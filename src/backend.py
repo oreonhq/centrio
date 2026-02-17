@@ -1220,7 +1220,7 @@ def verify_grub_packages(target_root):
     print(f"Detected distribution: {distro_id}, like: {distro_like}")
     
     # Set package names based on distribution
-    if "fedora" in distro_id or "fedora" in distro_like:
+    if "fedora" in distro_id or "fedora" in distro_like or "oreon" in distro_id or "oreon" in distro_like:
         required_grub_packages = [
             "grub2-efi-x64",
             "grub2-efi-x64-modules", 
@@ -1254,7 +1254,7 @@ def verify_grub_packages(target_root):
             "efibootmgr"
         ]
     else:
-        return False, f"Unsupported distribution for GRUB: {distro_id}. Supported: Fedora, RHEL/CentOS/Rocky/AlmaLinux, Debian/Ubuntu, Arch.", None
+        return False, f"Unsupported distribution for GRUB: {distro_id}. Supported: Fedora, Oreon, RHEL/CentOS/Rocky/AlmaLinux, Debian/Ubuntu, Arch.", None
 
     print(f"Checking for GRUB packages: {required_grub_packages}")
     
