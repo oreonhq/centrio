@@ -472,7 +472,7 @@ class DiskPage(BaseConfigurationPage):
                     else:
                          # Should not happen if map was built correctly
                          print(f"    ERROR: Loop device {current_path} not found in path_map for pkname lookup.")
-                              return None
+                         return None
 
                 except subprocess.CalledProcessError as e:
                      print(f"  ERROR: Command failed while processing loop device {current_path}: {' '.join(e.cmd)}")
