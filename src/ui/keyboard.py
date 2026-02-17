@@ -21,12 +21,15 @@ class KeyboardPage(BaseConfigurationPage):
         self.layout_list = []
 
         # --- Populate Layout List ---
-        self.layout_list = ana_get_keyboard_layouts()
+        # ana_get_keyboard_layouts() returns [(display_name, keymap_code), ...]
+        self.layout_pairs = ana_get_keyboard_layouts()
+        self.layout_codes = [code for _, code in self.layout_pairs]
+        self.layout_display_names = [name for name, _ in self.layout_pairs]
 
         # --- Add Keyboard Widgets --- 
         key_group = Adw.PreferencesGroup()
         self.add(key_group)
-        model = Gtk.StringList.new(self.layout_list)
+        model = Gtk.StringList.new(self.layout_display_names)
         self.layout_row = Adw.ComboRow(title="Keyboard Layout", model=model)
         key_group.add(self.layout_row)
         
@@ -46,9 +49,9 @@ class KeyboardPage(BaseConfigurationPage):
         self.complete_button.add_css_class("suggested-action")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         # Enable based on layout list availability
-        self.complete_button.set_sensitive(bool(self.layout_list))
-        self.layout_row.set_sensitive(bool(self.layout_list))
-        if not self.layout_list:
+        self.complete_button.set_sensitive(bool(self.layout_pairs))
+        self.layout_row.set_sensitive(bool(self.layout_pairs))
+        if not self.layout_pairs:
              self.layout_row.set_subtitle("Failed to load layouts")
         button_group.add(self.complete_button)
         
@@ -82,14 +85,15 @@ class KeyboardPage(BaseConfigurationPage):
 
             # Set UI selection based on fetched data (prefer VC map for console focus)
             initial_layout = self.current_vc_keymap
-            if initial_layout and initial_layout in self.layout_list:
+            if initial_layout and initial_layout in self.layout_codes:
                  try:
-                     idx = self.layout_list.index(initial_layout)
+                     idx = self.layout_codes.index(initial_layout)
                      self.layout_row.set_selected(idx)
                  except ValueError:
                      print(f"Warning: Initial layout '{initial_layout}' not found in list.")
-                     if self.layout_list: self.layout_row.set_selected(0) # Default to first if available
-            elif self.layout_list: # If no initial match, default to first
+                     if self.layout_codes:
+                         self.layout_row.set_selected(0)
+            elif self.layout_codes:
                  self.layout_row.set_selected(0)
 
         except FileNotFoundError:
@@ -111,11 +115,11 @@ class KeyboardPage(BaseConfigurationPage):
     def apply_settings_and_return(self, button):
         """Applies the selected keyboard layout using localectl."""
         selected_idx = self.layout_row.get_selected()
-        if not self.layout_list or selected_idx < 0 or selected_idx >= len(self.layout_list):
+        if not self.layout_codes or selected_idx < 0 or selected_idx >= len(self.layout_codes):
             self.show_toast("Invalid keyboard layout selection.")
             return
-            
-        selected_layout = self.layout_list[selected_idx]
+
+        selected_layout = self.layout_codes[selected_idx]
             
         print(f"Attempting to set Keyboard Layout to '{selected_layout}' using localectl...")
         self.complete_button.set_sensitive(False) # Disable button during operation

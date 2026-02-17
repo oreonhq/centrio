@@ -17,54 +17,85 @@ except ImportError:
     dbus_available = False
     print("WARNING: dasbus library not found. D-Bus communication will be disabled.")
 
-# --- Timezone Helpers (Simulated from pyanaconda.timezone) ---
-# In a real integration, import these from pyanaconda.timezone
-# For now, provide dummy implementations
-try:
-    import pytz
-    pytz_available = True
-except ImportError:
-    pytz = None
-    pytz_available = False
-    print("WARNING: pytz not found. Timezone list will be minimal.")
+# --- Timezone Helpers ---
+def _get_timezone_list():
+    """Return full IANA timezone list. Prefer zoneinfo (Python 3.9+), then pytz, then minimal fallback."""
+    try:
+        from zoneinfo import available_timezones
+        zones = sorted(available_timezones())
+        if zones:
+            print(f"  Loaded {len(zones)} timezones from zoneinfo.")
+            return zones
+    except ImportError:
+        pass
+    try:
+        import pytz
+        zones = sorted(pytz.all_timezones)
+        print(f"  Loaded {len(zones)} timezones from pytz.")
+        return zones
+    except Exception as e:
+        print(f"  Timezone fallback: {e}")
+    return ["UTC", "GMT", "America/New_York", "Europe/London", "Asia/Tokyo", "Europe/Paris", "Asia/Kolkata", "Australia/Sydney"]
+
 
 def ana_get_all_regions_and_timezones():
-    """Placeholder for pyanaconda.timezone.get_all_regions_and_timezones."""
-    if pytz_available:
-        # Basic simulation using pytz common timezones
-        try:
-            return sorted(pytz.common_timezones)
-        except Exception as e:
-             print(f"Error getting pytz timezones: {e}")
-             return ["UTC", "GMT"]
-    else:
-        # Minimal fallback
-        return ["UTC", "GMT", "America/New_York", "Europe/London", "Asia/Tokyo"]
+    """Return full list of IANA timezone identifiers for the timezone selector."""
+    return _get_timezone_list()
+
+def _parse_xkb_layout_descriptions():
+    """Parse /usr/share/X11/xkb/rules/evdev.lst for layout code -> human-readable name."""
+    desc = {}
+    path = "/usr/share/X11/xkb/rules/evdev.lst"
+    if not os.path.exists(path):
+        return desc
+    try:
+        in_layout = False
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.strip() == "! layout":
+                    in_layout = True
+                    continue
+                if in_layout:
+                    if line.startswith("!"):
+                        break
+                    # Format: "  us              English (US)"
+                    parts = line.split(None, 1)
+                    if len(parts) >= 2:
+                        code, name = parts[0], parts[1]
+                        desc[code] = name
+        print(f"  Loaded {len(desc)} keyboard layout descriptions from evdev.lst.")
+    except Exception as e:
+        print(f"  Could not parse evdev.lst: {e}")
+    return desc
+
 
 def ana_get_keyboard_layouts():
-    """Fetches available console keyboard layouts using localectl."""
+    """Fetches console keymaps and returns list of (display_name, keymap_code) for UI.
+    Display names come from XKB evdev.lst where available; otherwise the code is shown.
+    """
     print("Fetching keyboard layouts using localectl...")
+    descriptions = _parse_xkb_layout_descriptions()
     try:
-        # Get console keymaps
-        result = subprocess.run(["localectl", "list-keymaps"], 
-                                capture_output=True, text=True, check=True)
-        keymaps = sorted([line for line in result.stdout.split('\n') if line])
-        print(f"  Found {len(keymaps)} console keymaps.")
-        
-        # TODO: Also fetch X11 layouts/variants/options if needed for a more detailed UI
-        # result_x11 = subprocess.run(["localectl", "list-x11-keymap-layouts"], ...)
-        
-        # Return console keymaps for now for simplicity
-        return keymaps if keymaps else ["us"] # Fallback
+        result = subprocess.run(["localectl", "list-keymaps"],
+                                capture_output=True, text=True, check=True, timeout=15)
+        keymaps = sorted([line.strip() for line in result.stdout.split("\n") if line.strip()])
+        if not keymaps:
+            keymaps = ["us"]
+        # Build (display_name, code) list; sort by display name
+        pairs = []
+        for code in keymaps:
+            display = descriptions.get(code, code)
+            pairs.append((display, code))
+        pairs.sort(key=lambda x: x[0].lower())
+        print(f"  Found {len(pairs)} keyboard layouts.")
+        return pairs  # List of (display_name, keymap_code)
     except FileNotFoundError:
         print("ERROR: localectl command not found. Using fallback layouts.")
-        return ["us", "gb", "de", "fr"] # Fallback list
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: localectl list-keymaps failed: {e}. Using fallback layouts.")
-        return ["us", "gb", "de", "fr"]
-    except Exception as e:
-        print(f"ERROR: Unexpected error fetching keymaps: {e}. Using fallback layouts.")
-        return ["us", "gb", "de", "fr"]
+        return [("English (US)", "us"), ("English (UK)", "gb"), ("German", "de"), ("French", "fr")]
+    except (subprocess.CalledProcessError, Exception) as e:
+        print(f"ERROR: list-keymaps failed: {e}. Using fallback.")
+        return [("English (US)", "us"), ("English (UK)", "gb"), ("German", "de"), ("French", "fr")]
 
 def ana_get_available_locales():
     """Fetches available locales using localectl."""

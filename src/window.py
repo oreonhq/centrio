@@ -26,9 +26,10 @@ from ui.payload import PayloadPage
 from ui.bootloader import BootloaderPage
 
 class CentrioInstallerWindow(Adw.ApplicationWindow):
-    def __init__(self, **kwargs):
+    def __init__(self, installer_script=None, **kwargs):
         super().__init__(**kwargs)
-        
+        self.installer_script = installer_script or sys.argv[0]
+
         self.config_state = {} # Stores completion status (True/False) for each config key
         self.required_configs = set() # Set of keys for required configurations
         self.main_page_order = ["welcome", "summary", "progress", "finished"]
@@ -52,8 +53,8 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         self.toast_overlay.set_child(self.view_stack)
 
         # --- Add ui to the stack ---
-        # Main flow ui
-        self.welcome_page = WelcomePage()
+        # Main flow ui (pass main_window so welcome can restart for language change)
+        self.welcome_page = WelcomePage(main_window=self)
         self.view_stack.add_titled(self.welcome_page, self.main_page_order[0], "Welcome")
 
         # Create Summary Page - this will also populate config_state and required_configs

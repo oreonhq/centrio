@@ -1,0 +1,334 @@
+# centrio_installer/install_logic.py
+# serves as the backend for bootloader installation and by progress for flow.
+
+import os
+import re
+import shutil
+import subprocess
+import shlex
+
+# Helpers from backend (imported at use site to avoid circular deps)
+def _run_command(command_list, description, progress_callback=None, timeout=None, pipe_input=None):
+    """Delegate to backend._run_command."""
+    from backend import _run_command as _rc
+    return _rc(command_list, description, progress_callback, timeout, pipe_input)
+
+def _run_in_chroot(target_root, command_list, description, progress_callback=None, timeout=None, pipe_input=None):
+    """Delegate to backend._run_in_chroot."""
+    from backend import _run_in_chroot as _rch
+    return _rch(target_root, command_list, description, progress_callback, timeout, pipe_input)
+
+
+BOOTLOADER_ID = "Oreon"
+
+# --- UEFI and BIOS detection ---
+def is_uefi_system():
+    return os.path.exists("/sys/firmware/efi")
+
+
+def _efi_partition_ensure_mounted(target_root, efi_partition_device):
+    """Ensure EFI partition is mounted at target_root/boot/efi. Mount if not. Returns (success, err, efi_mount_point)."""
+    efi_mount = os.path.join(target_root, "boot", "efi")
+    try:
+        os.makedirs(efi_mount, exist_ok=True)
+    except Exception as e:
+        return False, f"Failed to create EFI mount point: {e}", None
+
+    if os.path.ismount(efi_mount):
+        return True, "", efi_mount
+
+    if not efi_partition_device:
+        # Try findmnt
+        try:
+            r = subprocess.run(
+                ["findmnt", "-n", "-o", "SOURCE", "--target", efi_mount],
+                capture_output=True, text=True, check=False, timeout=10
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return True, "", efi_mount
+        except Exception:
+            pass
+        return False, "UEFI system but EFI partition not mounted and no device provided.", None
+
+    r = subprocess.run(
+        ["mount", efi_partition_device, efi_mount],
+        capture_output=True, text=True, check=False, timeout=30
+    )
+    if r.returncode != 0:
+        return False, f"Failed to mount EFI partition: {r.stderr.strip()}", None
+    return True, "", efi_mount
+
+
+def _find_shim_grub_on_host():
+    """Find shim and grub EFI files on host (live system). Returns (shim_path, grub_path)."""
+    shim_paths = [
+        "/boot/efi/EFI/BOOT/BOOTX64.EFI",
+        "/boot/efi/EFI/BOOT/shimx64.efi",
+        "/boot/efi/EFI/fedora/shimx64.efi",
+        "/boot/efi/EFI/centos/shimx64.efi",
+        "/boot/efi/EFI/rhel/shimx64.efi",
+        "/boot/efi/EFI/rocky/shimx64.efi",
+        "/boot/efi/EFI/almalinux/shimx64.efi",
+        "/boot/efi/EFI/oreon/shimx64.efi",
+        "/boot/shimx64.efi",
+        "/boot/BOOTX64.EFI",
+    ]
+    grub_paths = [
+        "/boot/efi/EFI/BOOT/grubx64.efi",
+        "/boot/efi/EFI/fedora/grubx64.efi",
+        "/boot/efi/EFI/centos/grubx64.efi",
+        "/boot/efi/EFI/rhel/grubx64.efi",
+        "/boot/efi/EFI/rocky/grubx64.efi",
+        "/boot/efi/EFI/almalinux/grubx64.efi",
+        "/boot/efi/EFI/oreon/grubx64.efi",
+        "/boot/grubx64.efi",
+    ]
+    shim = None
+    grub = None
+    for p in shim_paths:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            shim = p
+            break
+    for p in grub_paths:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            grub = p
+            break
+    if not shim:
+        try:
+            r = subprocess.run(
+                ["find", "/boot", "-name", "shimx64.efi", "-o", "-name", "BOOTX64.EFI", "-type", "f", "-size", "+100k"],
+                capture_output=True, text=True, timeout=30, check=False
+            )
+            if r.stdout.strip():
+                shim = r.stdout.strip().split("\n")[0].strip()
+        except Exception:
+            pass
+    if not grub:
+        try:
+            r = subprocess.run(
+                ["find", "/boot", "-name", "grubx64.efi", "-type", "f", "-size", "+100k"],
+                capture_output=True, text=True, timeout=30, check=False
+            )
+            if r.stdout.strip():
+                grub = r.stdout.strip().split("\n")[0].strip()
+        except Exception:
+            pass
+    return shim, grub
+
+
+def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
+    """Install GRUB for UEFI (and Secure Boot via shim). Returns (success, error_msg)."""
+    efi_mount_point = os.path.join(target_root, "boot", "efi")
+    if not efi_partition_device and os.path.ismount(efi_mount_point):
+        try:
+            r = subprocess.run(
+                ["findmnt", "-n", "-o", "SOURCE", "--target", efi_mount_point],
+                capture_output=True, text=True, check=False, timeout=10
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                efi_partition_device = r.stdout.strip()
+        except Exception:
+            pass
+
+    ok, err, _ = _efi_partition_ensure_mounted(target_root, efi_partition_device)
+    if not ok:
+        return False, err or "EFI partition not available."
+
+    # EFI dirs
+    efi_oreon = os.path.join(efi_mount_point, "EFI", BOOTLOADER_ID)
+    efi_boot = os.path.join(efi_mount_point, "EFI", "BOOT")
+    try:
+        os.makedirs(efi_oreon, exist_ok=True)
+        os.makedirs(efi_boot, exist_ok=True)
+    except Exception as e:
+        return False, f"Failed to create EFI dirs: {e}"
+
+    # Ensure GRUB EFI packages in target (dnf-based)
+    from backend import verify_grub_packages
+    vok, verr, _ = verify_grub_packages(target_root)
+    if not vok:
+        return False, verr or "Required GRUB packages missing."
+
+    # Shim + GRUB: from host or grub2-install
+    shim_src, grub_src = _find_shim_grub_on_host()
+    if not shim_src:
+        return False, "Could not find shim (shimx64.efi/BOOTX64.EFI) on live system; required for UEFI/Secure Boot."
+
+    shim_dst = os.path.join(efi_oreon, "shimx64.efi")
+    bootx64_dst = os.path.join(efi_oreon, "BOOTX64.EFI")
+    grub_dst = os.path.join(efi_oreon, "grubx64.efi")
+
+    try:
+        shutil.copy2(shim_src, shim_dst)
+        shutil.copy2(shim_src, bootx64_dst)
+    except Exception as e:
+        return False, f"Failed to copy shim: {e}"
+
+    if grub_src:
+        try:
+            shutil.copy2(grub_src, grub_dst)
+        except Exception as e:
+            return False, f"Failed to copy grub: {e}"
+    else:
+        # Create via grub2-install in chroot
+        cmd = [
+            "grub2-install", "--target=x86_64-efi",
+            "--efi-directory=/boot/efi", f"--bootloader-id={BOOTLOADER_ID}",
+            "--no-nvram", "--removable"
+        ]
+        ok, err, _ = _run_in_chroot(target_root, cmd, "GRUB EFI install", progress_callback, timeout=180)
+        if not ok:
+            return False, f"grub2-install (UEFI) failed: {err}"
+        # grub2-install may create under EFI/BOOT or EFI/Oreon; copy to our path if needed
+        for d in [efi_oreon, efi_boot]:
+            cand = os.path.join(d, "grubx64.efi")
+            if os.path.exists(cand) and (not os.path.exists(grub_dst) or os.path.getsize(cand) > 0):
+                if cand != grub_dst:
+                    shutil.copy2(cand, grub_dst)
+                break
+        if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
+            # From target root
+            for p in [os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
+                      os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi")]:
+                if os.path.exists(p):
+                    shutil.copy2(p, grub_dst)
+                    break
+            if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
+                return False, "Could not create or find grubx64.efi."
+
+    # Fallback EFI/BOOT for removable/fallback boot
+    fallback_shim = os.path.join(efi_boot, "BOOTX64.EFI")
+    if not os.path.exists(fallback_shim) or os.path.getsize(fallback_shim) == 0:
+        try:
+            shutil.copy2(shim_src, fallback_shim)
+        except Exception as e:
+            print(f"Warning: Could not create fallback BOOTX64.EFI: {e}")
+
+    # NVRAM boot entry (efibootmgr from host)
+    if efi_partition_device:
+        match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
+                re.match(r"(/dev/nvme\d+n\d+)p(\d+)", efi_partition_device) or
+                re.match(r"(/dev/mmcblk\d+)p(\d+)", efi_partition_device))
+        if match:
+            efi_disk, efi_part = match.group(1), match.group(2)
+            for loader in ["\\EFI\\" + BOOTLOADER_ID + "\\BOOTX64.EFI", "\\EFI\\" + BOOTLOADER_ID + "\\shimx64.efi"]:
+                cmd = ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", BOOTLOADER_ID, "-l", loader]
+                r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+                if r.returncode == 0:
+                    break
+            else:
+                print("Warning: efibootmgr could not add boot entry; use firmware or fallback BOOTX64.EFI.")
+
+    return True, ""
+
+
+def _install_bios_bootloader(target_root, primary_disk, progress_callback=None):
+    """Install GRUB for legacy BIOS. Returns (success, error_msg)."""
+    from backend import _run_in_chroot, _run_command
+    # Ensure grub2-pc (and deps) in target
+    for pkg in ["grub2-pc", "grub2-common", "grub2-tools"]:
+        r = subprocess.run(["rpm", "-q", pkg, f"--root={target_root}"], capture_output=True, text=True, check=False, timeout=10)
+        if r.returncode != 0:
+            ok, err, _ = _run_in_chroot(
+                target_root,
+                ["dnf", "install", "-y", pkg],
+                f"Install {pkg}",
+                progress_callback,
+                timeout=180
+            )
+            if not ok:
+                return False, f"Missing {pkg}: {err}"
+
+    boot_dir = os.path.join(target_root, "boot")
+    cmd = [
+        "grub2-install", "--target=i386-pc", "--force", "--recheck",
+        "--boot-directory", boot_dir,
+        primary_disk
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=180)
+    if r.returncode != 0:
+        # Fallback without recheck
+        cmd = [
+            "grub2-install", "--target=i386-pc", "--force", "--skip-fs-probe",
+            "--boot-directory", boot_dir,
+            primary_disk
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=180)
+        if r.returncode != 0:
+            return False, f"grub2-install (BIOS) failed: {r.stderr.strip() or r.stdout}"
+    return True, ""
+
+
+def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None):
+    """Generate /boot/grub2/grub.cfg for target (must run inside chroot to see target's /boot). Returns (success, error_msg)."""
+    grub_cfg_chroot = "/boot/grub2/grub.cfg"
+    ok, err, _ = _run_in_chroot(
+        target_root,
+        ["grub2-mkconfig", "-o", grub_cfg_chroot],
+        "grub2-mkconfig",
+        progress_callback,
+        timeout=120
+    )
+    if not ok:
+        return False, err or "grub2-mkconfig failed."
+
+    cfg_path = os.path.join(target_root, "boot", "grub2", "grub.cfg")
+    if not os.path.exists(cfg_path) or os.path.getsize(cfg_path) < 100:
+        return False, "GRUB config missing or too small."
+    return True, ""
+
+
+def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
+    """
+    Install bootloader for target: UEFI (with Secure Boot support) or legacy BIOS.
+    Works with dnf-based systems. Returns (success, error_msg, verification_dict or None).
+    """
+    if not primary_disk:
+        return False, "No primary disk specified.", None
+
+    uefi = is_uefi_system()
+    if progress_callback:
+        progress_callback("Installing bootloader (%s)..." % ("UEFI" if uefi else "BIOS"), None)
+
+    if uefi:
+        ok, err = _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback)
+    else:
+        ok, err = _install_bios_bootloader(target_root, primary_disk, progress_callback)
+
+    if not ok:
+        return False, err, None
+
+    # Common: generate grub.cfg
+    ok, err = _generate_grub_cfg(target_root, primary_disk, uefi, progress_callback)
+    if not ok:
+        return False, err, None
+
+    # Optional: copy grub.cfg to EFI partition for UEFI
+    if uefi:
+        efi_mount = os.path.join(target_root, "boot", "efi")
+        cfg_src = os.path.join(target_root, "boot", "grub2", "grub.cfg")
+        efi_cfg = os.path.join(efi_mount, "EFI", BOOTLOADER_ID, "grub.cfg")
+        if os.path.ismount(efi_mount) and os.path.exists(cfg_src) and os.path.exists(os.path.dirname(efi_cfg)):
+            try:
+                shutil.copy2(cfg_src, efi_cfg)
+            except Exception as e:
+                print(f"Warning: Could not copy grub.cfg to EFI: {e}")
+
+    # Optional: regenerate initramfs (best effort)
+    try:
+        vmlinuz_dir = os.path.join(target_root, "boot")
+        if os.path.exists(vmlinuz_dir):
+            kernels = sorted([f for f in os.listdir(vmlinuz_dir) if f.startswith("vmlinuz-") and "rescue" not in f])
+            for k in reversed(kernels):
+                kver = k.replace("vmlinuz-", "")
+                _run_in_chroot(target_root, ["dracut", "--force", "--kver", kver], f"dracut {kver}", progress_callback, timeout=300)
+    except Exception as e:
+        print(f"Warning: initramfs regeneration: {e}")
+
+    verification = {
+        "uefi": uefi,
+        "bootloader_id": BOOTLOADER_ID,
+        "primary_disk": primary_disk,
+        "efi_partition": efi_partition_device if uefi else None,
+    }
+    return True, "", verification

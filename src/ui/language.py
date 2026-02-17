@@ -24,18 +24,14 @@ class LanguagePage(BaseConfigurationPage): # Renamed class slightly
         # --- Populate Locales List ---
         self.available_locales = ana_get_available_locales()
         self.locale_codes = list(self.available_locales.keys())
+        self.locale_display_names = [self.available_locales.get(c, c) for c in self.locale_codes]
 
         # --- Add Widgets using self.add() --- 
         lang_group = Adw.PreferencesGroup(title="System Locale")
-        # lang_group.set_description("Select the default locale (language and formats).")
         self.add(lang_group)
-        
-        # Use ComboRow instead of ListBox with checks
-        locale_model = Gtk.StringList.new(self.locale_codes) # Model needs codes
+
+        locale_model = Gtk.StringList.new(self.locale_display_names)
         self.locale_row = Adw.ComboRow(title="Locale", model=locale_model)
-        # Set display names for the combo box items (requires Gtk 4.10+? Fallback needed?)
-        # For simplicity, we'll just show the codes in the dropdown for now.
-        # A Gtk.Expression could be used to show display names if needed later.
         lang_group.add(self.locale_row)
 
         # --- Confirmation Button --- 

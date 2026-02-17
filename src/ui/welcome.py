@@ -1,80 +1,32 @@
 # centrio_installer/ui/welcome.py
 
+import os
+import sys
+import gettext
+from pathlib import Path
+
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw
 
-# Import the utility function
 from utils import get_os_release_info
 
-# Simple translation dictionary for installer interface
-TRANSLATIONS = {
-    'en_US': {
-        'welcome': 'Welcome to {}',
-        'description': 'Set up your new operating system in a few simple steps.',
-        'language': 'Language',
-        'installer_language': 'Installer Language',
-        'installation_overview': 'Installation Overview',
-        'operating_system': 'Operating System',
-        'installation_type': 'Installation Type',
-        'full_desktop': 'Full desktop with applications',
-        'estimated_time': 'Estimated Time',
-        'time_estimate': '15-30 minutes',
-        'click_next': 'Click Next to begin configuration.',
-        'language_selected': 'Language Selected',
-        'language_applied': 'Language set to {}. This will be applied to the installed system.'
-    },
-    'es_ES': {
-        'welcome': 'Bienvenido a {}',
-        'description': 'Configure su nuevo sistema operativo en unos pocos pasos simples.',
-        'language': 'Idioma',
-        'installer_language': 'Idioma del Instalador',
-        'installation_overview': 'Resumen de la Instalación',
-        'operating_system': 'Sistema Operativo',
-        'installation_type': 'Tipo de Instalación',
-        'full_desktop': 'Escritorio completo con aplicaciones',
-        'estimated_time': 'Tiempo Estimado',
-        'time_estimate': '15-30 minutos',
-        'click_next': 'Haga clic en Siguiente para comenzar la configuración.',
-        'language_selected': 'Idioma Seleccionado',
-        'language_applied': 'Idioma establecido en {}. Esto se aplicará al sistema instalado.'
-    },
-    'fr_FR': {
-        'welcome': 'Bienvenue sur {}',
-        'description': 'Configurez votre nouveau système d\'exploitation en quelques étapes simples.',
-        'language': 'Langue',
-        'installer_language': 'Langue de l\'Installateur',
-        'installation_overview': 'Aperçu de l\'Installation',
-        'operating_system': 'Système d\'Exploitation',
-        'installation_type': 'Type d\'Installation',
-        'full_desktop': 'Bureau complet avec applications',
-        'estimated_time': 'Temps Estimé',
-        'time_estimate': '15-30 minutes',
-        'click_next': 'Cliquez sur Suivant pour commencer la configuration.',
-        'language_selected': 'Langue Sélectionnée',
-        'language_applied': 'Langue définie sur {}. Cela sera appliqué au système installé.'
-    }
-}
+# Translation function: always bound so no UnboundLocalError
+_locale_dir = Path(__file__).resolve().parents[2] / "locale"
+try:
+    _t = gettext.translation("centrio", localedir=str(_locale_dir), fallback=True)
+    _ = _t.gettext
+except Exception:
+    _ = lambda s: s
 
-def get_text(key, lang_code='en_US', *args):
-    """Get translated text for the given key and language."""
-    if lang_code in TRANSLATIONS and key in TRANSLATIONS[lang_code]:
-        text = TRANSLATIONS[lang_code][key]
-        return text.format(*args) if args else text
-    else:
-        # Fallback to English
-        if key in TRANSLATIONS['en_US']:
-            text = TRANSLATIONS['en_US'][key]
-            return text.format(*args) if args else text
-        return key
 
 class WelcomePage(Gtk.Box):
-    def __init__(self, **kwargs):
+    def __init__(self, main_window=None, **kwargs):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12, **kwargs)
-        
-        # Initialize language
-        self.selected_language = 'en_US'
+        self.main_window = main_window
+
+        self.selected_language = "en_US"
         
         # Get OS Name for branding
         os_info = get_os_release_info()
@@ -101,13 +53,13 @@ class WelcomePage(Gtk.Box):
         main_content.append(icon)
         
         # Title
-        title = Gtk.Label(label=get_text("welcome", self.selected_language, distro_name))
+        title = Gtk.Label(label=_("Welcome to {}").format(distro_name))
         title.add_css_class("title-1")
         title.set_halign(Gtk.Align.CENTER)
         main_content.append(title)
-        
+
         # Description
-        description = Gtk.Label(label=get_text("description", self.selected_language))
+        description = Gtk.Label(label=_("Set up your new operating system in a few simple steps."))
         description.add_css_class("title-4")
         description.add_css_class("dim-label")
         description.set_halign(Gtk.Align.CENTER)
@@ -115,9 +67,8 @@ class WelcomePage(Gtk.Box):
         main_content.append(description)
         
         # Language selection - more compact
-        lang_group = Adw.PreferencesGroup(title=get_text("language"))
-        
-        self.lang_row = Adw.ComboRow(title=get_text("installer_language"))
+        lang_group = Adw.PreferencesGroup(title=_("Language"))
+        self.lang_row = Adw.ComboRow(title=_("Installer Language"))
         
         # Comprehensive language list with proper codes
         lang_model = Gtk.StringList()
@@ -163,9 +114,8 @@ class WelcomePage(Gtk.Box):
             ("Cymraeg", "cy_GB")
         ]
         
-        self.language_codes = [code for _, code in languages]
-        
-        for name, _ in languages:
+        self.language_codes = [code for _name, code in languages]
+        for name, _code in languages:
             lang_model.append(name)
         
         self.lang_row.set_model(lang_model)
@@ -187,41 +137,34 @@ class WelcomePage(Gtk.Box):
         main_content.append(lang_group)
         
         # Compact system info
-        system_group = Adw.PreferencesGroup(title=get_text("installation_overview"))
-        
-        # OS version info
+        system_group = Adw.PreferencesGroup(title=_("Installation Overview"))
         version = os_info.get("VERSION", "10")
         version_row = Adw.ActionRow(
-            title=get_text("operating_system"),
+            title=_("Operating System"),
             subtitle=f"{distro_name} {version}"
         )
         version_icon = Gtk.Image.new_from_icon_name("computer-symbolic")
         version_row.add_prefix(version_icon)
         system_group.add(version_row)
-        
-        # Installation type info
+
         install_row = Adw.ActionRow(
-            title=get_text("installation_type"),
-            subtitle=get_text("full_desktop")
+            title=_("Installation Type"),
+            subtitle=_("Full desktop with applications")
         )
         install_icon = Gtk.Image.new_from_icon_name("drive-harddisk-symbolic")
         install_row.add_prefix(install_icon)
         system_group.add(install_row)
-        
-        # Estimated time
+
         time_row = Adw.ActionRow(
-            title=get_text("estimated_time"),
-            subtitle=get_text("time_estimate")
+            title=_("Estimated Time"),
+            subtitle=_("15-30 minutes")
         )
         time_icon = Gtk.Image.new_from_icon_name("alarm-symbolic")
         time_row.add_prefix(time_icon)
-        system_group.add(time_row)
-        
         main_content.append(system_group)
-        
-        # Footer
+
         footer_label = Gtk.Label(
-            label=get_text("click_next"),
+            label=_("Click Next to begin configuration."),
             justify=Gtk.Justification.CENTER
         )
         footer_label.add_css_class("dim-label")
@@ -232,38 +175,43 @@ class WelcomePage(Gtk.Box):
         self.append(main_content)
 
     def on_language_changed(self, combo_row, pspec):
-        """Handle language selection change."""
+        """Handle language selection: save locale and restart installer so full UI is translated."""
         selected = combo_row.get_selected()
-        
-        if selected >= 0 and selected < len(self.language_codes):
-            lang_code = self.language_codes[selected]
-            print(f"Language selected: {lang_code}")
-            
-            # Store the selected language for use during installation
-            # Don't change system locale now - that happens after install
-            self.selected_language = lang_code
-            
-            # Update the interface text
-            self.update_interface_text()
-            
-            # Show a message that the language will be applied after installation
-            dialog = Gtk.MessageDialog(
-                transient_for=self.get_root(),
-                message_type=Gtk.MessageType.INFO,
-                buttons=Gtk.ButtonsType.OK,
-                text=get_text("language_selected", self.selected_language),
-                secondary_text=get_text("language_applied", self.selected_language, lang_code)
-            )
-            dialog.connect("response", lambda d, response: dialog.destroy())
-            dialog.present()
-        else:
-            print("Invalid language selection")
-    
-    def update_interface_text(self):
-        """Update the interface text based on the selected language."""
-        # This would update all the text elements in the interface
-        # For now, we'll just print that the language changed
-        print(f"Interface language updated to: {self.selected_language}")
+        if selected < 0 or selected >= len(self.language_codes):
+            return
+        lang_code = self.language_codes[selected]
+        self.selected_language = lang_code
+
+        # Write chosen locale so main.py applies it on next run
+        lang_file = getattr(self.main_window, "installer_lang_file", None)
+        script = getattr(self.main_window, "installer_script", None)
+        if not lang_file or not script:
+            return
+        try:
+            locale_value = f"{lang_code}.UTF-8" if "." not in lang_code else lang_code
+            with open(lang_file, "w", encoding="utf-8") as f:
+                f.write(locale_value)
+        except Exception as e:
+            print(f"Could not write installer language file: {e}")
+            return
+
+        # Restart the installer so gettext/locale apply to the whole UI
+        root = self.get_root()
+        dialog = Gtk.MessageDialog(
+            transient_for=root,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=_("Language Selected"),
+            secondary_text=_("The installer will restart to apply the new language.")
+        )
+        def on_ok(dlg, resp):
+            dlg.destroy()
+            try:
+                os.execv(sys.executable, [sys.executable, script] + sys.argv[1:])
+            except Exception as e:
+                print(f"Could not restart installer: {e}")
+        dialog.connect("response", on_ok)
+        dialog.present()
     
     def _detect_current_language(self):
         """Detect the current system language."""

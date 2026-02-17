@@ -105,7 +105,7 @@ def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", d
         commands.append(["mkfs.xfs", "-f", root_part])
     else:
         # Fallback to ext4
-        commands.append(["mkfs.ext4", "-F", part2])
+        commands.append(["mkfs.ext4", "-F", root_part])
     
     return commands
 
@@ -884,8 +884,8 @@ class DiskPage(BaseConfigurationPage):
                     print(f"Using existing EFI partition: device={self.selected_efi_partition}")
                 root_device = f"{primary_disk}{part2_suffix}"
             else:
-                # BIOS: root is the first real partition
-                root_device = f"{primary_disk}{part1_suffix}"
+                # BIOS (GPT): partition 1 is bios_grub, partition 2 is root
+                root_device = f"{primary_disk}{part2_suffix}"
             partitions.append({
                 "device": root_device, 
                 "mountpoint": "/", 
