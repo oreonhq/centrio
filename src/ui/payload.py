@@ -277,7 +277,7 @@ class PayloadPage(BaseConfigurationPage):
         # Add packages from selected groups
         for group_id, group_info in self.package_groups.items():
             if group_info["selected"] or group_info["required"]:
-                dnf_packages.extend(group_info["packages"])
+                dnf_packages.extend(group_info.get("packages", []))
                 # Add flatpak packages if the group has them
                 if "flatpak_packages" in group_info:
                     flatpak_packages.extend(group_info["flatpak_packages"])
