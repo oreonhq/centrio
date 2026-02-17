@@ -104,9 +104,7 @@ def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", d
     elif filesystem == "xfs":
         commands.append(["mkfs.xfs", "-f", root_part])
     else:
-        # Fallback to ext4
-        commands.append(["mkfs.ext4", "-F", root_part])
-    
+        raise ValueError(f"Unsupported filesystem: {filesystem}. Use ext4, btrfs, or xfs.")
     return commands
 
 # --- Helper Functions to Check Host Usage ---
@@ -346,7 +344,7 @@ class DiskPage(BaseConfigurationPage):
                 print(f"Installation mode: Dual boot (found {len(self.efi_partitions)} EFI partitions)")
             else:
                 self.show_toast("No existing EFI partitions found for dual boot")
-                self.normal_radio.set_active(True)  # Fall back to normal
+                self.normal_radio.set_active(True)  # Default to normal
                 return
         
         self.partitioning_method = mode
@@ -460,12 +458,7 @@ class DiskPage(BaseConfigurationPage):
                             continue # Restart loop with the new source device path
                         else:
                             print(f"    ERROR: Could not find source device for backing file directory {backing_file_dir}")
-                            # If findmnt fails, try the pkname fallback below
-                            print(f"    Falling back to check pkname for loop device {current_path}...")
-                            # pass # Let it fall through to pkname check
 
-                    # Fallback for (deleted) or if findmnt failed for non-deleted
-                    # --- Attempt to trace via the loop device's parent in lsblk ---
                     print(f"    Trying lsblk parent (pkname) for loop device {current_path}...")
                     if current_path in path_map:
                          parent_path = path_map[current_path]["pkname"]
@@ -479,8 +472,7 @@ class DiskPage(BaseConfigurationPage):
                     else:
                          # Should not happen if map was built correctly
                          print(f"    ERROR: Loop device {current_path} not found in path_map for pkname lookup.")
-                         return None
-                    # --- End Fallback ---
+                              return None
 
                 except subprocess.CalledProcessError as e:
                      print(f"  ERROR: Command failed while processing loop device {current_path}: {' '.join(e.cmd)}")

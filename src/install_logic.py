@@ -93,26 +93,6 @@ def _find_shim_grub_on_host():
         if os.path.exists(p) and os.path.getsize(p) > 0:
             grub = p
             break
-    if not shim:
-        try:
-            r = subprocess.run(
-                ["find", "/boot", "-name", "shimx64.efi", "-o", "-name", "BOOTX64.EFI", "-type", "f", "-size", "+100k"],
-                capture_output=True, text=True, timeout=30, check=False
-            )
-            if r.stdout.strip():
-                shim = r.stdout.strip().split("\n")[0].strip()
-        except Exception:
-            pass
-    if not grub:
-        try:
-            r = subprocess.run(
-                ["find", "/boot", "-name", "grubx64.efi", "-type", "f", "-size", "+100k"],
-                capture_output=True, text=True, timeout=30, check=False
-            )
-            if r.stdout.strip():
-                grub = r.stdout.strip().split("\n")[0].strip()
-        except Exception:
-            pass
     return shim, grub
 
 
@@ -158,15 +138,16 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     bootx64_dst = os.path.join(efi_oreon, "BOOTX64.EFI")
     grub_dst = os.path.join(efi_oreon, "grubx64.efi")
 
+    # Use shutil.copy (content only) for EFI partition: vfat does not support xattrs/SELinux
     try:
-        shutil.copy2(shim_src, shim_dst)
-        shutil.copy2(shim_src, bootx64_dst)
+        shutil.copy(shim_src, shim_dst)
+        shutil.copy(shim_src, bootx64_dst)
     except Exception as e:
         return False, f"Failed to copy shim: {e}"
 
     if grub_src:
         try:
-            shutil.copy2(grub_src, grub_dst)
+            shutil.copy(grub_src, grub_dst)
         except Exception as e:
             return False, f"Failed to copy grub: {e}"
     else:
@@ -184,40 +165,28 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             cand = os.path.join(d, "grubx64.efi")
             if os.path.exists(cand) and (not os.path.exists(grub_dst) or os.path.getsize(cand) > 0):
                 if cand != grub_dst:
-                    shutil.copy2(cand, grub_dst)
+                    shutil.copy(cand, grub_dst)
                 break
         if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
-            # From target root
             for p in [os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
                       os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi")]:
                 if os.path.exists(p):
-                    shutil.copy2(p, grub_dst)
+                    shutil.copy(p, grub_dst)
                     break
             if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
                 return False, "Could not create or find grubx64.efi."
 
-    # Fallback EFI/BOOT for removable/fallback boot
-    fallback_shim = os.path.join(efi_boot, "BOOTX64.EFI")
-    if not os.path.exists(fallback_shim) or os.path.getsize(fallback_shim) == 0:
-        try:
-            shutil.copy2(shim_src, fallback_shim)
-        except Exception as e:
-            print(f"Warning: Could not create fallback BOOTX64.EFI: {e}")
+    efi_boot_shim = os.path.join(efi_boot, "BOOTX64.EFI")
+    shutil.copy(shim_src, efi_boot_shim)
 
-    # NVRAM boot entry (efibootmgr from host)
     if efi_partition_device:
         match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
                 re.match(r"(/dev/nvme\d+n\d+)p(\d+)", efi_partition_device) or
                 re.match(r"(/dev/mmcblk\d+)p(\d+)", efi_partition_device))
         if match:
             efi_disk, efi_part = match.group(1), match.group(2)
-            for loader in ["\\EFI\\" + BOOTLOADER_ID + "\\BOOTX64.EFI", "\\EFI\\" + BOOTLOADER_ID + "\\shimx64.efi"]:
-                cmd = ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", BOOTLOADER_ID, "-l", loader]
-                r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
-                if r.returncode == 0:
-                    break
-            else:
-                print("Warning: efibootmgr could not add boot entry; use firmware or fallback BOOTX64.EFI.")
+            cmd = ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", BOOTLOADER_ID, "-l", "\\EFI\\" + BOOTLOADER_ID + "\\BOOTX64.EFI"]
+            subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
 
     return True, ""
 
@@ -247,15 +216,7 @@ def _install_bios_bootloader(target_root, primary_disk, progress_callback=None):
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=180)
     if r.returncode != 0:
-        # Fallback without recheck
-        cmd = [
-            "grub2-install", "--target=i386-pc", "--force", "--skip-fs-probe",
-            "--boot-directory", boot_dir,
-            primary_disk
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=180)
-        if r.returncode != 0:
-            return False, f"grub2-install (BIOS) failed: {r.stderr.strip() or r.stdout}"
+        return False, f"grub2-install (BIOS) failed: {r.stderr.strip() or r.stdout}"
     return True, ""
 
 
@@ -310,7 +271,7 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
         efi_cfg = os.path.join(efi_mount, "EFI", BOOTLOADER_ID, "grub.cfg")
         if os.path.ismount(efi_mount) and os.path.exists(cfg_src) and os.path.exists(os.path.dirname(efi_cfg)):
             try:
-                shutil.copy2(cfg_src, efi_cfg)
+                shutil.copy(cfg_src, efi_cfg)
             except Exception as e:
                 print(f"Warning: Could not copy grub.cfg to EFI: {e}")
 

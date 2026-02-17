@@ -101,17 +101,8 @@ class ProgressPage(Gtk.Box):
                     subprocess.run(umount_cmd, check=True, timeout=15, capture_output=True)
                     print(f"      Successfully unmounted {mp}")
                 except subprocess.CalledProcessError as e:
-                    print(f"      Warning: Failed to unmount {mp}: {e.stderr.strip()}. Trying lazy unmount...")
-                    # Sync again before lazy unmount
-                    try: subprocess.run(["sync"], check=False, timeout=5) 
-                    except Exception: pass
-                    # Fallback to lazy unmount
-                    umount_lazy_cmd = ["umount", "-l", mp]
-                    try:
-                        subprocess.run(umount_lazy_cmd, check=True, timeout=5, capture_output=True)
-                        print(f"        Lazy unmount successful for {mp}")
-                    except Exception as lazy_e:
-                        print(f"        Warning: Lazy unmount also failed for {mp}: {lazy_e}")
+                    print(f"      Failed to unmount {mp}: {e.stderr.strip()}")
+                    raise
                 except subprocess.TimeoutExpired:
                      print(f"      Warning: Timeout unmounting {mp}")
                 except Exception as e:

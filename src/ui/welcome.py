@@ -15,7 +15,7 @@ from utils import get_os_release_info
 # Translation function: always bound so no UnboundLocalError
 _locale_dir = Path(__file__).resolve().parents[2] / "locale"
 try:
-    _t = gettext.translation("centrio", localedir=str(_locale_dir), fallback=True)
+    _t = gettext.translation("centrio", localedir=str(_locale_dir), fallback=False)
     _ = _t.gettext
 except Exception:
     _ = lambda s: s
@@ -226,21 +226,14 @@ class WelcomePage(Gtk.Box):
                 lang_code = lang.split('.')[0]
                 return lang_code
             
-            # Fallback to localectl
-            result = subprocess.run(["localectl", "status"], 
-                                  capture_output=True, text=True, check=True)
+            result = subprocess.run(["localectl", "status"],
+                                    capture_output=True, text=True, check=True)
             output = result.stdout
-            
-            # Parse System Locale
             import re
             locale_match = re.search(r"System Locale: LANG=(\S+)", output)
             if locale_match:
                 lang = locale_match.group(1)
-                lang_code = lang.split('.')[0]
-                return lang_code
-                
+                return lang.split('.')[0]
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass
-        
-        # Default fallback
-        return "en_US" 
+        return None 

@@ -19,23 +19,16 @@ except ImportError:
 
 # --- Timezone Helpers ---
 def _get_timezone_list():
-    """Return full IANA timezone list. Prefer zoneinfo (Python 3.9+), then pytz, then minimal fallback."""
+    """Return full IANA timezone list. Requires zoneinfo (Python 3.9+)."""
     try:
         from zoneinfo import available_timezones
-        zones = sorted(available_timezones())
-        if zones:
-            print(f"  Loaded {len(zones)} timezones from zoneinfo.")
-            return zones
     except ImportError:
-        pass
-    try:
-        import pytz
-        zones = sorted(pytz.all_timezones)
-        print(f"  Loaded {len(zones)} timezones from pytz.")
-        return zones
-    except Exception as e:
-        print(f"  Timezone fallback: {e}")
-    return ["UTC", "GMT", "America/New_York", "Europe/London", "Asia/Tokyo", "Europe/Paris", "Asia/Kolkata", "Australia/Sydney"]
+        raise RuntimeError("zoneinfo is required for timezones (Python 3.9+).")
+    zones = sorted(available_timezones())
+    if not zones:
+        raise RuntimeError("zoneinfo.available_timezones() returned no timezones.")
+    print(f"  Loaded {len(zones)} timezones from zoneinfo.")
+    return zones
 
 
 def ana_get_all_regions_and_timezones():
@@ -91,11 +84,9 @@ def ana_get_keyboard_layouts():
         print(f"  Found {len(pairs)} keyboard layouts.")
         return pairs  # List of (display_name, keymap_code)
     except FileNotFoundError:
-        print("ERROR: localectl command not found. Using fallback layouts.")
-        return [("English (US)", "us"), ("English (UK)", "gb"), ("German", "de"), ("French", "fr")]
+        raise RuntimeError("localectl is required for keyboard layouts. Install systemd or ensure localectl is in PATH.")
     except (subprocess.CalledProcessError, Exception) as e:
-        print(f"ERROR: list-keymaps failed: {e}. Using fallback.")
-        return [("English (US)", "us"), ("English (UK)", "gb"), ("German", "de"), ("French", "fr")]
+        raise RuntimeError(f"localectl list-keymaps failed: {e}") from e
 
 def ana_get_available_locales():
     """Fetches available locales using localectl."""
@@ -117,24 +108,17 @@ def ana_get_available_locales():
              locales[locale_code] = display_name 
              
         print(f"  Found {len(locales)} locales.")
-        # Sort by display name for UI
         sorted_locales = dict(sorted(locales.items(), key=lambda item: item[1]))
-        return sorted_locales if sorted_locales else {"en_US.UTF-8": "English (US)"} # Fallback
-        
+        if not sorted_locales:
+            raise RuntimeError("localectl list-locales returned no locales.")
+        return sorted_locales
+
     except FileNotFoundError:
-        print("ERROR: localectl command not found. Using fallback locales.")
+        raise RuntimeError("localectl is required for locales. Install systemd or ensure localectl is in PATH.") from None
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: localectl list-locales failed: {e}. Using fallback locales.")
+        raise RuntimeError(f"localectl list-locales failed: {e}") from e
     except Exception as e:
-        print(f"ERROR: Unexpected error fetching locales: {e}. Using fallback locales.")
-        
-    # Fallback list if errors occurred
-    return {
-        "en_US.UTF-8": "English (US)",
-        "es_ES.UTF-8": "Spanish (Spain)",
-        "fr_FR.UTF-8": "French (France)",
-        "de_DE.UTF-8": "German (Germany)"
-    } 
+        raise RuntimeError(f"Unexpected error fetching locales: {e}") from e 
 
 # Note: Avoid importing GUI or app-specific constants here to keep utils lightweight.
 

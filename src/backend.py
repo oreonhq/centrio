@@ -320,14 +320,8 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                      result = subprocess.run(umount_cmd, capture_output=True, text=True, check=True, timeout=30)
                      print(f"    Successfully unmounted {mount_target}")
                  except subprocess.CalledProcessError as e:
-                     print(f"    Warning: Failed to unmount {mount_target}: {e.stderr.strip()}")
-                     # Try lazy unmount as fallback
-                     try:
-                         lazy_umount_cmd = ["umount", "-l", mount_target]
-                         subprocess.run(lazy_umount_cmd, capture_output=True, text=True, check=True, timeout=15)
-                         print(f"    Lazy unmount successful for {mount_target}")
-                     except Exception as lazy_e:
-                         print(f"    Warning: Lazy unmount also failed for {mount_target}: {lazy_e}")
+                     print(f"    Failed to unmount {mount_target}: {e.stderr.strip()}")
+                     raise
                  except Exception as e:
                      print(f"    Warning: Error unmounting {mount_target}: {e}")
         except Exception as e:
@@ -646,8 +640,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
     os_info = get_os_release_info()
     releasever = os_info.get("VERSION_ID")
     if not releasever:
-        print("Warning: Could not detect OS VERSION_ID. Falling back to default.")
-        releasever = "40" # Default fallback
+        raise RuntimeError("Could not detect OS VERSION_ID for DNF. Set releasever or fix /etc/os-release.")
     print(f"Using release version: {releasever}")
     
     # Build DNF command with package exclusions
@@ -1261,13 +1254,8 @@ def verify_grub_packages(target_root):
             "efibootmgr"
         ]
     else:
-        # Generic fallback
-        required_grub_packages = [
-            "grub2-efi-x64",
-            "grub2-tools",
-            "grub2-common"
-        ]
-    
+        return False, f"Unsupported distribution for GRUB: {distro_id}. Supported: Fedora, RHEL/CentOS/Rocky/AlmaLinux, Debian/Ubuntu, Arch.", None
+
     print(f"Checking for GRUB packages: {required_grub_packages}")
     
     missing_packages = []
@@ -1404,13 +1392,14 @@ def copy_live_environment(target_root, progress_callback=None):
     # Use cp with progress tracking
     total_dirs = len(copy_directories)
     completed_dirs = 0
-    
+    progress_fraction = 0.1
+
     for directory in copy_directories:
         source = directory
         destination = os.path.join(target_root, directory.lstrip('/'))
         
         # If the source is a symlink (e.g., /bin -> /usr/bin), try to replicate the symlink.
-        # If symlink creation is not permitted by the filesystem, fall back to copying contents.
+        # If symlink creation is not permitted by the filesystem, copy contents instead.
         try:
             if os.path.islink(source):
                 try:
@@ -1435,9 +1424,9 @@ def copy_live_environment(target_root, progress_callback=None):
                     continue
                 except OSError as e:
                     # Most commonly, the target filesystem may not permit symlinks.
-                    print(f"Warning: Could not create symlink for {directory}: {e}. Falling back to copying contents.")
+                    print(f"Warning: Could not create symlink for {directory}: {e}. Copying contents instead.")
         except Exception as e:
-            print(f"Warning: Symlink handling failed for {directory}: {e}. Falling back to copying contents.")
+            print(f"Warning: Symlink handling failed for {directory}: {e}. Copying contents instead.")
         
         # Create destination directory if it doesn't exist
         os.makedirs(destination, exist_ok=True)
@@ -1447,29 +1436,22 @@ def copy_live_environment(target_root, progress_callback=None):
         try:
             # Use find to copy all files and directories from source to destination
             # This avoids the "copy into itself" issue
-            # Use rsync when available for robust copying with symlink handling and filesystem boundary constraints
+            # Use rsync when available for robust copying with symlink handling and filesystem boundary constraints.
+            # --no-xattrs: avoid copying extended attributes (e.g. security.selinux); target may be vfat (EFI) or
+            #              other fs that don't support xattrs, which causes "operation not supported" and transfer errors.
             rsync_path = shutil.which("rsync")
-            if rsync_path:
-                # -aHAX: archive, hardlinks, ACLs, xattrs; -S: sparse; --one-file-system: don't cross mounts
-                # We copy the contents of the top-level dir, not the dir itself
-                rsync_cmd = [
-                    rsync_path,
-                    "-aHAXS",
-                    "--one-file-system",
-                    f"{source}/",
-                    destination,
-                ]
-                result = subprocess.run(rsync_cmd, capture_output=True, text=True, check=True, timeout=1800)
-            else:
-                # Fallback to find+cp preserving attributes and not crossing mounts
-                find_cmd = [
-                    "find", source,
-                    "-mindepth", "1",
-                    "-maxdepth", "1",
-                    "-xdev",
-                    "-exec", "cp", "-a", "--preserve=all", "{}", destination, ";"
-                ]
-                result = subprocess.run(find_cmd, capture_output=True, text=True, check=True, timeout=1800)
+            if not rsync_path:
+                return False, "rsync is required for live environment copy. Install rsync."
+            rsync_cmd = [
+                rsync_path,
+                "-aHAXS",
+                "--one-file-system",
+                "--no-xattrs",
+                "--no-acls",
+                f"{source}/",
+                destination,
+            ]
+            result = subprocess.run(rsync_cmd, capture_output=True, text=True, check=True, timeout=1800)
             
             completed_dirs += 1
             progress_fraction = 0.1 + (completed_dirs / total_dirs) * 0.8
@@ -1624,7 +1606,7 @@ def generate_fstab_for_target(target_root):
             try:
                 source, target, fstype, options = (field.strip() for field in line.split())
             except ValueError:
-                # Some fields might contain spaces; fall back to a more robust split
+                # Some fields might contain spaces; use a more robust split
                 parts = line.split()
                 if len(parts) < 3:
                     continue

@@ -7,7 +7,6 @@ gi.require_version('Adw', '1')
 try:
     from gi.repository import Gtk, Adw, GLib  # type: ignore
 except ImportError:
-    # Fallback for environments where gi might not be available
     print("Warning: gi.repository could not be imported")
     raise
 

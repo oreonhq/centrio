@@ -31,7 +31,6 @@ class BaseConfigurationPage(Adw.PreferencesPage):
             toast.set_timeout(timeout)
             self.overlay_widget.add_toast(toast)
         else:
-            # Fallback: print to console
             print(f"Toast: {message}")
 
     def mark_complete_and_return(self, button, config_values=None):
