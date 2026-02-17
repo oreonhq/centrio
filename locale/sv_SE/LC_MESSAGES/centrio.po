@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Swedish\n"
+"Language: sv_SE\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Välkommen till {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Konfigurera ditt nya operativsystem i några enkla steg."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Språk"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Installationsspråk"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Installationsöversikt"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Operativsystem"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Installationstyp"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Full skrivbordsmiljö med program"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Uppskattad tid"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minuter"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Klicka på Nästa för att börja konfigurera."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Språk ändrat"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Språket har ändrats. Starta om installationsprogrammet."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Språk valt"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Installationsprogrammet startas om för att tillämpa det nya språket."

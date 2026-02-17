@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Slovak\n"
+"Language: sk_SK\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Vitajte v {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Nastavte si nový operačný systém v niekoľkých jednoduchých krokoch."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Jazyk"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Jazyk inštalátora"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Prehľad inštalácie"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Operačný systém"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Typ inštalácie"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Plná pracovná plocha s aplikáciami"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Odhadovaný čas"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minút"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Kliknite na Ďalší pre začatie konfigurácie."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Jazyk zmenený"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Jazyk bol zmenený. Reštartujte inštalátor."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Jazyk vybratý"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Inštalátor sa reštartuje pre použitie nového jazyka."

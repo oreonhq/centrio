@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Catalan\n"
+"Language: ca_ES\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Benvingut a {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Configureu el nou sistema operatiu en uns passos simples."
 
 msgid "Language"
 msgstr "Idioma"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Idioma de l'instal·lador"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Resum de la instal·lació"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Sistema operatiu"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Tipus d'instal·lació"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Escriptori complet amb aplicacions"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Temps estimat"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minuts"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Feu clic a Següent per començar la configuració."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Idioma canviat"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "L'idioma s'ha canviat. Reinicieu l'instal·lador."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Idioma seleccionat"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "L'instal·lador es reiniciarà per aplicar la nova llengua."

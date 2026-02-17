@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_CN\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "欢迎使用 {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "通过几个简单步骤设置您的新操作系统。"
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "语言"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "安装程序语言"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "安装概览"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "操作系统"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "安装类型"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "带应用程序的完整桌面"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "预计时间"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 分钟"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "点击“下一步”开始配置。"
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "语言已更改"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "语言已更改。请重新启动安装程序以查看更改。"
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "已选择语言"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "安装程序将重新启动以应用新语言。"

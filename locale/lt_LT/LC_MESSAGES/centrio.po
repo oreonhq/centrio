@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Lithuanian\n"
+"Language: lt_LT\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Sveiki atvykę į {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Nustatykite naują operacinę sistemą keliais paprastais žingsniais."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Kalba"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Diegiklio kalba"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Diegimo apžvalga"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Operacinė sistema"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Diegimo tipas"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Pilna darbalaukis su programomis"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Numatytas laikas"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minučių"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Spustelėkite Toliau, kad pradėtumėte konfigūraciją."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Kalba pakeista"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Kalba pakeista. Perleiskite diegiklį."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Kalba pasirinkta"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Diegiklis bus perleistas, kad pritaikytų naują kalbą."

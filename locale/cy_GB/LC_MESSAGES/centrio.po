@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Welsh\n"
+"Language: cy_GB\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Croeso i {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Ffurfweddu eich system weithredu newydd mewn ychydig gamau syml."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Iaith"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Iaith y gosodwr"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Trosolwg gosod"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "System weithredu"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Math o osod"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Penbwrdd llawn gyda cheisiadau"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Amcangyfrif o amser"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 munud"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Cliciwch Nesaf i ddechrau'r ffurfweddiad."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Iaith wedi newid"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Mae'r iaith wedi newid. Ailgychwynnwch y gosodwr."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Iaith wedi'i dewis"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Bydd y gosodwr yn ailgychwyn i weithredu'r iaith newydd."

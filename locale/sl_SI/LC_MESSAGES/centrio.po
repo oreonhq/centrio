@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Slovenian\n"
+"Language: sl_SI\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Dobrodošli v {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Nastavite novi operacijski sistem v nekaj preprostih korakih."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Jezik"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Jezik namestitvenega programa"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Pregled namestitve"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Operacijski sistem"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Vrsta namestitve"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Polna namizje z aplikacijami"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Ocenjeni čas"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minut"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Kliknite Naprej za začetek konfiguracije."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Jezik spremenjen"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Jezik je bil spremenjen. Znova zaženite namestitveni program."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Jezik izbran"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Namestitveni program se bo znova zagnal za uporabo novega jezika."

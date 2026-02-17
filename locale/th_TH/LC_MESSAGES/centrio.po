@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Thai\n"
+"Language: th_TH\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Welcome to {}"
+msgstr "ยินดีต้อนรับสู่ {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "ตั้งค่าระบบปฏิบัติการใหม่ในไม่กี่ขั้นตอน"
+
+msgid "Language"
+msgstr "ภาษา"
+
+msgid "Installer Language"
+msgstr "ภาษาของตัวติดตั้ง"
+
+msgid "Installation Overview"
+msgstr "ภาพรวมการติดตั้ง"
+
+msgid "Operating System"
+msgstr "ระบบปฏิบัติการ"
+
+msgid "Installation Type"
+msgstr "ประเภทการติดตั้ง"
+
+msgid "Full desktop with applications"
+msgstr "เดสก์ท็อปเต็มรูปแบบพร้อมแอปพลิเคชัน"
+
+msgid "Estimated Time"
+msgstr "เวลาโดยประมาณ"
+
+msgid "15-30 minutes"
+msgstr "15-30 นาที"
+
+msgid "Click Next to begin configuration."
+msgstr "คลิก ถัดไป เพื่อเริ่มการกำหนดค่า"
+
+msgid "Language Changed"
+msgstr "เปลี่ยนภาษาแล้ว"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "ภาษาได้ถูกเปลี่ยนแล้ว กรุณาเริ่มตัวติดตั้งใหม่เพื่อดูการเปลี่ยนแปลง"
+
+msgid "Language Selected"
+msgstr "เลือกภาษาแล้ว"
+
+msgid "The installer will restart to apply the new language."
+msgstr "ตัวติดตั้งจะเริ่มใหม่เพื่อใช้ภาษาใหม่"

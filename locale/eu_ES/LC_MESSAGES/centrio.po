@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Basque\n"
+"Language: eu_ES\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Ongi etorri {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Konfiguratu zure sistema eragile berria urrats sinple batzuetan."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Hizkuntza"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Instalatzaileren hizkuntza"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Instalazioaren ikuspegi orokorra"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Sistema eragilea"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Instalazio mota"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Mahaigain osoa aplikazioekin"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Denbora gutxi gorabehera"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minutu"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Egin klik Hurrengoa konfigurazioa hasteko."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Hizkuntza aldatu da"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Hizkuntza aldatu da. Berrabiarazi instalatzailea."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Hizkuntza hautatuta"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Instalatzailea berrabiaraziko da hizkuntza berria aplikatzeko."

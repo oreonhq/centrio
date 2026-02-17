@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Finnish\n"
+"Language: fi_FI\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "Tervetuloa kohteeseen {}"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Asenna uusi käyttöjärjestelmä muutamassa yksinkertaisessa vaiheessa."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Kieli"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Asennusohjelman kieli"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Asennuksen yhteenveto"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "Käyttöjärjestelmä"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Asennustyyppi"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Täysi työpöytä sovelluksineen"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Arvioitu aika"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 minuuttia"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Napsauta Seuraava aloittaaksesi määrityksen."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Kieli vaihdettu"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Kieli on vaihdettu. Käynnistä asennusohjelma uudelleen."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Kieli valittu"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Asennusohjelma käynnistetään uudelleen uuden kielen käyttöönottoa varten."

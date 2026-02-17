@@ -5,54 +5,54 @@ msgstr ""
 "POT-Creation-Date: 2025-08-05 14:30+0000\n"
 "PO-Revision-Date: 2026-02-17+0000\n"
 "Last-Translator: \n"
-"Language-Team: Spanish\n"
-"Language: es_ES\n"
+"Language-Team: Turkish\n"
+"Language: tr_TR\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Welcome to {}"
-msgstr "Bienvenido a {}"
+msgstr "{} hoş geldiniz"
 
 msgid "Set up your new operating system in a few simple steps."
-msgstr "Configure su nuevo sistema operativo en unos pocos pasos simples."
+msgstr "Yeni işletim sisteminizi birkaç basit adımda kurun."
 
 msgid "Language"
-msgstr "Idioma"
+msgstr "Dil"
 
 msgid "Installer Language"
-msgstr "Idioma del Instalador"
+msgstr "Yükleyici dili"
 
 msgid "Installation Overview"
-msgstr "Resumen de la Instalación"
+msgstr "Kurulum özeti"
 
 msgid "Operating System"
-msgstr "Sistema Operativo"
+msgstr "İşletim sistemi"
 
 msgid "Installation Type"
-msgstr "Tipo de Instalación"
+msgstr "Kurulum türü"
 
 msgid "Full desktop with applications"
-msgstr "Escritorio completo con aplicaciones"
+msgstr "Uygulamalı tam masaüstü"
 
 msgid "Estimated Time"
-msgstr "Tiempo Estimado"
+msgstr "Tahmini süre"
 
 msgid "15-30 minutes"
-msgstr "15-30 minutos"
+msgstr "15-30 dakika"
 
 msgid "Click Next to begin configuration."
-msgstr "Haga clic en Siguiente para comenzar la configuración."
+msgstr "Yapılandırmaya başlamak için İleri'ye tıklayın."
 
 msgid "Language Changed"
-msgstr "Idioma Cambiado"
+msgstr "Dil değiştirildi"
 
 msgid "The language has been changed. Please restart the installer to see the changes."
-msgstr "El idioma ha sido cambiado. Por favor reinicie el instalador para ver los cambios."
+msgstr "Dil değiştirildi. Değişiklikleri görmek için yükleyiciyi yeniden başlatın."
 
 msgid "Language Selected"
-msgstr "Idioma Seleccionado"
+msgstr "Dil seçildi"
 
 msgid "The installer will restart to apply the new language."
-msgstr "El instalador se reiniciará para aplicar el nuevo idioma."
+msgstr "Yeni dili uygulamak için yükleyici yeniden başlatılacak."
