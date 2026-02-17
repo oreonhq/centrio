@@ -129,8 +129,9 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     if not vok:
         return False, verr or "Required GRUB packages missing."
 
-    # Shim + GRUB: from host or grub2-install
-    shim_src, grub_src = _find_shim_grub_on_host()
+    # Shim from host (for Secure Boot); GRUB must be installed via grub2-install in chroot
+    # so the embedded prefix points to EFI/Oreon and it finds grub.cfg on the installed system.
+    shim_src, _ = _find_shim_grub_on_host()
     if not shim_src:
         return False, "Could not find shim (shimx64.efi/BOOTX64.EFI) on live system; required for UEFI/Secure Boot."
 
@@ -138,43 +139,35 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     bootx64_dst = os.path.join(efi_oreon, "BOOTX64.EFI")
     grub_dst = os.path.join(efi_oreon, "grubx64.efi")
 
-    # Use shutil.copy (content only) for EFI partition: vfat does not support xattrs/SELinux
     try:
         shutil.copy(shim_src, shim_dst)
         shutil.copy(shim_src, bootx64_dst)
     except Exception as e:
         return False, f"Failed to copy shim: {e}"
 
-    if grub_src:
-        try:
-            shutil.copy(grub_src, grub_dst)
-        except Exception as e:
-            return False, f"Failed to copy grub: {e}"
-    else:
-        # Create via grub2-install in chroot
-        cmd = [
-            "grub2-install", "--target=x86_64-efi",
-            "--efi-directory=/boot/efi", f"--bootloader-id={BOOTLOADER_ID}",
-            "--no-nvram", "--removable"
-        ]
-        ok, err, _ = _run_in_chroot(target_root, cmd, "GRUB EFI install", progress_callback, timeout=180)
-        if not ok:
-            return False, f"grub2-install (UEFI) failed: {err}"
-        # grub2-install may create under EFI/BOOT or EFI/Oreon; copy to our path if needed
-        for d in [efi_oreon, efi_boot]:
-            cand = os.path.join(d, "grubx64.efi")
-            if os.path.exists(cand) and (not os.path.exists(grub_dst) or os.path.getsize(cand) > 0):
-                if cand != grub_dst:
-                    shutil.copy(cand, grub_dst)
+    # Always run grub2-install in chroot so grubx64.efi has prefix (hd0,gptN)/EFI/Oreon and finds grub.cfg.
+    cmd = [
+        "grub2-install", "--target=x86_64-efi",
+        "--efi-directory=/boot/efi", f"--bootloader-id={BOOTLOADER_ID}",
+        "--no-nvram", "--removable"
+    ]
+    ok, err, _ = _run_in_chroot(target_root, cmd, "GRUB EFI install", progress_callback, timeout=180)
+    if not ok:
+        return False, f"grub2-install (UEFI) failed: {err}"
+    for d in [efi_oreon, efi_boot]:
+        cand = os.path.join(d, "grubx64.efi")
+        if os.path.exists(cand) and (not os.path.exists(grub_dst) or os.path.getsize(cand) > 0):
+            if cand != grub_dst:
+                shutil.copy(cand, grub_dst)
+            break
+    if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
+        for p in [os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
+                  os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi")]:
+            if os.path.exists(p):
+                shutil.copy(p, grub_dst)
                 break
         if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
-            for p in [os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
-                      os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi")]:
-                if os.path.exists(p):
-                    shutil.copy(p, grub_dst)
-                    break
-            if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
-                return False, "Could not create or find grubx64.efi."
+            return False, "Could not create or find grubx64.efi."
 
     efi_boot_shim = os.path.join(efi_boot, "BOOTX64.EFI")
     shutil.copy(shim_src, efi_boot_shim)

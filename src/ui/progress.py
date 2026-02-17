@@ -50,17 +50,22 @@ class ProgressPage(Gtk.Box):
     def _update_progress_text(self, text, fraction=None):
         """Helper to update progress bar text and optionally fraction via GLib.idle_add."""
         def update():
-            # This code runs in the main GTK thread
             self.progress_label.set_text(text)
             if fraction is not None:
-                # Keep track of the latest known overall fraction
-                self.progress_value = max(self.progress_value, fraction) 
+                self.progress_value = max(self.progress_value, fraction)
                 clamped_fraction = max(0.0, min(self.progress_value, 1.0))
                 self.progress_bar.set_fraction(clamped_fraction)
                 self.progress_bar.set_text(f"{int(clamped_fraction * 100)}%")
-            # Always log the text update
-            print(f"Progress Update: {text} (Overall Fraction: {fraction if fraction is not None else '[text only]' })") 
+            print(f"Progress Update: {text} (Overall Fraction: {fraction if fraction is not None else '[text only]' })")
         GLib.idle_add(update)
+
+    def _scaled_progress_callback(self, step_start, step_end):
+        """Return a progress callback that maps backend fraction [0,1] to [step_start, step_end]."""
+        def cb(text, fraction=None):
+            if fraction is not None:
+                fraction = step_start + (step_end - step_start) * max(0.0, min(1.0, float(fraction)))
+            self._update_progress_text(text, fraction)
+        return cb
 
     def _attempt_unmount(self):
         """Attempts to unmount filesystems mounted under target_root."""
@@ -680,21 +685,23 @@ class ProgressPage(Gtk.Box):
         print("Using live environment copy method...")
         self._update_progress_text("Starting live environment copy (This is much faster than package installation)...", 0.35)
         
-        # Step 1: Copy the live environment
+        # Step 1: Copy the live environment (progress 0.30 -> 0.60)
+        copy_cb = self._scaled_progress_callback(0.30, 0.60)
         success, err = backend.copy_live_environment(
             self.target_root,
-            progress_callback=self._update_progress_text
+            progress_callback=copy_cb
         )
         
         if not success:
             self.installation_error = err
             return False
         
-        # Step 2: Setup the copied environment
-        self._update_progress_text("Setting up copied environment...", 0.75)
+        # Step 2: Setup the copied environment (0.60 -> 0.68)
+        self._update_progress_text("Setting up copied environment...", 0.62)
+        setup_cb = self._scaled_progress_callback(0.60, 0.68)
         success, err = backend.setup_live_environment_post_copy(
             self.target_root,
-            progress_callback=self._update_progress_text
+            progress_callback=setup_cb
         )
         
         if not success:
@@ -711,12 +718,12 @@ class ProgressPage(Gtk.Box):
         print(f"  network_config: {network_config}")
         
         if skip_network:
-            self._update_progress_text("Network configuration skipped - only base system installed.", 0.85)
+            self._update_progress_text("Network configuration skipped - only base system installed.", 0.70)
             print("Network configuration skipped - no additional packages will be installed")
             return True
         
         if not network_enabled:
-            self._update_progress_text("Network disabled - only base system installed.", 0.85)
+            self._update_progress_text("Network disabled - only base system installed.", 0.70)
             print("Network disabled - no additional packages will be installed")
             return True
         
@@ -734,14 +741,12 @@ class ProgressPage(Gtk.Box):
         
         # Double-check: if network is disabled, don't install any packages
         if not network_enabled or skip_network:
-            self._update_progress_text("Network disabled - only base system installed.", 0.85)
+            self._update_progress_text("Network disabled - only base system installed.", 0.70)
             print("Network disabled - no additional packages will be installed (double-check)")
             return True
         
         if packages or repositories or flatpak_enabled:
-            self._update_progress_text("Installing additional packages on live environment...", 0.8)
-            
-            # Build package configuration for additional packages
+            self._update_progress_text("Installing additional packages on live environment...", 0.68)
             package_config = {
                 "packages": packages,
                 "repositories": repositories,
@@ -750,21 +755,21 @@ class ProgressPage(Gtk.Box):
                 "minimal_install": False,
                 "keep_cache": True
             }
-            
+            # Map backend 0-1 to step band 0.68-0.75
+            pkg_cb = self._scaled_progress_callback(0.68, 0.75)
             success, err = backend.install_packages_on_live_copy(
                 self.target_root,
                 package_config,
-                progress_callback=self._update_progress_text
+                progress_callback=pkg_cb
             )
-            
             if not success:
                 self.installation_error = err
                 return False
         else:
-            self._update_progress_text("No additional packages selected - base system only.", 0.85)
+            self._update_progress_text("No additional packages selected - base system only.", 0.70)
             print("No additional packages selected - base system only")
         
-        self._update_progress_text("Live environment copy and setup complete.", 0.85)
+        self._update_progress_text("Live environment copy and setup complete.", 0.75)
         return True
 
     def _install_packages(self, config_data):
@@ -855,7 +860,7 @@ class ProgressPage(Gtk.Box):
         
         if not bootloader_config.get('install_bootloader', False):
             print("Skipping bootloader installation.")
-            self._update_progress_text("Bootloader installation skipped.", 0.9)
+            self._update_progress_text("Bootloader installation skipped.", 0.97)
             return True
 
         # Determine primary disk and EFI partition (if exists)
@@ -874,17 +879,16 @@ class ProgressPage(Gtk.Box):
         # Note: We might proceed even without an EFI partition found here, 
         # backend function will handle BIOS vs UEFI logic.
 
-        self._update_progress_text("Installing bootloader...", 0.9)
-        
+        self._update_progress_text("Installing bootloader...", 0.87)
+        boot_cb = self._scaled_progress_callback(0.87, 0.97)
         success, err, _ = backend.install_bootloader_in_container(
-            self.target_root, 
-            primary_disk, 
-            efi_partition_device, # Pass EFI partition device
-            progress_callback=self._update_progress_text
+            self.target_root,
+            primary_disk,
+            efi_partition_device,
+            progress_callback=boot_cb
         )
-        
         if success:
-            self._update_progress_text("Bootloader installed.", 0.95)
+            self._update_progress_text("Bootloader installed.", 0.97)
             # Clean up EFI mount after successful bootloader installation
             backend.cleanup_efi_mount(self.target_root)
         else:

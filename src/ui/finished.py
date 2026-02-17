@@ -31,7 +31,12 @@ class FinishedPage(Gtk.Box):
         self.append(reboot_button)
 
     def on_reboot(self, button):
-        print("Reboot requested! (Simulated)")
-        # In a real scenario, this would trigger a system reboot command
-        # For safety in this simulation, we just quit the app.
-        self.app.quit() 
+        import subprocess
+        print("Reboot requested.")
+        try:
+            subprocess.run(["systemctl", "reboot"], check=True, timeout=5)
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"Reboot failed (run installer as root for reboot): {e}")
+            self.app.quit()
+        else:
+            self.app.quit() 
