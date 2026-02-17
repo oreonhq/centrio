@@ -1,5 +1,17 @@
 # centrio_installer/install_logic.py
-# serves as the backend for bootloader installation and by progress for flow.
+# Backend for bootloader installation (UEFI and BIOS).
+#
+# How distros typically do UEFI GRUB (no grub2-install for EFI):
+# - Fedora/RHEL (Anaconda): Does NOT run grub2-install for UEFI. Requires packages
+#   grub2-efi-x64 and shim-x64; the RPMs install signed shim/grub to the target.
+#   Installer runs gen_grub_cfgstub, grub2-mkconfig, and efibootmgr to add NVRAM
+#   entry pointing at shimx64.efi. See pyanaconda bootloader/efi.py (EFIGRUB).
+# - Calamares: Uses grub-install for EFI (can hit "should not be used for EFI" and
+#   may use --force or distro-specific paths).
+# - Debian: grub-efi has hardcoded id "debian"; must use EFI/debian and stub grub.cfg.
+#
+# We follow the Fedora model: use distro signed shim + grub (from target), write
+# grub.cfg, register with efibootmgr. No grub2-install for UEFI.
 
 import os
 import re
@@ -129,8 +141,7 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     if not vok:
         return False, verr or "Required GRUB packages missing."
 
-    # Shim from host (for Secure Boot); GRUB must be installed via grub2-install in chroot
-    # so the embedded prefix points to EFI/Oreon and it finds grub.cfg on the installed system.
+    # Shim from host (signed, for Secure Boot). GRUB: distro's signed grub from target only.
     shim_src, _ = _find_shim_grub_on_host()
     if not shim_src:
         return False, "Could not find shim (shimx64.efi/BOOTX64.EFI) on live system; required for UEFI/Secure Boot."
@@ -145,29 +156,21 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     except Exception as e:
         return False, f"Failed to copy shim: {e}"
 
-    # Always run grub2-install in chroot so grubx64.efi has prefix (hd0,gptN)/EFI/Oreon and finds grub.cfg.
-    cmd = [
-        "grub2-install", "--target=x86_64-efi",
-        "--efi-directory=/boot/efi", f"--bootloader-id={BOOTLOADER_ID}",
-        "--no-nvram", "--removable"
+    signed_grub_paths = [
+        os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
+        os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi"),
     ]
-    ok, err, _ = _run_in_chroot(target_root, cmd, "GRUB EFI install", progress_callback, timeout=180)
-    if not ok:
-        return False, f"grub2-install (UEFI) failed: {err}"
-    for d in [efi_oreon, efi_boot]:
-        cand = os.path.join(d, "grubx64.efi")
-        if os.path.exists(cand) and (not os.path.exists(grub_dst) or os.path.getsize(cand) > 0):
-            if cand != grub_dst:
-                shutil.copy(cand, grub_dst)
-            break
-    if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
-        for p in [os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
-                  os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi")]:
-            if os.path.exists(p):
+    grub_copied = False
+    for p in signed_grub_paths:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            try:
                 shutil.copy(p, grub_dst)
+                grub_copied = True
                 break
-        if not os.path.exists(grub_dst) or os.path.getsize(grub_dst) == 0:
-            return False, "Could not create or find grubx64.efi."
+            except Exception as e:
+                return False, f"Could not copy signed GRUB from {p}: {e}"
+    if not grub_copied:
+        return False, "Signed GRUB (grubx64.efi) not found in target. Required paths: " + ", ".join(signed_grub_paths) + ". Install grub2-efi-x64 (or equivalent) in the target system."
 
     efi_boot_shim = os.path.join(efi_boot, "BOOTX64.EFI")
     shutil.copy(shim_src, efi_boot_shim)
