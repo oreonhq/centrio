@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import shlex
+import tempfile
 
 # Helpers from backend (imported at use site to avoid circular deps)
 def _run_command(command_list, description, progress_callback=None, timeout=None, pipe_input=None):
@@ -163,22 +164,12 @@ def _find_shim_grub_on_host():
 
 def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
     """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
-    signed shim+grub from host, stub grub.cfg on ESP. Returns (success, error_msg, efi_install_id)."""
-    efi_mount_point = os.path.join(target_root, "boot", "efi")
-    if not efi_partition_device and os.path.ismount(efi_mount_point):
-        try:
-            r = subprocess.run(
-                ["findmnt", "-n", "-o", "SOURCE", "--target", efi_mount_point],
-                capture_output=True, text=True, check=False, timeout=10
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                efi_partition_device = r.stdout.strip()
-        except Exception:
-            pass
-
-    ok, err, _ = _efi_partition_ensure_mounted(target_root, efi_partition_device)
-    if not ok:
-        return False, err or "EFI partition not available.", None
+    signed shim+grub from host, stub grub.cfg on ESP.
+    Mounts the target ESP to a private temp dir so we always write to the correct partition."""
+    if not efi_partition_device:
+        return False, "UEFI install requires the EFI partition device (e.g. /dev/sda1).", None
+    if not os.path.exists(efi_partition_device):
+        return False, "EFI partition device does not exist: %s" % efi_partition_device, None
 
     from backend import verify_grub_packages
     vok, verr, _ = verify_grub_packages(target_root)
@@ -189,77 +180,93 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     if not shim_src or not grub_src:
         return False, "Host has no signed shim/grub in /boot/efi/EFI (need e.g. EFI/almalinux).", None
 
-    # Match Anaconda layout: use vendor dir (almalinux) so layout matches working Oreon installs.
     efi_install_id = efi_vendor if efi_vendor else "almalinux"
-    efi_dir = os.path.join(efi_mount_point, "EFI", efi_install_id)
-    efi_boot = os.path.join(efi_mount_point, "EFI", "BOOT")
+    tmp_mount = tempfile.mkdtemp(prefix="centrio_efi_")
     try:
-        os.makedirs(efi_dir, exist_ok=True)
-        os.makedirs(efi_boot, exist_ok=True)
-    except Exception as e:
-        return False, f"Failed to create EFI dirs: {e}", None
+        r = subprocess.run(
+            ["mount", efi_partition_device, tmp_mount],
+            capture_output=True, text=True, check=False, timeout=30
+        )
+        if r.returncode != 0:
+            return False, "Failed to mount ESP at temp dir: %s" % (r.stderr or r.stdout or ""), None
 
-    # Copy full vendor dir from host so we get shim, grub, and any .efi/.CSV (like Anaconda).
-    host_vendor_dir = os.path.join("/boot/efi/EFI", efi_install_id)
-    if os.path.isdir(host_vendor_dir):
-        for name in os.listdir(host_vendor_dir):
-            src = os.path.join(host_vendor_dir, name)
-            if os.path.isfile(src):
-                try:
-                    shutil.copy2(src, os.path.join(efi_dir, name))
-                except Exception as e:
-                    return False, f"Failed to copy {name} from host EFI: {e}", None
-    else:
-        # Fallback: copy only shim and grub we found.
+        efi_dir = os.path.join(tmp_mount, "EFI", efi_install_id)
+        efi_boot = os.path.join(tmp_mount, "EFI", "BOOT")
         try:
-            shutil.copy2(shim_src, os.path.join(efi_dir, "shimx64.efi"))
-            shutil.copy2(grub_src, os.path.join(efi_dir, "grubx64.efi"))
+            os.makedirs(efi_dir, exist_ok=True)
+            os.makedirs(efi_boot, exist_ok=True)
         except Exception as e:
-            return False, f"Failed to copy shim/grub: {e}", None
+            subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+            return False, f"Failed to create EFI dirs on ESP: {e}", None
 
-    # Fallback boot: EFI/BOOT/BOOTX64.EFI (shim).
-    try:
-        shutil.copy2(shim_src, os.path.join(efi_boot, "BOOTX64.EFI"))
-    except Exception as e:
-        return False, f"Failed to copy shim to EFI/BOOT: {e}", None
+        host_vendor_dir = os.path.join("/boot/efi/EFI", efi_install_id)
+        if os.path.isdir(host_vendor_dir):
+            for name in os.listdir(host_vendor_dir):
+                src = os.path.join(host_vendor_dir, name)
+                if os.path.isfile(src):
+                    try:
+                        shutil.copy2(src, os.path.join(efi_dir, name))
+                    except Exception as e:
+                        subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+                        return False, f"Failed to copy {name} from host EFI: {e}", None
+        else:
+            try:
+                shutil.copy2(shim_src, os.path.join(efi_dir, "shimx64.efi"))
+                shutil.copy2(grub_src, os.path.join(efi_dir, "grubx64.efi"))
+            except Exception as e:
+                subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+                return False, f"Failed to copy shim/grub: {e}", None
 
-    root_uuid = _get_root_uuid(target_root)
-    if not root_uuid:
-        return False, "Could not determine root filesystem UUID for GRUB stub.", None
+        try:
+            shutil.copy2(shim_src, os.path.join(efi_boot, "BOOTX64.EFI"))
+        except Exception as e:
+            subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+            return False, f"Failed to copy shim to EFI/BOOT: {e}", None
 
-    # Stub grub.cfg on ESP (UnifyGrubConfig style): find root by UUID, load real config from /boot/grub2.
-    stub_cfg = (
-        "search.fs_uuid %s root\nset prefix=($root)/boot/grub2\nconfigfile $prefix/grub.cfg\n"
-        % root_uuid
-    )
-    efi_grub_cfg = os.path.join(efi_dir, "grub.cfg")
-    try:
-        with open(efi_grub_cfg, "w") as f:
-            f.write(stub_cfg)
-    except Exception as e:
-        return False, "Failed to write stub grub.cfg on ESP: %s" % e, None
+        root_uuid = _get_root_uuid(target_root)
+        if not root_uuid:
+            subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+            return False, "Could not determine root filesystem UUID for GRUB stub.", None
 
-    # Verify vendor dir on ESP so we never leave it missing.
-    if not os.path.isdir(efi_dir):
-        return False, "EFI/%s was not created on ESP." % efi_install_id, None
-    has_cfg = os.path.isfile(os.path.join(efi_dir, "grub.cfg"))
-    has_shim = os.path.isfile(os.path.join(efi_dir, "shimx64.efi"))
-    has_grub = os.path.isfile(os.path.join(efi_dir, "grubx64.efi"))
-    if not has_cfg or (not has_shim and not has_grub):
-        return False, "ESP missing EFI/%s/grub.cfg or shim/grub. Check that target ESP was mounted." % efi_install_id, None
+        stub_cfg = (
+            "search.fs_uuid %s root\nset prefix=($root)/boot/grub2\nconfigfile $prefix/grub.cfg\n"
+            % root_uuid
+        )
+        efi_grub_cfg = os.path.join(efi_dir, "grub.cfg")
+        try:
+            with open(efi_grub_cfg, "w") as f:
+                f.write(stub_cfg)
+        except Exception as e:
+            subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+            return False, "Failed to write stub grub.cfg on ESP: %s" % e, None
 
-    # NVRAM: point to shim in vendor dir (AlmaLinux/Oreon use shimx64.efi there).
-    if efi_partition_device:
-        match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
-                re.match(r"(/dev/nvme\d+n\d+)p(\d+)", efi_partition_device) or
-                re.match(r"(/dev/mmcblk\d+)p(\d+)", efi_partition_device))
-        if match:
-            efi_disk, efi_part = match.group(1), match.group(2)
-            loader = "\\EFI\\" + efi_install_id + "\\shimx64.efi"
-            subprocess.run(
-                ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", efi_install_id, "-l", loader],
-                capture_output=True, text=True, check=False, timeout=60
-            )
+        try:
+            os.sync()
+        except Exception:
+            pass
+        subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+    finally:
+        try:
+            if os.path.ismount(tmp_mount):
+                subprocess.run(["umount", tmp_mount], capture_output=True, timeout=15)
+        except Exception:
+            pass
+        try:
+            os.rmdir(tmp_mount)
+        except Exception:
+            pass
+
+    # NVRAM: point to shim in vendor dir
+    match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
+            re.match(r"(/dev/nvme\d+n\d+)p(\d+)", efi_partition_device) or
+            re.match(r"(/dev/mmcblk\d+)p(\d+)", efi_partition_device))
+    if match:
+        efi_disk, efi_part = match.group(1), match.group(2)
+        loader = "\\EFI\\" + efi_install_id + "\\shimx64.efi"
+        subprocess.run(
+            ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", efi_install_id, "-l", loader],
+            capture_output=True, text=True, check=False, timeout=60
+        )
 
     return True, "", efi_install_id
 
