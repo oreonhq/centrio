@@ -72,11 +72,14 @@ def _efi_partition_ensure_mounted(target_root, efi_partition_device):
 
 
 def _find_shim_grub_on_host():
-    """Find shim and grub EFI files on host (live system). Returns (shim_path, grub_path)."""
+    """Find shim and grub EFI files on host (live system). Returns (shim_path, grub_path, efi_vendor).
+    efi_vendor is the EFI subdir name (e.g. 'almalinux') when found under /boot/efi/EFI/<name>/, else None.
+    """
     host_efi = "/boot/efi/EFI"
     shim = None
     grub = None
-    # Fixed paths (common distro layout)
+    efi_vendor = None
+    # Fixed paths
     for p in [
         "/boot/efi/EFI/BOOT/BOOTX64.EFI", "/boot/efi/EFI/BOOT/shimx64.efi",
         "/boot/efi/EFI/fedora/shimx64.efi", "/boot/efi/EFI/centos/shimx64.efi",
@@ -93,9 +96,14 @@ def _find_shim_grub_on_host():
                 p = os.path.join(host_efi, name, f)
                 if os.path.isfile(p) and os.path.getsize(p) > 0:
                     shim = p
+                    efi_vendor = name
                     break
             if shim:
                 break
+    if shim and not efi_vendor and host_efi in shim:
+        parts = shim.replace(host_efi, "").strip("/").split("/")
+        if len(parts) >= 1 and parts[0] != "BOOT":
+            efi_vendor = parts[0]
     for p in [
         "/boot/efi/EFI/BOOT/grubx64.efi", "/boot/efi/EFI/fedora/grubx64.efi",
         "/boot/efi/EFI/centos/grubx64.efi", "/boot/efi/EFI/rhel/grubx64.efi",
@@ -104,18 +112,23 @@ def _find_shim_grub_on_host():
     ]:
         if os.path.exists(p) and os.path.getsize(p) > 0:
             grub = p
+            if not efi_vendor and host_efi in p:
+                parts = p.replace(host_efi, "").strip("/").split("/")
+                if len(parts) >= 1 and parts[0] != "BOOT":
+                    efi_vendor = parts[0]
             break
     if not grub and os.path.isdir(host_efi):
         for name in os.listdir(host_efi):
             p = os.path.join(host_efi, name, "grubx64.efi")
             if os.path.isfile(p) and os.path.getsize(p) > 0:
                 grub = p
+                efi_vendor = name
                 break
-    return shim, grub
+    return shim, grub, efi_vendor
 
 
 def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
-    """Install GRUB for UEFI (and Secure Boot via shim). Returns (success, error_msg)."""
+    """Install GRUB for UEFI (and Secure Boot via shim). Returns (success, error_msg, efi_install_id)."""
     efi_mount_point = os.path.join(target_root, "boot", "efi")
     if not efi_partition_device and os.path.ismount(efi_mount_point):
         try:
@@ -130,39 +143,19 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
 
     ok, err, _ = _efi_partition_ensure_mounted(target_root, efi_partition_device)
     if not ok:
-        return False, err or "EFI partition not available."
-
-    # EFI dirs
-    efi_oreon = os.path.join(efi_mount_point, "EFI", BOOTLOADER_ID)
-    efi_boot = os.path.join(efi_mount_point, "EFI", "BOOT")
-    try:
-        os.makedirs(efi_oreon, exist_ok=True)
-        os.makedirs(efi_boot, exist_ok=True)
-    except Exception as e:
-        return False, f"Failed to create EFI dirs: {e}"
+        return False, err or "EFI partition not available.", None
 
     # Ensure GRUB EFI packages in target (dnf-based)
     from backend import verify_grub_packages
     vok, verr, _ = verify_grub_packages(target_root)
     if not vok:
-        return False, verr or "Required GRUB packages missing."
+        return False, verr or "Required GRUB packages missing.", None
 
-    # Shim from host (signed, for Secure Boot). GRUB: distro's signed grub from target only.
-    shim_src, _ = _find_shim_grub_on_host()
+    shim_src, _, host_efi_vendor = _find_shim_grub_on_host()
     if not shim_src:
-        return False, "Could not find shim (shimx64.efi/BOOTX64.EFI) on live system; required for UEFI/Secure Boot."
+        return False, "Could not find shim (shimx64.efi/BOOTX64.EFI) on live system; required for UEFI/Secure Boot.", None
 
-    shim_dst = os.path.join(efi_oreon, "shimx64.efi")
-    bootx64_dst = os.path.join(efi_oreon, "BOOTX64.EFI")
-    grub_dst = os.path.join(efi_oreon, "grubx64.efi")
-
-    try:
-        shutil.copy(shim_src, shim_dst)
-        shutil.copy(shim_src, bootx64_dst)
-    except Exception as e:
-        return False, f"Failed to copy shim: {e}"
-
-    # Signed grub: target /usr, target ESP (after copy), or host ESP (live USB)
+    # Signed grub: target /usr, target ESP, or host ESP. Use same EFI dir as grub source so embedded prefix finds grub.cfg.
     signed_grub_paths = [
         os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
         os.path.join(target_root, "usr/lib/grub2/x86_64-efi/grubx64.efi"),
@@ -176,20 +169,41 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
                 if os.path.isfile(cand) and os.path.getsize(cand) > 0:
                     signed_grub_paths.append(cand)
                     break
-    grub_copied = False
+    grub_src_used = None
     for p in signed_grub_paths:
         if os.path.exists(p) and os.path.getsize(p) > 0:
-            try:
-                shutil.copy(p, grub_dst)
-                grub_copied = True
-                break
-            except Exception as e:
-                return False, f"Could not copy signed GRUB from {p}: {e}"
-    if not grub_copied:
+            grub_src_used = p
+            break
+    if not grub_src_used:
         return False, (
             "Signed GRUB (grubx64.efi) not found. Checked: target usr/lib/grub*, usr/share/grub*, "
             "target and host boot/efi/EFI/*/. Install grub2-efi-x64 or ensure live ESP has grubx64.efi."
-        )
+        ), None
+    # Embedded prefix in distro grub points at (hd0,gptN)/EFI/<vendor>/. Use that dir so grub finds grub.cfg.
+    efi_install_id = BOOTLOADER_ID
+    if "/EFI/" in grub_src_used:
+        parts = grub_src_used.split("/EFI/", 1)[-1].strip("/").split("/")
+        if parts and parts[0] != "BOOT":
+            efi_install_id = parts[0]
+    elif host_efi_vendor:
+        efi_install_id = host_efi_vendor
+    efi_dir = os.path.join(efi_mount_point, "EFI", efi_install_id)
+    efi_boot = os.path.join(efi_mount_point, "EFI", "BOOT")
+    try:
+        os.makedirs(efi_dir, exist_ok=True)
+        os.makedirs(efi_boot, exist_ok=True)
+    except Exception as e:
+        return False, f"Failed to create EFI dirs: {e}", None
+
+    shim_dst = os.path.join(efi_dir, "shimx64.efi")
+    bootx64_dst = os.path.join(efi_dir, "BOOTX64.EFI")
+    grub_dst = os.path.join(efi_dir, "grubx64.efi")
+    try:
+        shutil.copy(shim_src, shim_dst)
+        shutil.copy(shim_src, bootx64_dst)
+        shutil.copy(grub_src_used, grub_dst)
+    except Exception as e:
+        return False, f"Failed to copy shim/grub: {e}", None
 
     efi_boot_shim = os.path.join(efi_boot, "BOOTX64.EFI")
     shutil.copy(shim_src, efi_boot_shim)
@@ -200,10 +214,11 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
                 re.match(r"(/dev/mmcblk\d+)p(\d+)", efi_partition_device))
         if match:
             efi_disk, efi_part = match.group(1), match.group(2)
-            cmd = ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", BOOTLOADER_ID, "-l", "\\EFI\\" + BOOTLOADER_ID + "\\BOOTX64.EFI"]
+            loader = "\\EFI\\" + efi_install_id + "\\BOOTX64.EFI"
+            cmd = ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", efi_install_id, "-l", loader]
             subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
 
-    return True, ""
+    return True, "", efi_install_id
 
 
 def _install_bios_bootloader(target_root, primary_disk, progress_callback=None):
@@ -266,8 +281,11 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if progress_callback:
         progress_callback("Installing bootloader (%s)..." % ("UEFI" if uefi else "BIOS"), None)
 
+    efi_install_id = BOOTLOADER_ID
     if uefi:
-        ok, err = _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback)
+        ok, err, efi_install_id = _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback)
+        if efi_install_id is None:
+            efi_install_id = BOOTLOADER_ID
     else:
         ok, err = _install_bios_bootloader(target_root, primary_disk, progress_callback)
 
@@ -279,11 +297,11 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if not ok:
         return False, err, None
 
-    # Optional: copy grub.cfg to EFI partition for UEFI
-    if uefi:
+    # Copy grub.cfg to EFI partition (same dir as grub binary so embedded prefix finds it)
+    if uefi and efi_install_id:
         efi_mount = os.path.join(target_root, "boot", "efi")
         cfg_src = os.path.join(target_root, "boot", "grub2", "grub.cfg")
-        efi_cfg = os.path.join(efi_mount, "EFI", BOOTLOADER_ID, "grub.cfg")
+        efi_cfg = os.path.join(efi_mount, "EFI", efi_install_id, "grub.cfg")
         if os.path.ismount(efi_mount) and os.path.exists(cfg_src) and os.path.exists(os.path.dirname(efi_cfg)):
             try:
                 shutil.copy(cfg_src, efi_cfg)
@@ -303,7 +321,7 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
 
     verification = {
         "uefi": uefi,
-        "bootloader_id": BOOTLOADER_ID,
+        "bootloader_id": efi_install_id if uefi else BOOTLOADER_ID,
         "primary_disk": primary_disk,
         "efi_partition": efi_partition_device if uefi else None,
     }
