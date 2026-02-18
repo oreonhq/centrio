@@ -1,17 +1,14 @@
 # centrio_installer/install_logic.py
 # Backend for bootloader installation (UEFI and BIOS).
 #
-# How distros typically do UEFI GRUB (no grub2-install for EFI):
-# - Fedora/RHEL (Anaconda): Does NOT run grub2-install for UEFI. Requires packages
-#   grub2-efi-x64 and shim-x64; the RPMs install signed shim/grub to the target.
-#   Installer runs gen_grub_cfgstub, grub2-mkconfig, and efibootmgr to add NVRAM
-#   entry pointing at shimx64.efi. See pyanaconda bootloader/efi.py (EFIGRUB).
-# - Calamares: Uses grub-install for EFI (can hit "should not be used for EFI" and
-#   may use --force or distro-specific paths).
-# - Debian: grub-efi has hardcoded id "debian"; must use EFI/debian and stub grub.cfg.
-#
-# We follow the Fedora model: use distro signed shim + grub (from target), write
-# grub.cfg, register with efibootmgr. No grub2-install for UEFI.
+# Anaconda (Fedora/RHEL) UEFI flow:
+# - Does NOT run grub2-install for UEFI. ESP is mounted at target/boot/efi before
+#   package install; grub2-efi-x64 and shim-x64 RPMs install signed binaries there.
+# - GRUB uses $fw_path (from firmware LoadedImage) so it finds grub.cfg in the same
+#   dir on the ESP. Fedora 34+ (UnifyGrubConfig): that file is a STUB that does
+#   search.fs_uuid <root_uuid> root; set prefix=($root)/boot/grub2; configfile $prefix/grub.cfg
+#   so the real config lives in /boot/grub2/ on the root fs.
+# - oreon-release can provide a Secure Boot cert; use distro signed shim+grub when available.
 
 import os
 import re
@@ -127,8 +124,23 @@ def _find_shim_grub_on_host():
     return shim, grub, efi_vendor
 
 
+def _get_root_uuid(target_root):
+    """Return UUID of the filesystem mounted at target_root, or None."""
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "UUID", "--target", target_root],
+            capture_output=True, text=True, check=False, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
-    """Install GRUB for UEFI (and Secure Boot via shim). Returns (success, error_msg, efi_install_id)."""
+    """Install GRUB for UEFI like Anaconda: distro signed shim+grub on ESP, no grub2-install.
+    Returns (success, error_msg, efi_install_id). GRUB uses $fw_path so we put a stub grub.cfg on ESP later."""
     efi_mount_point = os.path.join(target_root, "boot", "efi")
     if not efi_partition_device and os.path.ismount(efi_mount_point):
         try:
@@ -145,7 +157,6 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     if not ok:
         return False, err or "EFI partition not available.", None
 
-    # Ensure GRUB EFI packages in target (dnf-based)
     from backend import verify_grub_packages
     vok, verr, _ = verify_grub_packages(target_root)
     if not vok:
@@ -155,7 +166,7 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     if not shim_src:
         return False, "Could not find shim (shimx64.efi/BOOTX64.EFI) on live system; required for UEFI/Secure Boot.", None
 
-    # Signed grub: target /usr, target ESP, or host ESP. Use same EFI dir as grub source so embedded prefix finds grub.cfg.
+    # Signed grub: target /usr, target ESP, or host ESP. Use same EFI dir as grub source so $fw_path finds stub.
     signed_grub_paths = [
         os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
         os.path.join(target_root, "usr/lib/grub2/x86_64-efi/grubx64.efi"),
@@ -179,7 +190,7 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             "Signed GRUB (grubx64.efi) not found. Checked: target usr/lib/grub*, usr/share/grub*, "
             "target and host boot/efi/EFI/*/. Install grub2-efi-x64 or ensure live ESP has grubx64.efi."
         ), None
-    # Embedded prefix in distro grub points at (hd0,gptN)/EFI/<vendor>/. Use that dir so grub finds grub.cfg.
+    # Use vendor dir when grub is from host/target ESP so $fw_path matches (e.g. EFI/almalinux).
     efi_install_id = BOOTLOADER_ID
     if "/EFI/" in grub_src_used:
         parts = grub_src_used.split("/EFI/", 1)[-1].strip("/").split("/")
@@ -195,19 +206,15 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     except Exception as e:
         return False, f"Failed to create EFI dirs: {e}", None
 
-    shim_dst = os.path.join(efi_dir, "shimx64.efi")
-    bootx64_dst = os.path.join(efi_dir, "BOOTX64.EFI")
-    grub_dst = os.path.join(efi_dir, "grubx64.efi")
     try:
-        shutil.copy(shim_src, shim_dst)
-        shutil.copy(shim_src, bootx64_dst)
+        shutil.copy(shim_src, os.path.join(efi_dir, "shimx64.efi"))
+        shutil.copy(shim_src, os.path.join(efi_dir, "BOOTX64.EFI"))
+        shutil.copy(shim_src, os.path.join(efi_boot, "BOOTX64.EFI"))
+        grub_dst = os.path.join(efi_dir, "grubx64.efi")
         if os.path.normpath(grub_src_used) != os.path.normpath(grub_dst):
             shutil.copy(grub_src_used, grub_dst)
     except Exception as e:
         return False, f"Failed to copy shim/grub: {e}", None
-
-    efi_boot_shim = os.path.join(efi_boot, "BOOTX64.EFI")
-    shutil.copy(shim_src, efi_boot_shim)
 
     if efi_partition_device:
         match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
@@ -298,16 +305,30 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if not ok:
         return False, err, None
 
-    # Copy grub.cfg to EFI partition (same dir as grub binary so embedded prefix finds it)
+    # UEFI: write stub grub.cfg on ESP (Anaconda/UnifyGrubConfig style). GRUB loads this from $fw_path, stub loads real config from /boot/grub2 by UUID.
     if uefi and efi_install_id:
         efi_mount = os.path.join(target_root, "boot", "efi")
-        cfg_src = os.path.join(target_root, "boot", "grub2", "grub.cfg")
         efi_cfg = os.path.join(efi_mount, "EFI", efi_install_id, "grub.cfg")
-        if os.path.ismount(efi_mount) and os.path.exists(cfg_src) and os.path.exists(os.path.dirname(efi_cfg)):
-            try:
-                shutil.copy(cfg_src, efi_cfg)
-            except Exception as e:
-                print(f"Warning: Could not copy grub.cfg to EFI: {e}")
+        if os.path.ismount(efi_mount) and os.path.exists(os.path.dirname(efi_cfg)):
+            root_uuid = _get_root_uuid(target_root)
+            if root_uuid:
+                stub = (
+                    "search.fs_uuid %s root\nset prefix=($root)/boot/grub2\nconfigfile $prefix/grub.cfg\n"
+                    % root_uuid
+                )
+                try:
+                    with open(efi_cfg, "w") as f:
+                        f.write(stub)
+                except Exception as e:
+                    print(f"Warning: Could not write stub grub.cfg to EFI: {e}")
+            else:
+                print("Warning: Could not get root UUID for stub; copying full grub.cfg to ESP.")
+                cfg_src = os.path.join(target_root, "boot", "grub2", "grub.cfg")
+                if os.path.exists(cfg_src):
+                    try:
+                        shutil.copy(cfg_src, efi_cfg)
+                    except Exception as e:
+                        print(f"Warning: Could not copy grub.cfg to EFI: {e}")
 
     # Optional: regenerate initramfs (best effort)
     try:
