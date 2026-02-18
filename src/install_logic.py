@@ -201,7 +201,8 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     try:
         shutil.copy(shim_src, shim_dst)
         shutil.copy(shim_src, bootx64_dst)
-        shutil.copy(grub_src_used, grub_dst)
+        if os.path.normpath(grub_src_used) != os.path.normpath(grub_dst):
+            shutil.copy(grub_src_used, grub_dst)
     except Exception as e:
         return False, f"Failed to copy shim/grub: {e}", None
 
