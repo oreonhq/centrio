@@ -1280,15 +1280,22 @@ def verify_grub_packages(target_root):
     if missing_packages:
         print(f"Missing GRUB packages: {missing_packages}")
         
-        # Try to install missing packages
+        # Try to install missing packages (dnf runs inside chroot; no --installroot)
         try:
             print("Attempting to install missing GRUB packages...")
             if "ubuntu" in distro_id or "debian" in distro_like:
                 install_cmd = ["apt-get", "install", "-y"] + missing_packages
             else:
-                install_cmd = ["dnf", "install", "-y"] + missing_packages
-            
-            install_cmd.append(f"--installroot={target_root}")
+                # Get releasever from target so repo URLs (e.g. EPEL) resolve. Use major version for RHEL-family.
+                releasever = (os_info.get("VERSION_ID") or os_info.get("VERSION") or "").strip()
+                if releasever and "." in releasever:
+                    releasever = releasever.split(".")[0]
+                if not releasever:
+                    return False, "Could not detect VERSION_ID for DNF (needed for --releasever). Check target /etc/os-release.", None
+                install_cmd = [
+                    "dnf", "install", "-y",
+                    f"--releasever={releasever}",
+                ] + missing_packages
             
             success, err, stdout = _run_in_chroot(target_root, install_cmd, "Install missing GRUB packages", timeout=300)
             if success:
