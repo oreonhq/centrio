@@ -73,38 +73,44 @@ def _efi_partition_ensure_mounted(target_root, efi_partition_device):
 
 def _find_shim_grub_on_host():
     """Find shim and grub EFI files on host (live system). Returns (shim_path, grub_path)."""
-    shim_paths = [
-        "/boot/efi/EFI/BOOT/BOOTX64.EFI",
-        "/boot/efi/EFI/BOOT/shimx64.efi",
-        "/boot/efi/EFI/fedora/shimx64.efi",
-        "/boot/efi/EFI/centos/shimx64.efi",
-        "/boot/efi/EFI/rhel/shimx64.efi",
-        "/boot/efi/EFI/rocky/shimx64.efi",
-        "/boot/efi/EFI/almalinux/shimx64.efi",
-        "/boot/efi/EFI/oreon/shimx64.efi",
-        "/boot/shimx64.efi",
-        "/boot/BOOTX64.EFI",
-    ]
-    grub_paths = [
-        "/boot/efi/EFI/BOOT/grubx64.efi",
-        "/boot/efi/EFI/fedora/grubx64.efi",
-        "/boot/efi/EFI/centos/grubx64.efi",
-        "/boot/efi/EFI/rhel/grubx64.efi",
-        "/boot/efi/EFI/rocky/grubx64.efi",
-        "/boot/efi/EFI/almalinux/grubx64.efi",
-        "/boot/efi/EFI/oreon/grubx64.efi",
-        "/boot/grubx64.efi",
-    ]
+    host_efi = "/boot/efi/EFI"
     shim = None
     grub = None
-    for p in shim_paths:
+    # Fixed paths (common distro layout)
+    for p in [
+        "/boot/efi/EFI/BOOT/BOOTX64.EFI", "/boot/efi/EFI/BOOT/shimx64.efi",
+        "/boot/efi/EFI/fedora/shimx64.efi", "/boot/efi/EFI/centos/shimx64.efi",
+        "/boot/efi/EFI/rhel/shimx64.efi", "/boot/efi/EFI/rocky/shimx64.efi",
+        "/boot/efi/EFI/almalinux/shimx64.efi", "/boot/efi/EFI/oreon/shimx64.efi",
+        "/boot/shimx64.efi", "/boot/BOOTX64.EFI",
+    ]:
         if os.path.exists(p) and os.path.getsize(p) > 0:
             shim = p
             break
-    for p in grub_paths:
+    if not shim and os.path.isdir(host_efi):
+        for name in os.listdir(host_efi):
+            for f in ("shimx64.efi", "BOOTX64.EFI"):
+                p = os.path.join(host_efi, name, f)
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    shim = p
+                    break
+            if shim:
+                break
+    for p in [
+        "/boot/efi/EFI/BOOT/grubx64.efi", "/boot/efi/EFI/fedora/grubx64.efi",
+        "/boot/efi/EFI/centos/grubx64.efi", "/boot/efi/EFI/rhel/grubx64.efi",
+        "/boot/efi/EFI/rocky/grubx64.efi", "/boot/efi/EFI/almalinux/grubx64.efi",
+        "/boot/efi/EFI/oreon/grubx64.efi", "/boot/grubx64.efi",
+    ]:
         if os.path.exists(p) and os.path.getsize(p) > 0:
             grub = p
             break
+    if not grub and os.path.isdir(host_efi):
+        for name in os.listdir(host_efi):
+            p = os.path.join(host_efi, name, "grubx64.efi")
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                grub = p
+                break
     return shim, grub
 
 
@@ -156,10 +162,20 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
     except Exception as e:
         return False, f"Failed to copy shim: {e}"
 
+    # Signed grub: target /usr, target ESP (after copy), or host ESP (live USB)
     signed_grub_paths = [
         os.path.join(target_root, "usr/lib/grub/x86_64-efi/grubx64.efi"),
+        os.path.join(target_root, "usr/lib/grub2/x86_64-efi/grubx64.efi"),
         os.path.join(target_root, "usr/share/grub/x86_64-efi/grubx64.efi"),
     ]
+    for base, efi_sub in [(os.path.join(target_root, "boot", "efi"), "EFI"), ("/boot/efi", "EFI")]:
+        efi_efi = os.path.join(base, efi_sub)
+        if os.path.isdir(efi_efi):
+            for name in os.listdir(efi_efi):
+                cand = os.path.join(efi_efi, name, "grubx64.efi")
+                if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                    signed_grub_paths.append(cand)
+                    break
     grub_copied = False
     for p in signed_grub_paths:
         if os.path.exists(p) and os.path.getsize(p) > 0:
@@ -170,7 +186,10 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             except Exception as e:
                 return False, f"Could not copy signed GRUB from {p}: {e}"
     if not grub_copied:
-        return False, "Signed GRUB (grubx64.efi) not found in target. Required paths: " + ", ".join(signed_grub_paths) + ". Install grub2-efi-x64 (or equivalent) in the target system."
+        return False, (
+            "Signed GRUB (grubx64.efi) not found. Checked: target usr/lib/grub*, usr/share/grub*, "
+            "target and host boot/efi/EFI/*/. Install grub2-efi-x64 or ensure live ESP has grubx64.efi."
+        )
 
     efi_boot_shim = os.path.join(efi_boot, "BOOTX64.EFI")
     shutil.copy(shim_src, efi_boot_shim)
