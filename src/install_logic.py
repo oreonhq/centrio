@@ -34,36 +34,61 @@ def is_uefi_system():
 
 
 def _efi_partition_ensure_mounted(target_root, efi_partition_device):
-    """Ensure EFI partition is mounted at target_root/boot/efi. Mount if not. Returns (success, err, efi_mount_point)."""
+    """Ensure the *target* EFI partition is mounted at target_root/boot/efi.
+    If efi_partition_device is given, always use it (unmount and remount if something else is there)."""
     efi_mount = os.path.join(target_root, "boot", "efi")
     try:
         os.makedirs(efi_mount, exist_ok=True)
     except Exception as e:
         return False, f"Failed to create EFI mount point: {e}", None
 
-    if os.path.ismount(efi_mount):
+    def _realpath(dev):
+        try:
+            return os.path.realpath(dev) if dev else None
+        except Exception:
+            return dev
+
+    if efi_partition_device:
+        # Ensure the target's ESP is mounted here; avoid writing to host's ESP by mistake.
+        want = _realpath(efi_partition_device)
+        if os.path.ismount(efi_mount):
+            try:
+                r = subprocess.run(
+                    ["findmnt", "-n", "-o", "SOURCE", "--target", efi_mount],
+                    capture_output=True, text=True, check=False, timeout=10
+                )
+                current = _realpath(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+                if current and want and current != want:
+                    subprocess.run(["umount", efi_mount], capture_output=True, text=True, timeout=15)
+                elif current == want:
+                    return True, "", efi_mount
+            except Exception:
+                pass
+            if os.path.ismount(efi_mount):
+                try:
+                    subprocess.run(["umount", efi_mount], capture_output=True, text=True, timeout=15)
+                except Exception:
+                    pass
+        r = subprocess.run(
+            ["mount", efi_partition_device, efi_mount],
+            capture_output=True, text=True, check=False, timeout=30
+        )
+        if r.returncode != 0:
+            return False, f"Failed to mount EFI partition: {r.stderr.strip()}", None
         return True, "", efi_mount
 
-    if not efi_partition_device:
-        # Try findmnt
-        try:
-            r = subprocess.run(
-                ["findmnt", "-n", "-o", "SOURCE", "--target", efi_mount],
-                capture_output=True, text=True, check=False, timeout=10
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                return True, "", efi_mount
-        except Exception:
-            pass
-        return False, "UEFI system but EFI partition not mounted and no device provided.", None
-
-    r = subprocess.run(
-        ["mount", efi_partition_device, efi_mount],
-        capture_output=True, text=True, check=False, timeout=30
-    )
-    if r.returncode != 0:
-        return False, f"Failed to mount EFI partition: {r.stderr.strip()}", None
-    return True, "", efi_mount
+    if os.path.ismount(efi_mount):
+        return True, "", efi_mount
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", efi_mount],
+            capture_output=True, text=True, check=False, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return True, "", efi_mount
+    except Exception:
+        pass
+    return False, "UEFI system but EFI partition not mounted and no device provided.", None
 
 
 def _get_root_uuid(target_root):
@@ -213,6 +238,15 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             f.write(stub_cfg)
     except Exception as e:
         return False, "Failed to write stub grub.cfg on ESP: %s" % e, None
+
+    # Verify vendor dir on ESP so we never leave it missing.
+    if not os.path.isdir(efi_dir):
+        return False, "EFI/%s was not created on ESP." % efi_install_id, None
+    has_cfg = os.path.isfile(os.path.join(efi_dir, "grub.cfg"))
+    has_shim = os.path.isfile(os.path.join(efi_dir, "shimx64.efi"))
+    has_grub = os.path.isfile(os.path.join(efi_dir, "grubx64.efi"))
+    if not has_cfg or (not has_shim and not has_grub):
+        return False, "ESP missing EFI/%s/grub.cfg or shim/grub. Check that target ESP was mounted." % efi_install_id, None
 
     # NVRAM: point to shim in vendor dir (AlmaLinux/Oreon use shimx64.efi there).
     if efi_partition_device:
