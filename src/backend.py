@@ -1770,23 +1770,24 @@ WantedBy=multi-user.target
         except Exception as e:
             print(f"Warning: Plymouth theme {theme}: {e}")
 
-    # --- Ensure kernel cmdline has rhgb quiet so Plymouth splash shows (not text gibberish) ---
+    # --- Ensure kernel cmdline has rhgb quiet (and rd.plymouth=1) so Plymouth splash shows ---
     grub_default = os.path.join(target_root, "etc/default/grub")
     if os.path.exists(grub_default):
         try:
             with open(grub_default, "r") as f:
                 content = f.read()
-            # Append rhgb and quiet to GRUB_CMDLINE_LINUX if missing (RHEL/Fedora graphical boot)
-            match = re.search(r'^(GRUB_CMDLINE_LINUX=")([^"]*)(")', content, re.MULTILINE)
+            # Match GRUB_CMDLINE_LINUX="..." or GRUB_CMDLINE_LINUX='...'
+            match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
-                prefix, args, suffix = match.group(1), match.group(2), match.group(3)
-                for param in ["rhgb", "quiet"]:
+                quote_char, args = match.group(1), match.group(2)
+                for param in ["rhgb", "quiet", "rd.plymouth=1"]:
                     if param not in args.split():
                         args = (args + " " + param).strip()
-                content = content[:match.start()] + prefix + args + suffix + content[match.end():]
+                new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
+                content = content[:match.start()] + new_line + content[match.end():]
                 with open(grub_default, "w") as f:
                     f.write(content)
-                print("Ensured rhgb quiet in /etc/default/grub for Plymouth splash")
+                print("Ensured rhgb quiet rd.plymouth=1 in /etc/default/grub for Plymouth splash")
         except Exception as e:
             print(f"Warning: Could not patch /etc/default/grub: {e}")
 

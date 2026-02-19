@@ -355,6 +355,11 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
             for k in reversed(kernels):
                 kver = k.replace("vmlinuz-", "")
                 _run_in_chroot(target_root, ["dracut", "--force", "--kver", kver], f"dracut {kver}", progress_callback, timeout=300)
+        # After dracut, re-apply Plymouth so the final initramfs includes the splash (dracut overwrote earlier plymouth initramfs).
+        try:
+            _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R"], "Plymouth initramfs", progress_callback, timeout=120)
+        except Exception:
+            pass  # best effort
     except Exception as e:
         print(f"Warning: initramfs regeneration: {e}")
 
