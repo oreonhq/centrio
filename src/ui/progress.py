@@ -725,14 +725,22 @@ class ProgressPage(Gtk.Box):
             print("Network disabled - no additional packages will be installed")
             return True
         
-        # Network is enabled, proceed with additional packages
+        # Network is enabled, proceed with additional packages only if there are any beyond the base
         packages = payload_config.get('packages', [])
         repositories = payload_config.get('repositories', [])
         flatpak_enabled = payload_config.get('flatpak_enabled', False)
         flatpak_packages = payload_config.get('flatpak_packages', [])
+        # Live copy already has base; exclude core-group packages so we only run DNF when user selected extra
+        _CORE_PACKAGES = frozenset([
+            "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common",
+            "grub2-tools", "shim-x64", "shim", "efibootmgr", "NetworkManager", "systemd-resolved",
+            "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"
+        ])
+        extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
+        has_extra_work = bool(extra_packages or repositories or (flatpak_enabled and flatpak_packages))
         
         print(f"Additional packages check:")
-        print(f"  packages: {packages}")
+        print(f"  packages (extra only): {extra_packages}")
         print(f"  repositories: {repositories}")
         print(f"  flatpak_enabled: {flatpak_enabled}")
         print(f"  flatpak_packages: {flatpak_packages}")
@@ -743,10 +751,10 @@ class ProgressPage(Gtk.Box):
             print("Network disabled - no additional packages will be installed (double-check)")
             return True
         
-        if packages or repositories or flatpak_enabled:
+        if has_extra_work:
             self._update_progress_text("Installing additional packages on live environment...", 0.68)
             package_config = {
-                "packages": packages,
+                "packages": extra_packages,
                 "repositories": repositories,
                 "flatpak_enabled": flatpak_enabled,
                 "flatpak_packages": flatpak_packages,
