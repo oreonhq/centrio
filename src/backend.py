@@ -1663,22 +1663,24 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
         except Exception as e:
             print(f"Warning: Could not update SELinux config: {e}")
 
-    # First-boot oneshot: relabel with restorecon, switch to enforcing, reboot.
+    # First-boot oneshot: run when marker exists; relabel, switch to enforcing, remove marker, reboot.
+    # Marker file ensures the service runs (ConditionFirstBoot can be unreliable); removing it before reboot means one-shot.
     systemd_system = os.path.join(target_root, "etc/systemd/system")
     firstboot_unit = os.path.join(systemd_system, "centrio-selinux-firstboot.service")
+    firstboot_marker = "/etc/centrio-selinux-firstboot"
     try:
         os.makedirs(systemd_system, exist_ok=True)
+        open(os.path.join(target_root, firstboot_marker.lstrip("/")), "w").close()
         unit_content = """[Unit]
 Description=Centrio first boot: relabel SELinux and switch to enforcing
-ConditionFirstBoot=yes
-After=multi-user.target
+ConditionPathExists=""" + firstboot_marker + """
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
 ExecStart=/usr/sbin/restorecon -Rv /
 ExecStart=/bin/sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
 ExecStart=/bin/rm -f /.autorelabel
+ExecStart=/bin/rm -f """ + firstboot_marker + """
 ExecStart=/usr/bin/systemctl reboot
 
 [Install]
@@ -1686,14 +1688,13 @@ WantedBy=multi-user.target
 """
         with open(firstboot_unit, "w") as f:
             f.write(unit_content)
-        # Enable the unit (create wants symlink)
         wants_dir = os.path.join(target_root, "etc/systemd/system/multi-user.target.wants")
         os.makedirs(wants_dir, exist_ok=True)
         want_link = os.path.join(wants_dir, "centrio-selinux-firstboot.service")
         if os.path.lexists(want_link):
             os.remove(want_link)
         os.symlink("../centrio-selinux-firstboot.service", want_link)
-        print("Installed and enabled centrio-selinux-firstboot.service for first boot")
+        print("Installed and enabled centrio-selinux-firstboot.service (marker: %s)" % firstboot_marker)
     except Exception as e:
         print(f"Warning: Could not install SELinux first-boot service: {e}")
 
@@ -1768,6 +1769,26 @@ WantedBy=multi-user.target
                 break
         except Exception as e:
             print(f"Warning: Plymouth theme {theme}: {e}")
+
+    # --- Ensure kernel cmdline has rhgb quiet so Plymouth splash shows (not text gibberish) ---
+    grub_default = os.path.join(target_root, "etc/default/grub")
+    if os.path.exists(grub_default):
+        try:
+            with open(grub_default, "r") as f:
+                content = f.read()
+            # Append rhgb and quiet to GRUB_CMDLINE_LINUX if missing (RHEL/Fedora graphical boot)
+            match = re.search(r'^(GRUB_CMDLINE_LINUX=")([^"]*)(")', content, re.MULTILINE)
+            if match:
+                prefix, args, suffix = match.group(1), match.group(2), match.group(3)
+                for param in ["rhgb", "quiet"]:
+                    if param not in args.split():
+                        args = (args + " " + param).strip()
+                content = content[:match.start()] + prefix + args + suffix + content[match.end():]
+                with open(grub_default, "w") as f:
+                    f.write(content)
+                print("Ensured rhgb quiet in /etc/default/grub for Plymouth splash")
+        except Exception as e:
+            print(f"Warning: Could not patch /etc/default/grub: {e}")
 
     # --- Remove live-specific GNOME/Software config overrides ---
     live_dconf_dirs = [
