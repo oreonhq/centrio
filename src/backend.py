@@ -1904,6 +1904,23 @@ def generate_fstab_for_target(target_root):
     except Exception as e:
         return False, f"Failed to generate fstab: {e}"
 
+def check_network_connectivity():
+    """Return True if the system has usable network connectivity (for DNF/Flatpak)."""
+    try:
+        r = subprocess.run(
+            ["nmcli", "networking", "connectivity", "check"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            return False
+        out = (r.stdout or "").strip().lower()
+        return out in ("full", "limited")
+    except Exception:
+        return False
+
+
 def install_packages_on_live_copy(target_root, package_config, progress_callback=None):
     """Installs additional packages on top of the copied live environment.
     

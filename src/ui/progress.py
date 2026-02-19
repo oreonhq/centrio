@@ -752,6 +752,12 @@ class ProgressPage(Gtk.Box):
             return True
         
         if has_extra_work:
+            # Runtime check: do not run DNF/Flatpak when there is no internet at all
+            if not backend.check_network_connectivity():
+                self._update_progress_text("No internet - only base system installed.", 0.70)
+                print("No network connectivity at install time - skipping additional packages")
+                self._update_progress_text("Live environment copy and setup complete.", 0.75)
+                return True
             self._update_progress_text("Installing additional packages on live environment...", 0.68)
             package_config = {
                 "packages": extra_packages,
