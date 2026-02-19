@@ -1538,6 +1538,29 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
         except Exception as e2:
             print(f"Warning: Fallback machine-id also failed: {e2}")
     
+    # SELinux: copy uses --no-xattrs so target has no labels. Set permissive and request relabel.
+    selinux_config = os.path.join(target_root, "etc/selinux/config")
+    if os.path.exists(os.path.dirname(selinux_config)):
+        try:
+            content = ""
+            if os.path.exists(selinux_config):
+                with open(selinux_config, "r") as f:
+                    content = f.read()
+            # Ensure SELINUX=permissive for first boot (labels will be wrong; avoid denial cascade)
+            content = re.sub(r"^SELINUX=.*", "SELINUX=permissive", content, flags=re.MULTILINE)
+            if "SELINUX=" not in content:
+                content = "SELINUX=permissive\n" + content
+            with open(selinux_config, "w") as f:
+                f.write(content)
+            print("Set SELINUX=permissive in /etc/selinux/config for first boot")
+        except Exception as e:
+            print(f"Warning: Could not update SELinux config: {e}")
+        try:
+            open(os.path.join(target_root, ".autorelabel"), "w").close()
+            print("Created /.autorelabel for full relabel on first boot")
+        except Exception as e:
+            print(f"Warning: Could not create /.autorelabel: {e}")
+
     # Clear systemd random seed
     random_seed_path = os.path.join(target_root, "var/lib/systemd/random-seed")
     try:
