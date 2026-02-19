@@ -1504,25 +1504,39 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
     # --- Regenerate system-specific files ---
     print("Regenerating system-specific files...")
     
-    # Generate new machine-id
+    # Create new machine-id during install so first boot does not need to write to /etc
+    # (kernel often mounts root read-only initially; systemd then fails with "Missing /etc/machine-id and /etc is mounted read-only")
     machine_id_path = os.path.join(target_root, "etc/machine-id")
-    try:
-        if os.path.exists(machine_id_path):
-            os.remove(machine_id_path)
-        # systemd will generate a new machine-id on first boot
-        print("Removed old machine-id (will be regenerated on first boot)")
-    except Exception as e:
-        print(f"Warning: Could not remove machine-id: {e}")
-    
-    # Generate new dbus machine-id
     dbus_machine_id_path = os.path.join(target_root, "var/lib/dbus/machine-id")
+
+    def _write_machine_id_fallback():
+        import secrets
+        new_id = secrets.token_hex(16)
+        os.makedirs(os.path.dirname(machine_id_path), exist_ok=True)
+        with open(machine_id_path, "w") as f:
+            f.write(new_id + "\n")
+        os.makedirs(os.path.dirname(dbus_machine_id_path), exist_ok=True)
+        with open(dbus_machine_id_path, "w") as f:
+            f.write(new_id + "\n")
+        print("Created new machine-id (fallback)")
+
     try:
-        if os.path.exists(dbus_machine_id_path):
-            os.remove(dbus_machine_id_path)
-        # dbus will generate a new machine-id on first boot
-        print("Removed old dbus machine-id (will be regenerated on first boot)")
+        r = subprocess.run(
+            ["systemd-machine-id-setup", f"--root={target_root}"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode == 0:
+            print("Created new machine-id via systemd-machine-id-setup")
+        else:
+            _write_machine_id_fallback()
+    except FileNotFoundError:
+        _write_machine_id_fallback()
     except Exception as e:
-        print(f"Warning: Could not remove dbus machine-id: {e}")
+        print(f"Warning: Could not create machine-id: {e}")
+        try:
+            _write_machine_id_fallback()
+        except Exception as e2:
+            print(f"Warning: Fallback machine-id also failed: {e2}")
     
     # Clear systemd random seed
     random_seed_path = os.path.join(target_root, "var/lib/systemd/random-seed")
