@@ -1645,6 +1645,8 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
             open(os.path.join(target_root, ".autorelabel"), "w").close()
         except Exception:
             pass
+    # First boot in permissive so systemd can complete (/dev and /run get correct labels at runtime).
+    # A first-boot oneshot will relabel, set enforcing, then reboot; second boot is enforcing.
     selinux_config = os.path.join(target_root, "etc/selinux/config")
     if os.path.exists(os.path.dirname(selinux_config)):
         try:
@@ -1652,14 +1654,48 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
             if os.path.exists(selinux_config):
                 with open(selinux_config, "r") as f:
                     content = f.read()
-            content = re.sub(r"^SELINUX=.*", "SELINUX=enforcing", content, flags=re.MULTILINE)
+            content = re.sub(r"^SELINUX=.*", "SELINUX=permissive", content, flags=re.MULTILINE)
             if "SELINUX=" not in content:
-                content = "SELINUX=enforcing\n" + content
+                content = "SELINUX=permissive\n" + content
             with open(selinux_config, "w") as f:
                 f.write(content)
-            print("Set SELINUX=enforcing in /etc/selinux/config")
+            print("Set SELINUX=permissive for first boot in /etc/selinux/config")
         except Exception as e:
             print(f"Warning: Could not update SELinux config: {e}")
+
+    # First-boot oneshot: relabel with restorecon, switch to enforcing, reboot.
+    systemd_system = os.path.join(target_root, "etc/systemd/system")
+    firstboot_unit = os.path.join(systemd_system, "centrio-selinux-firstboot.service")
+    try:
+        os.makedirs(systemd_system, exist_ok=True)
+        unit_content = """[Unit]
+Description=Centrio first boot: relabel SELinux and switch to enforcing
+ConditionFirstBoot=yes
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/restorecon -Rv /
+ExecStart=/bin/sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+ExecStart=/bin/rm -f /.autorelabel
+ExecStart=/usr/bin/systemctl reboot
+
+[Install]
+WantedBy=multi-user.target
+"""
+        with open(firstboot_unit, "w") as f:
+            f.write(unit_content)
+        # Enable the unit (create wants symlink)
+        wants_dir = os.path.join(target_root, "etc/systemd/system/multi-user.target.wants")
+        os.makedirs(wants_dir, exist_ok=True)
+        want_link = os.path.join(wants_dir, "centrio-selinux-firstboot.service")
+        if os.path.lexists(want_link):
+            os.remove(want_link)
+        os.symlink("../centrio-selinux-firstboot.service", want_link)
+        print("Installed and enabled centrio-selinux-firstboot.service for first boot")
+    except Exception as e:
+        print(f"Warning: Could not install SELinux first-boot service: {e}")
 
     # Clear systemd random seed
     random_seed_path = os.path.join(target_root, "var/lib/systemd/random-seed")
