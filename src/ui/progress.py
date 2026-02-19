@@ -303,13 +303,12 @@ class ProgressPage(Gtk.Box):
             dm_success, dm_warn = backend._remove_dm_mappings(primary_disk, self._update_progress_text)
             if not dm_success: # Should always return True, but check anyway
                  print(f"Warning: dmsetup removal step indicated failure (ignored): {dm_warn}")
-            if dm_warn: print(f"Note: {dm_warn}") # Print any warning message
-            time.sleep(1) # Pause after dmsetup
+            if dm_warn: print(f"Note: {dm_warn}")
+            time.sleep(0.5)
                  
             print("Running udevadm settle...")
             try:
-                # Run directly, might not need pkexec depending on context
-                subprocess.run(["udevadm", "settle"], check=False, timeout=60) # Increased timeout
+                subprocess.run(["udevadm", "settle"], check=False, timeout=15)
                 print("  Udev settle complete.")
             except FileNotFoundError:
                  print("Warning: udevadm not found, cannot settle udev queue.")
@@ -369,10 +368,10 @@ class ProgressPage(Gtk.Box):
                         
                     if not lsof_found_processes: # Should always be False if we got here
                          print(f"  Final lsof checks passed for all paths.")
-                         print(f"Adding 8 second delay before executing {cmd_name}...") # Increased delay
-                         try: subprocess.run(["sync"], check=False, timeout=5) # Sync before delay
+                         print(f"Adding 4 second delay before executing {cmd_name}...")
+                         try: subprocess.run(["sync"], check=False, timeout=5)
                          except Exception: pass
-                         time.sleep(8) # Increased from 5 to 8 seconds
+                         time.sleep(4)
                          try: subprocess.run(["sync"], check=False, timeout=5) # Sync after delay
                          except Exception: pass
                     else:
@@ -560,9 +559,8 @@ class ProgressPage(Gtk.Box):
                 except Exception as e:
                     print(f"WARNING: Could not verify filesystem type with blkid: {e}")
                 
-                # Add a small delay to ensure partition table is settled
-                print("Adding delay to ensure partition is ready...")
-                time.sleep(2)
+                # Brief delay for partition table to settle
+                time.sleep(0.5)
                 
                 print(f"=== End EFI Partition Verification ===")
             
@@ -823,6 +821,25 @@ class ProgressPage(Gtk.Box):
              
         return success
 
+    def _remove_live_users_and_configure_oobe(self, config_data):
+        """Remove live users (e.g. liveuser) from target and configure OOBE for first boot."""
+        if self.stop_requested:
+            return False
+        user_config = config_data.get("user") or {}
+        username = user_config.get("username") if user_config else None
+        install_user_created = bool(username)
+        self._update_progress_text("Removing live users and configuring first boot...", 0.85)
+        success, err = backend.remove_live_users_and_configure_oobe(
+            self.target_root,
+            install_user_created=install_user_created,
+            install_username=username,
+            progress_callback=self._update_progress_text,
+        )
+        if not success:
+            self.installation_error = err or "Failed to remove live users / configure OOBE"
+            return False
+        return True
+
     def _enable_network_manager_step(self, config_data):
         """Step wrapper for enabling NetworkManager."""
         if self.stop_requested: return False, "Stop requested"
@@ -922,7 +939,8 @@ class ProgressPage(Gtk.Box):
              (self._generate_fstab,             config_data,             0.75,  0.76),  # fstab
              (self._configure_system,           config_data,             0.76,  0.80),  # 4% config
              (self._create_user,                config_data,             0.80,  0.85),  # 5% user
-             (self._enable_network_manager_step, config_data,            0.85,  0.87),  # 2% network
+             (self._remove_live_users_and_configure_oobe, config_data,   0.85,  0.86),  # live user removal + OOBE
+             (self._enable_network_manager_step, config_data,            0.86,  0.87),  # 2% network
              (self._install_bootloader,         config_data,             0.87,  0.97),  # 10% bootloader
         ]
         

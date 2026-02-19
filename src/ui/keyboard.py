@@ -29,24 +29,47 @@ class KeyboardPage(BaseConfigurationPage):
         # --- Add Keyboard Widgets --- 
         key_group = Adw.PreferencesGroup()
         self.add(key_group)
-        model = Gtk.StringList.new(self.layout_display_names)
-        self.layout_row = Adw.ComboRow(title="Keyboard Layout", model=model)
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Search keyboard layouts...")
+        self.search_entry.set_hexpand(True)
+        self.search_entry.set_margin_top(8)
+        self.search_entry.set_margin_bottom(12)
+        self.search_entry.add_css_class("centrio-compact-entry")
+        key_group.add(self.search_entry)
+        self.layout_string_list = Gtk.StringList.new(self.layout_display_names)
+        self._layout_search_text = [""]
+        def _layout_match_func(item, _data):
+            s = item.get_string()
+            return self._layout_search_text[0].lower() in s.lower()
+        self.layout_filter = Gtk.CustomFilter.new(_layout_match_func, None)
+        self.layout_filter_model = Gtk.FilterListModel(model=self.layout_string_list)
+        self.layout_filter_model.set_filter(self.layout_filter)
+        self.layout_row = Adw.ComboRow(title="Keyboard Layout", model=self.layout_filter_model)
+        self.layout_row.set_margin_top(4)
+        self.layout_row.set_margin_bottom(8)
+        self.search_entry.connect("search-changed", self._on_layout_search_changed)
         key_group.add(self.layout_row)
         
         test_row = Adw.ActionRow(title="Test your keyboard settings")
+        test_row.add_css_class("centrio-compact-row")
+        test_row.set_margin_top(12)
+        test_row.set_margin_bottom(8)
         test_entry = Gtk.Entry()
         test_entry.set_placeholder_text("Type here to test layout...")
+        test_entry.add_css_class("centrio-compact-entry")
         test_row.add_suffix(test_entry)
         test_row.set_activatable_widget(test_entry)
         key_group.add(test_row)
 
         # --- Confirmation Button --- 
         button_group = Adw.PreferencesGroup()
+        button_group.set_margin_top(20)
         self.add(button_group) 
         self.complete_button = Gtk.Button(label="Apply Keyboard Layout")
         self.complete_button.set_halign(Gtk.Align.CENTER)
-        self.complete_button.set_margin_top(24)
+        self.complete_button.set_margin_top(20)
+        self.complete_button.set_margin_bottom(16)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         # Enable based on layout list availability
         self.complete_button.set_sensitive(bool(self.layout_pairs))
@@ -57,7 +80,11 @@ class KeyboardPage(BaseConfigurationPage):
         
         # --- Fetch Current Settings --- 
         self.connect_and_fetch_data()
-            
+
+    def _on_layout_search_changed(self, entry):
+        self._layout_search_text[0] = entry.get_text()
+        self.layout_filter.changed(Gtk.FilterChange.DIFFERENT)
+
     def connect_and_fetch_data(self):
         """Fetches current keymap settings using localectl status."""
         print("Fetching keyboard settings using localectl...")
@@ -86,11 +113,13 @@ class KeyboardPage(BaseConfigurationPage):
             # Set UI selection based on fetched data (prefer VC map for console focus)
             initial_layout = self.current_vc_keymap
             if initial_layout and initial_layout in self.layout_codes:
-                 try:
-                     idx = self.layout_codes.index(initial_layout)
-                     self.layout_row.set_selected(idx)
-                 except ValueError:
-                     print(f"Warning: Initial layout '{initial_layout}' not found in list.")
+                 display_name = self.layout_display_names[self.layout_codes.index(initial_layout)]
+                 n = self.layout_filter_model.get_n_items()
+                 for i in range(n):
+                     if self.layout_filter_model.get_item(i).get_string() == display_name:
+                         self.layout_row.set_selected(i)
+                         break
+                 else:
                      if self.layout_codes:
                          self.layout_row.set_selected(0)
             elif self.layout_codes:
@@ -115,11 +144,22 @@ class KeyboardPage(BaseConfigurationPage):
     def apply_settings_and_return(self, button):
         """Applies the selected keyboard layout using localectl."""
         selected_idx = self.layout_row.get_selected()
-        if not self.layout_codes or selected_idx < 0 or selected_idx >= len(self.layout_codes):
+        if selected_idx == Gtk.INVALID_LIST_POSITION or selected_idx < 0:
             self.show_toast("Invalid keyboard layout selection.")
             return
-
-        selected_layout = self.layout_codes[selected_idx]
+        sel_item = self.layout_filter_model.get_item(selected_idx)
+        if not sel_item or not self.layout_codes:
+            self.show_toast("Invalid keyboard layout selection.")
+            return
+        display_name = sel_item.get_string()
+        try:
+            orig_idx = self.layout_display_names.index(display_name)
+            selected_layout = self.layout_codes[orig_idx]
+        except (ValueError, IndexError):
+            selected_layout = next((c for c in self.layout_codes if self.layout_display_names[self.layout_codes.index(c)] == display_name), None)
+        if not selected_layout:
+            self.show_toast("Invalid keyboard layout selection.")
+            return
             
         print(f"Attempting to set Keyboard Layout to '{selected_layout}' using localectl...")
         self.complete_button.set_sensitive(False) # Disable button during operation

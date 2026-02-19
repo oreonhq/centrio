@@ -51,8 +51,10 @@ class BootloaderPage(BaseConfigurationPage):
         self.add(button_group)
         self.complete_button = Gtk.Button(label="Confirm Bootloader Choice")
         self.complete_button.set_halign(Gtk.Align.CENTER)
-        self.complete_button.set_margin_top(24)
+        self.complete_button.set_margin_top(18)
+        self.complete_button.set_margin_bottom(8)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         # Button is always sensitive now
         self.complete_button.set_sensitive(True)

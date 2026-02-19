@@ -461,6 +461,86 @@ def create_user_in_container(target_root, user_config, progress_callback=None):
         
     return True, "", None
 
+
+# Live users to remove from installed system (live environment accounts)
+LIVE_USERNAMES = ["liveuser", "live", "fedora", "gnome"]
+
+
+def remove_live_users_and_configure_oobe(target_root, install_user_created=False, install_username=None, progress_callback=None):
+    """Remove live-environment users from the target and configure first-boot behavior.
+
+    - Removes users in LIVE_USERNAMES (e.g. liveuser) so the system does not boot to them.
+    - If install_user_created and install_username: create marker so GNOME OOBE is skipped
+      for that user on first login (installer already did language/keyboard/user setup).
+    - If no user was created: leave OOBE to run (GDM will show no normal users and can run
+      gnome-initial-setup when appropriate).
+    """
+    if progress_callback:
+        progress_callback("Removing live users and configuring first boot...", None)
+    print("Removing live users from target system...")
+    passwd_path = os.path.join(target_root, "etc/passwd")
+    if not os.path.exists(passwd_path):
+        print("  No /etc/passwd in target, skipping live user removal.")
+        return True, ""
+    existing = set()
+    try:
+        with open(passwd_path, "r") as f:
+            for line in f:
+                name = line.split(":")[0].strip()
+                if name:
+                    existing.add(name)
+    except Exception as e:
+        print(f"Warning: Could not read {passwd_path}: {e}")
+        return True, ""
+
+    for username in LIVE_USERNAMES:
+        if username not in existing:
+            continue
+        print(f"  Removing live user: {username}")
+        ok, err, _ = _run_in_chroot(
+            target_root,
+            ["userdel", "-r", "-f", username],
+            f"Remove live user {username}",
+            progress_callback=progress_callback,
+            timeout=30,
+        )
+        if not ok:
+            print(f"Warning: userdel -r -f {username} failed: {err}")
+        # Remove AccountService data so GDM does not list this user
+        acct_file = os.path.join(target_root, "var/lib/AccountsService/users", username)
+        try:
+            if os.path.exists(acct_file):
+                os.remove(acct_file)
+                print(f"  Removed AccountService data for {username}")
+        except Exception as e:
+            print(f"Warning: Could not remove {acct_file}: {e}")
+
+    if install_user_created and install_username:
+        # Mark OOBE as done so first login goes to desktop (installer already did setup)
+        user_home = os.path.join(target_root, "home", install_username)
+        marker_dir = os.path.join(user_home, ".config")
+        marker_file = os.path.join(marker_dir, "gnome-initial-setup-done")
+        try:
+            os.makedirs(marker_dir, exist_ok=True)
+            with open(marker_file, "w") as f:
+                f.write("")
+            print(f"  Created OOBE-done marker for {install_username}")
+        except Exception as e:
+            print(f"Warning: Could not create OOBE marker: {e}")
+        var_lib = os.path.join(target_root, "var/lib")
+        gis_done = os.path.join(var_lib, "gnome-initial-setup-done")
+        try:
+            os.makedirs(var_lib, exist_ok=True)
+            with open(gis_done, "w") as f:
+                f.write("")
+            print("  Created system-wide OOBE-done marker")
+        except Exception as e:
+            print(f"Warning: Could not create {gis_done}: {e}")
+
+    print("Live user removal and OOBE configuration complete.")
+    return True, ""
+
+
 # --- Package Installation ---
 
 def setup_repositories(target_root, repositories, progress_callback=None):
@@ -643,7 +723,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         raise RuntimeError("Could not detect OS VERSION_ID for DNF. Set releasever or fix /etc/os-release.")
     print(f"Using release version: {releasever}")
     
-    # Build DNF command with package exclusions
+    # Build DNF command with package exclusions and speed optimizations
     dnf_cmd = [
         "dnf", 
         "install", 
@@ -652,6 +732,8 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         f"--installroot={target_root}",
         f"--releasever={releasever}",
         f"--setopt=install_weak_deps=False",
+        "--setopt=max_parallel_downloads=10",
+        "--setopt=fastestmirror=True",
         "--exclude=firefox",
         "--exclude=redhat-flatpak-repo", 
         "--exclude=almalinux-*",
@@ -1455,6 +1537,10 @@ def copy_live_environment(target_root, progress_callback=None):
                 "--one-file-system",
                 "--no-xattrs",
                 "--no-acls",
+                "--inplace",       # Write in-place, avoid temp files
+                "-W",              # Whole-file transfer (skip delta calc for local)
+                "--omit-dir-times", # Skip mtime on dirs (minor speedup)
+                "--no-compress",   # Explicit: no compression for local copy
                 f"{source}/",
                 destination,
             ]
@@ -1538,7 +1624,27 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
         except Exception as e2:
             print(f"Warning: Fallback machine-id also failed: {e2}")
     
-    # SELinux: copy uses --no-xattrs so target has no labels. Set permissive and request relabel.
+    # SELinux: copy uses --no-xattrs so target has no labels. Relabel during install so we can use enforcing.
+    try:
+        ok, _, _ = _run_in_chroot(
+            target_root,
+            ["restorecon", "-Rv", "-e", "/tmp", "-e", "/var/tmp", "-e", "/var/cache", "-e", "/var/log", "/"],
+            "SELinux relabel", progress_callback, timeout=600
+        )
+        if ok:
+            print("SELinux relabel completed")
+        else:
+            print("Warning: restorecon may have failed; creating /.autorelabel for first boot fallback")
+            try:
+                open(os.path.join(target_root, ".autorelabel"), "w").close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Warning: SELinux relabel failed: {e}; creating /.autorelabel")
+        try:
+            open(os.path.join(target_root, ".autorelabel"), "w").close()
+        except Exception:
+            pass
     selinux_config = os.path.join(target_root, "etc/selinux/config")
     if os.path.exists(os.path.dirname(selinux_config)):
         try:
@@ -1546,20 +1652,14 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
             if os.path.exists(selinux_config):
                 with open(selinux_config, "r") as f:
                     content = f.read()
-            # Ensure SELINUX=permissive for first boot (labels will be wrong; avoid denial cascade)
-            content = re.sub(r"^SELINUX=.*", "SELINUX=permissive", content, flags=re.MULTILINE)
+            content = re.sub(r"^SELINUX=.*", "SELINUX=enforcing", content, flags=re.MULTILINE)
             if "SELINUX=" not in content:
-                content = "SELINUX=permissive\n" + content
+                content = "SELINUX=enforcing\n" + content
             with open(selinux_config, "w") as f:
                 f.write(content)
-            print("Set SELINUX=permissive in /etc/selinux/config for first boot")
+            print("Set SELINUX=enforcing in /etc/selinux/config")
         except Exception as e:
             print(f"Warning: Could not update SELinux config: {e}")
-        try:
-            open(os.path.join(target_root, ".autorelabel"), "w").close()
-            print("Created /.autorelabel for full relabel on first boot")
-        except Exception as e:
-            print(f"Warning: Could not create /.autorelabel: {e}")
 
     # Clear systemd random seed
     random_seed_path = os.path.join(target_root, "var/lib/systemd/random-seed")
@@ -1608,6 +1708,44 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
     except Exception as e:
         print(f"Warning: Could not copy resolv.conf: {e}")
     
+    # --- Remove livesys-scripts (live-install popups like "Welcome to Oreon") ---
+    try:
+        r = subprocess.run(
+            ["rpm", "-q", "livesys-scripts", f"--root={target_root}"],
+            capture_output=True, text=True, check=False, timeout=10
+        )
+        if r.returncode == 0:
+            subprocess.run(
+                ["rpm", "-e", "--nodeps", "livesys-scripts", f"--root={target_root}"],
+                capture_output=True, text=True, timeout=30
+            )
+            print("Removed livesys-scripts package")
+    except Exception as e:
+        print(f"Warning: Could not remove livesys-scripts: {e}")
+
+    # --- Plymouth: set default theme and rebuild initramfs for installed system ---
+    for theme in ["spinner", "bgrt", "spin-gdm", "details"]:
+        try:
+            ok, _, _ = _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R", theme], "Set Plymouth theme", progress_callback, timeout=120)
+            if ok:
+                print(f"Set Plymouth theme to {theme}")
+                break
+        except Exception as e:
+            print(f"Warning: Plymouth theme {theme}: {e}")
+
+    # --- Remove live-specific GNOME/Software config overrides ---
+    live_dconf_dirs = [
+        os.path.join(target_root, "etc/dconf/db/local.d/10-livesys"),
+        os.path.join(target_root, "etc/dconf/db/local.d/livesys"),
+    ]
+    for d in live_dconf_dirs:
+        if os.path.exists(d) and os.path.isfile(d):
+            try:
+                os.remove(d)
+                print(f"Removed live config: {d}")
+            except Exception as e:
+                print(f"Warning: Could not remove {d}: {e}")
+
     # --- Ensure essential directories exist ---
     essential_dirs = [
         os.path.join(target_root, "proc"),

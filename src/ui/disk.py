@@ -148,6 +148,32 @@ def get_host_lvm_pvs():
         print(f"Warning: Failed to get host LVM PVs: {e}")
         return set()
 
+def disk_has_unallocated_space(disk_path):
+    """Check if a disk has unallocated (free) space for dual boot. Returns True if yes."""
+    if not disk_path or not os.path.exists(disk_path):
+        return False
+    try:
+        r = subprocess.run(
+            ["parted", "-s", disk_path, "unit", "s", "print", "free"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            return False
+        return "Free Space" in r.stdout or "free" in r.stdout.lower()
+    except Exception:
+        return False
+
+
+def get_parent_disk(partition_path):
+    """Get the parent disk path for a partition (e.g. /dev/sda1 -> /dev/sda)."""
+    if not partition_path:
+        return None
+    m = re.match(r"^(/dev/[a-zA-Z]+)\d*$", partition_path) or \
+        re.match(r"^(/dev/nvme\d+n\d+)p?\d*$", partition_path) or \
+        re.match(r"^(/dev/mmcblk\d+)p?\d*$", partition_path)
+    return m.group(1) if m else None
+
+
 def detect_existing_efi_partitions():
     """Detect existing EFI system partitions that could be reused for dual boot."""
     efi_partitions = []
@@ -222,6 +248,7 @@ class DiskPage(BaseConfigurationPage):
         self.scan_button = Gtk.Button(label="Scan for Disks")
         self.scan_button.set_valign(Gtk.Align.CENTER)
         self.scan_button.add_css_class("suggested-action")
+        self.scan_button.add_css_class("compact")
         self.scan_button.connect("clicked", self.scan_for_disks)
         scan_row.add_suffix(self.scan_button)
         info_group.add(scan_row)
@@ -252,7 +279,7 @@ class DiskPage(BaseConfigurationPage):
         # Dual boot installation
         self.dual_boot_row = Adw.ActionRow(
             title="Dual Boot Installation",
-            subtitle="Install alongside existing operating system"
+            subtitle="Install alongside Windows or another OS, reusing the existing EFI partition. Requires unallocated disk space (shrink a partition in Windows Disk Management or GParted first)."
         )
         self.dual_boot_radio = Gtk.CheckButton(group=self.normal_radio)
         self.dual_boot_radio.set_valign(Gtk.Align.CENTER)
@@ -317,6 +344,7 @@ class DiskPage(BaseConfigurationPage):
         self.complete_button = Gtk.Button(label="Apply Storage Plan")
         self.complete_button.set_valign(Gtk.Align.CENTER)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         self.complete_button.set_sensitive(False)
         confirm_row.add_suffix(self.complete_button)
@@ -325,11 +353,35 @@ class DiskPage(BaseConfigurationPage):
         # No _connect_dbus needed anymore
         # self._connect_dbus() 
             
+    def _check_dual_boot_available(self):
+        """Check if dual boot is possible: EFI partitions exist and at least one disk has unallocated space."""
+        self.efi_partitions = detect_existing_efi_partitions()
+        if not self.efi_partitions:
+            self.dual_boot_row.set_sensitive(False)
+            self.dual_boot_row.set_subtitle("No existing EFI partitions found. Use clean installation.")
+            return False
+        disks_checked = set()
+        for efi in self.efi_partitions:
+            disk = get_parent_disk(efi.get("path", ""))
+            if disk and disk not in disks_checked and disk_has_unallocated_space(disk):
+                disks_checked.add(disk)
+                self.dual_boot_row.set_sensitive(True)
+                self.dual_boot_row.set_subtitle("Install alongside existing OS. Select an EFI partition below.")
+                return True
+            disks_checked.add(disk) if disk else None
+        self.dual_boot_row.set_sensitive(False)
+        self.dual_boot_row.set_subtitle("No unallocated space on disks with EFI. Shrink a partition in Windows Disk Management or GParted to create free space.")
+        return False
+
     def on_install_mode_changed(self, button, mode):
         """Handle installation mode selection."""
         if not button.get_active():
             return
-            
+
+        if mode == "dual_boot" and not self.dual_boot_row.get_sensitive():
+            self.normal_radio.set_active(True)
+            return
+
         if mode == "normal":
             self.dual_boot_enabled = False
             self.preserve_efi = False
@@ -337,16 +389,14 @@ class DiskPage(BaseConfigurationPage):
             print("Installation mode: Normal (clean installation)")
         elif mode == "dual_boot":
             self.dual_boot_enabled = True
-            self.efi_partitions = detect_existing_efi_partitions()
-            if self.efi_partitions:
+            if self._check_dual_boot_available():
                 self._populate_efi_partitions()
                 self.efi_group.set_visible(True)
                 print(f"Installation mode: Dual boot (found {len(self.efi_partitions)} EFI partitions)")
             else:
-                self.show_toast("No existing EFI partitions found for dual boot")
-                self.normal_radio.set_active(True)  # Default to normal
+                self.normal_radio.set_active(True)
                 return
-        
+
         self.partitioning_method = mode
         self.update_complete_button_state()
     
@@ -579,7 +629,7 @@ class DiskPage(BaseConfigurationPage):
 
         try:
             # Run lsblk ONCE, get JSON tree, include MOUNTPOINT
-            cmd = ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT"]
+            cmd = ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT,TRAN"]
             print(f"Running: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
             lsblk_data = json.loads(result.stdout)
@@ -631,6 +681,11 @@ class DiskPage(BaseConfigurationPage):
             # --- Process all detected physical disks ---
             print("--- Processing detected disks ---")
             for device in all_block_devices:
+                # Skip optical, USB/portable drives
+                tran = (device.get("tran") or "").lower()
+                if tran == "usb":
+                    print(f"  Skipping USB/portable disk: {device.get('path')}")
+                    continue
                 if device.get("type") == "disk" and not any(s in (device.get("model") or "").upper() for s in ["CD", "DVD"]):
                     disk_path = device.get("path")
                     if not disk_path: continue
@@ -658,6 +713,7 @@ class DiskPage(BaseConfigurationPage):
                 self.disk_list_group.set_visible(True)
                 self.mode_group.set_visible(True)
                 self.fs_group.set_visible(True)
+                self._check_dual_boot_available()
                 self.normal_radio.set_active(True)  # Default to normal install
             else:
                  self.show_toast("No suitable disks found for installation.")

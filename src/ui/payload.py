@@ -1,11 +1,14 @@
 # centrio_installer/ui/payload.py
 
+import os
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
 
 from .base import BaseConfigurationPage
+
+_ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'icons')
 
 # Default package groups and packages
 DEFAULT_PACKAGE_GROUPS = {
@@ -41,7 +44,7 @@ DEFAULT_PACKAGE_GROUPS = {
         "name": "Productivity Suite",
         "description": "Office applications and productivity tools",
         "packages": ["thunderbird"],
-        "flatpak_packages": ["org.libreoffice.LibreOffice", "org.mozilla.firefox"],
+        "flatpak_packages": ["org.libreoffice.LibreOffice"],
         "required": False,
         "selected": True
     },
@@ -83,17 +86,53 @@ class PayloadPage(BaseConfigurationPage):
         
         # State variables
         self.package_groups = DEFAULT_PACKAGE_GROUPS.copy()
+        self.package_group_rows = {}
         self.custom_repositories = COMMON_REPOSITORIES.copy()
         self.flatpak_enabled = True
         self.custom_packages = []
         self.oem_packages = []
         self.oem_repo_url = ""
         
+        self.network_warning_row = None
         self._build_ui()
-        
+
+    def refresh_for_network(self, network_config=None):
+        """Gray out network-dependent options when no network. Call when page is shown."""
+        net = network_config or {}
+        connected = net.get("network_status") == "connected"
+        skip = net.get("skip_network", True)
+        has_network = connected and not skip
+        for w in [self.flatpak_row, self.flatpak_section, self.repos_section, self.oem_section, self.oem_repo_row, self.custom_packages_row]:
+            w.set_sensitive(has_network)
+        if not has_network:
+            self.browser_section.set_sensitive(False)
+        for gid, ginfo in self.package_groups.items():
+            if not ginfo["required"] and gid in self.package_group_rows:
+                self.package_group_rows[gid].set_sensitive(has_network)
+        if hasattr(self, "network_warning_group"):
+            self.network_warning_group.set_visible(not has_network)
+        # Re-apply Flatpak-dependent graying when network is available
+        if has_network:
+            self._refresh_flatpak_dependent()
+
     def _build_ui(self):
         """Build the enhanced package selection UI."""
         
+        self.network_warning_group = Adw.PreferencesGroup(
+            title="No Network",
+            description="Network is required for these options"
+        )
+        self.network_warning_row = Adw.ActionRow(
+            title="Network required",
+            subtitle="Configure network in Network Settings to enable additional software, Flatpak, repositories, and custom packages."
+        )
+        warn_icon = Gtk.Image.new_from_icon_name("network-offline-symbolic")
+        warn_icon.add_css_class("error")
+        self.network_warning_row.add_prefix(warn_icon)
+        self.network_warning_group.add(self.network_warning_row)
+        self.network_warning_group.set_visible(False)
+        self.add(self.network_warning_group)
+
         # Installation Method Section
         self.method_section = Adw.PreferencesGroup(
             title="Installation Method",
@@ -134,7 +173,46 @@ class PayloadPage(BaseConfigurationPage):
         self.flatpak_row.set_active(self.flatpak_enabled)
         self.flatpak_row.connect("notify::active", self.on_flatpak_toggled)
         self.flatpak_section.add(self.flatpak_row)
-        
+
+        # Web Browser Section (all Flatpak)
+        self.browser_section = Adw.PreferencesGroup(
+            title="Web Browser",
+            description="Select a web browser to install"
+        )
+        self.add(self.browser_section)
+        BROWSERS = [
+            ("firefox", "Firefox", "org.mozilla.firefox", "firefox.svg"),
+            ("chrome", "Chrome", "com.google.Chrome", "chrome.svg"),
+            ("brave", "Brave", "com.brave.Browser", "brave.svg"),
+            ("edge", "Edge", "com.microsoft.Edge", "edge.svg"),
+            ("none", "No web browser", None, None),
+        ]
+        self.browser_options = {b[0]: {"name": b[1], "flatpak": b[2], "icon_file": b[3]} for b in BROWSERS}
+        self.selected_browser = "none"
+        self.browser_rows = {}
+        self.browser_radios = {}
+        first_radio = None
+        for bid, binfo in self.browser_options.items():
+            row = Adw.ActionRow(title=binfo["name"], subtitle="You can always install one later" if bid == "none" else "")
+            if binfo["icon_file"]:
+                path = os.path.join(_ICONS_DIR, binfo["icon_file"])
+                icon = Gtk.Image.new_from_file(path) if os.path.isfile(path) else Gtk.Image()
+            else:
+                icon = Gtk.Image.new_from_icon_name("window-close-symbolic")
+            row.add_prefix(icon)
+            radio = Gtk.CheckButton()
+            if first_radio is None:
+                first_radio = radio
+                radio.set_active(True)
+            else:
+                radio.set_group(first_radio)
+            radio.connect("toggled", self._on_browser_selected, bid)
+            row.add_suffix(radio)
+            row.set_activatable_widget(radio)
+            self.browser_section.add(row)
+            self.browser_rows[bid] = row
+            self.browser_radios[bid] = radio
+
         # Custom Repositories Section
         self.repos_section = Adw.PreferencesGroup(
             title="Additional Repositories",
@@ -191,9 +269,12 @@ class PayloadPage(BaseConfigurationPage):
         self.complete_button = Gtk.Button(label="Apply Software Plan")
         self.complete_button.set_valign(Gtk.Align.CENTER)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         confirm_row.add_suffix(self.complete_button)
         self.button_section.add(confirm_row)
+
+        self._refresh_flatpak_dependent()
         
     def _populate_package_groups(self):
         """Populate the package groups section."""
@@ -202,11 +283,10 @@ class PayloadPage(BaseConfigurationPage):
                 title=group_info["name"],
                 subtitle=group_info["description"]
             )
-            
+            self.package_group_rows[group_id] = row
             if group_info["required"]:
                 row.set_sensitive(False)
                 row.set_subtitle(group_info["description"] + " (required)")
-            
             row.set_active(group_info["selected"])
             row.connect("notify::active", self.on_group_toggled, group_id)
             self.additional_section.add(row)
@@ -236,9 +316,30 @@ class PayloadPage(BaseConfigurationPage):
             self.custom_repositories[repo_id]["enabled"] = is_active
             print(f"Repository '{repo_id}' {'enabled' if is_active else 'disabled'}")
             
+    def _on_browser_selected(self, radio, bid):
+        if radio.get_active():
+            self.selected_browser = bid
+            print(f"Browser selected: {bid}")
+
+    def _refresh_flatpak_dependent(self):
+        """Gray out Flatpak-dependent options when Flatpak is disabled."""
+        enabled = self.flatpak_enabled
+        self.browser_section.set_sensitive(enabled)
+        for gid, ginfo in self.package_groups.items():
+            if ginfo.get("flatpak_packages") and gid in self.package_group_rows:
+                self.package_group_rows[gid].set_sensitive(enabled)
+                if not enabled:
+                    self.package_groups[gid]["selected"] = False
+                    self.package_group_rows[gid].set_active(False)
+
     def on_flatpak_toggled(self, switch_row, pspec):
         """Handle Flatpak toggle."""
         self.flatpak_enabled = switch_row.get_active()
+        self._refresh_flatpak_dependent()
+        if not self.flatpak_enabled:
+            self.selected_browser = "none"
+            for bid, radio in self.browser_radios.items():
+                radio.set_active(bid == "none")
         print(f"Flatpak support {'enabled' if self.flatpak_enabled else 'disabled'}")
         
     def on_oem_repo_changed(self, entry_row):
@@ -278,9 +379,15 @@ class PayloadPage(BaseConfigurationPage):
         for group_id, group_info in self.package_groups.items():
             if group_info["selected"] or group_info["required"]:
                 dnf_packages.extend(group_info.get("packages", []))
-                # Add flatpak packages if the group has them
-                if "flatpak_packages" in group_info:
+                # Add flatpak packages only when Flatpak is enabled
+                if self.flatpak_enabled and "flatpak_packages" in group_info:
                     flatpak_packages.extend(group_info["flatpak_packages"])
+        
+        # Add selected browser (Flatpak only) when Flatpak enabled
+        if self.flatpak_enabled and self.selected_browser != "none":
+            fp = self.browser_options.get(self.selected_browser, {}).get("flatpak")
+            if fp:
+                flatpak_packages.append(fp)
         
         # Add custom packages (assume they are DNF packages)
         dnf_packages.extend(self.custom_packages)
@@ -330,9 +437,15 @@ class PayloadPage(BaseConfigurationPage):
     def apply_settings_and_return(self, button):
         """Apply the software configuration and return to summary."""
         print(f"--- Apply Software Settings START ---")
-        
+        net = self.main_window.final_config.get("network", {}) if self.main_window else {}
+        has_network = net.get("network_status") == "connected" and not net.get("skip_network", True)
         selected_packages, flatpak_packages = self._get_selected_packages()
-        enabled_repos = self._get_enabled_repositories()
+        if not has_network:
+            flatpak_packages = []
+            custom_set = set(self.custom_packages) | set(self.oem_packages)
+            selected_packages = [p for p in selected_packages if p not in custom_set]
+        enabled_repos = [] if not has_network else self._get_enabled_repositories()
+        flatpak_enabled_effective = self.flatpak_enabled and has_network
         
         print(f"  Selected packages ({len(selected_packages)}): {selected_packages[:10]}{'...' if len(selected_packages) > 10 else ''}")
         print(f"  Flatpak packages ({len(flatpak_packages)}): {flatpak_packages}")
@@ -345,7 +458,7 @@ class PayloadPage(BaseConfigurationPage):
             "packages": selected_packages,
             "flatpak_packages": flatpak_packages,
             "repositories": enabled_repos,
-            "flatpak_enabled": self.flatpak_enabled,
+            "flatpak_enabled": flatpak_enabled_effective,
             "custom_packages": self.custom_packages,
             "oem_repo_url": self.oem_repo_url,
             "keep_cache": self.cache_row.get_active(),
@@ -358,7 +471,7 @@ class PayloadPage(BaseConfigurationPage):
         repo_count = len(enabled_repos)
         features = []
         
-        if self.flatpak_enabled:
+        if flatpak_enabled_effective:
             features.append("Flatpak")
         if self.custom_packages:
             features.append(f"{len(self.custom_packages)} custom packages")

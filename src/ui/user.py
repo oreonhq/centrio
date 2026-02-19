@@ -54,10 +54,12 @@ class UserPage(BaseConfigurationPage):
         admin_box.append(self.admin_check)
         admin_group.add(admin_box)
         
-        self.complete_button = Gtk.Button(label="Create User Account") 
+        self.complete_button = Gtk.Button(label="Create User Account")
         self.complete_button.set_halign(Gtk.Align.CENTER)
-        self.complete_button.set_margin_top(24)
+        self.complete_button.set_margin_top(18)
+        self.complete_button.set_margin_bottom(8)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         button_group.add(self.complete_button)
 
         # --- Connect Signals for Validation ---

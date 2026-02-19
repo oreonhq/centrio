@@ -30,10 +30,23 @@ class TimeDatePage(BaseConfigurationPage):
         time_group = Adw.PreferencesGroup()
         
         self.add(time_group)
-        
-        # Use ComboRow for timezone selection
-        timezone_model = Gtk.StringList.new(self.timezone_list)
-        self.timezone_row = Adw.ComboRow(title="Timezone", model=timezone_model)
+
+        self.tz_search_entry = Gtk.SearchEntry(placeholder_text="Search timezones...")
+        self.tz_search_entry.set_hexpand(True)
+        time_group.add(self.tz_search_entry)
+
+        # Use ComboRow with filter for timezone selection
+        # StringFilter/StringFilterMode require GTK 4.10+; use CustomFilter fallback
+        self.timezone_string_list = Gtk.StringList.new(self.timezone_list)
+        self._tz_search_text = [""]
+        def _tz_match_func(item, _data):
+            s = item.get_string()
+            return self._tz_search_text[0].lower() in s.lower()
+        self.timezone_filter = Gtk.CustomFilter.new(_tz_match_func, None)
+        self.timezone_filter_model = Gtk.FilterListModel(model=self.timezone_string_list)
+        self.timezone_filter_model.set_filter(self.timezone_filter)
+        self.timezone_row = Adw.ComboRow(title="Timezone", model=self.timezone_filter_model)
+        self.tz_search_entry.connect("search-changed", self._on_timezone_search_changed)
         time_group.add(self.timezone_row)
         
         # NTP toggle
@@ -50,8 +63,10 @@ class TimeDatePage(BaseConfigurationPage):
         self.add(button_group)
         self.complete_button = Gtk.Button(label="Apply Time & Date Settings")
         self.complete_button.set_halign(Gtk.Align.CENTER)
-        self.complete_button.set_margin_top(24)
+        self.complete_button.set_margin_top(18)
+        self.complete_button.set_margin_bottom(8)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         # Enable based on whether timezones could be listed
         self.complete_button.set_sensitive(bool(self.timezone_list))
@@ -63,6 +78,10 @@ class TimeDatePage(BaseConfigurationPage):
 
         # --- Fetch Current Settings --- 
         self.connect_and_fetch_data()
+
+    def _on_timezone_search_changed(self, entry):
+        self._tz_search_text[0] = entry.get_text()
+        self.timezone_filter.changed(Gtk.FilterChange.DIFFERENT)
 
     def on_ntp_toggled(self, switch_row, pspec):
         """Handle NTP toggle changes."""
@@ -142,11 +161,14 @@ class TimeDatePage(BaseConfigurationPage):
     def apply_settings_and_return(self, button):
         """Applies timezone and NTP settings using timedatectl."""
         selected_idx = self.timezone_row.get_selected()
-        if not self.timezone_list or selected_idx < 0 or selected_idx >= len(self.timezone_list):
-             self.show_toast("Invalid timezone selection.")
-             return
-             
-        selected_tz = self.timezone_list[selected_idx]
+        if selected_idx == Gtk.INVALID_LIST_POSITION or selected_idx < 0:
+            self.show_toast("Invalid timezone selection.")
+            return
+        sel_item = self.timezone_filter_model.get_item(selected_idx)
+        if not sel_item:
+            self.show_toast("Invalid timezone selection.")
+            return
+        selected_tz = sel_item.get_string()
         network_time_enabled = self.ntp_row.get_active()
         ntp_bool_str = "true" if network_time_enabled else "false"
 

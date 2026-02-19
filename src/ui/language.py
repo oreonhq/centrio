@@ -30,8 +30,21 @@ class LanguagePage(BaseConfigurationPage): # Renamed class slightly
         lang_group = Adw.PreferencesGroup(title="System Locale")
         self.add(lang_group)
 
-        locale_model = Gtk.StringList.new(self.locale_display_names)
-        self.locale_row = Adw.ComboRow(title="Locale", model=locale_model)
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Search locales...")
+        self.search_entry.set_hexpand(True)
+        lang_group.add(self.search_entry)
+
+        self.locale_string_list = Gtk.StringList.new(self.locale_display_names)
+        # StringFilter/StringFilterMode require GTK 4.10+; use CustomFilter fallback
+        self._search_text = [""]
+        def _match_func(item, _data):
+            s = item.get_string()
+            return self._search_text[0].lower() in s.lower()
+        self.locale_filter = Gtk.CustomFilter.new(_match_func, None)
+        self.locale_filter_model = Gtk.FilterListModel(model=self.locale_string_list)
+        self.locale_filter_model.set_filter(self.locale_filter)
+        self.locale_row = Adw.ComboRow(title="Locale", model=self.locale_filter_model)
+        self.search_entry.connect("search-changed", self._on_locale_search_changed)
         lang_group.add(self.locale_row)
 
         # --- Confirmation Button --- 
@@ -39,8 +52,10 @@ class LanguagePage(BaseConfigurationPage): # Renamed class slightly
         self.add(button_group)
         self.complete_button = Gtk.Button(label="Apply System Locale")
         self.complete_button.set_halign(Gtk.Align.CENTER)
-        self.complete_button.set_margin_top(24)
+        self.complete_button.set_margin_top(18)
+        self.complete_button.set_margin_bottom(8)
         self.complete_button.add_css_class("suggested-action")
+        self.complete_button.add_css_class("compact")
         self.complete_button.connect("clicked", self.apply_settings_and_return)
         # Sensitivity depends on available locales
         self.complete_button.set_sensitive(bool(self.available_locales))
@@ -50,7 +65,11 @@ class LanguagePage(BaseConfigurationPage): # Renamed class slightly
         button_group.add(self.complete_button)
 
         # --- Fetch Current Settings --- 
-        self.connect_and_fetch_data() 
+        self.connect_and_fetch_data()
+
+    def _on_locale_search_changed(self, entry):
+        self._search_text[0] = entry.get_text()
+        self.locale_filter.changed(Gtk.FilterChange.DIFFERENT)
 
     def connect_and_fetch_data(self):
         """Fetches current system locale using localectl status."""
@@ -98,11 +117,22 @@ class LanguagePage(BaseConfigurationPage): # Renamed class slightly
     def apply_settings_and_return(self, button):
         """Applies the selected system locale using localectl."""
         selected_idx = self.locale_row.get_selected()
-        if not self.locale_codes or selected_idx < 0 or selected_idx >= len(self.locale_codes):
-             self.show_toast("Invalid locale selection.")
-             return
-             
-        selected_locale = self.locale_codes[selected_idx]
+        if selected_idx == Gtk.INVALID_LIST_POSITION or selected_idx < 0:
+            self.show_toast("Invalid locale selection.")
+            return
+        sel_item = self.locale_filter_model.get_item(selected_idx)
+        if not sel_item:
+            self.show_toast("Invalid locale selection.")
+            return
+        display_name = sel_item.get_string()
+        try:
+            orig_idx = self.locale_display_names.index(display_name)
+            selected_locale = self.locale_codes[orig_idx]
+        except (ValueError, IndexError):
+            selected_locale = next((c for c in self.locale_codes if self.available_locales.get(c, c) == display_name), None)
+        if not selected_locale:
+            self.show_toast("Invalid locale selection.")
+            return
             
         print(f"Attempting to set System Locale to '{selected_locale}' using localectl...")
         self.complete_button.set_sensitive(False) 

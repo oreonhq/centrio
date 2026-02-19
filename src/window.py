@@ -5,7 +5,7 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 try:
-    from gi.repository import Gtk, Adw, GLib  # type: ignore
+    from gi.repository import Gtk, Adw, GLib, Gdk  # type: ignore
 except ImportError:
     print("Warning: gi.repository could not be imported")
     raise
@@ -39,6 +39,7 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         self.set_title("Centrio Installer")
         self.set_default_size(700, 350)  # Much smaller default height
         self.set_resizable(True)
+        self.connect("realize", lambda w: self._inject_compact_button_css())
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(main_box)
         
@@ -124,9 +125,74 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         nav_box.append(self.next_button)
 
         # Update navigation state when the visible child changes
-        self.view_stack.connect("notify::visible-child-name", self.update_navigation)
+        self.view_stack.connect("notify::visible-child-name", self._on_visible_child_changed)
         # Set initial navigation state
         self.update_navigation()
+
+    def _inject_compact_button_css(self):
+        """Inject CSS for comfortable button/entry sizing and padding."""
+        try:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(
+                b"""
+                button.compact,
+                button {
+                    min-height: 32px;
+                    padding: 6px 14px;
+                    margin: 0;
+                }
+                entry {
+                    min-height: 40px;
+                    padding: 12px 16px;
+                }
+                entry.centrio-padded-entry {
+                    min-height: 44px;
+                    padding: 14px 18px;
+                }
+                entry.centrio-compact-entry {
+                    min-height: 28px;
+                    padding: 4px 10px;
+                }
+                adwpreferencesgroup {
+                    margin-top: 16px;
+                    margin-bottom: 16px;
+                    padding: 12px 0;
+                }
+                adwpreferencesgroup + adwpreferencesgroup {
+                    margin-top: 20px;
+                }
+                adwactionrow {
+                    min-height: 52px;
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    margin: 6px 0;
+                }
+                adwactionrow.centrio-compact-row {
+                    min-height: 36px;
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    margin: 2px 0;
+                }
+                row.entry {
+                    min-height: 52px;
+                    padding: 10px 0;
+                }
+                """
+            )
+            disp = self.get_display() if hasattr(self, "get_display") and self.get_display() else Gdk.Display.get_default()
+            if disp:
+                Gtk.StyleContext.add_provider_for_display(
+                    disp, provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+        except Exception as e:
+            print(f"Warning: Could not load compact button CSS: {e}")
+
+    def _on_visible_child_changed(self, stack, pspec):
+        self.update_navigation()
+        name = self.view_stack.get_visible_child_name()
+        if name == "payload" and hasattr(self, "payload_page"):
+            self.payload_page.refresh_for_network(self.final_config.get("network", {}))
 
     def get_current_page_info(self):
         """Helper to get information about the currently visible page."""
