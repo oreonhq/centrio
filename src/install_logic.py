@@ -307,8 +307,7 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
         target_root,
         ["grub2-mkconfig", "-o", grub_cfg_chroot],
         "grub2-mkconfig",
-        progress_callback,
-        timeout=120
+        progress_callback
     )
     if not ok:
         return False, err or "grub2-mkconfig failed."
@@ -354,10 +353,10 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
             kernels = sorted([f for f in os.listdir(vmlinuz_dir) if f.startswith("vmlinuz-") and "rescue" not in f])
             for k in reversed(kernels):
                 kver = k.replace("vmlinuz-", "")
-                _run_in_chroot(target_root, ["dracut", "--force", "--kver", kver], f"dracut {kver}", progress_callback, timeout=300)
+                _run_in_chroot(target_root, ["dracut", "--force", "--kver", kver], f"dracut {kver}", progress_callback)
         # After dracut, re-apply Plymouth so the final initramfs includes the splash (dracut overwrote earlier plymouth initramfs).
         try:
-            _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R"], "Plymouth initramfs", progress_callback, timeout=120)
+            _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R"], "Plymouth initramfs", progress_callback)
         except Exception:
             pass  # best effort
     except Exception as e:
