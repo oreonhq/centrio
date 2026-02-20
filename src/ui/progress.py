@@ -737,7 +737,7 @@ class ProgressPage(Gtk.Box):
             "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"
         ])
         extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
-        has_extra_work = bool(extra_packages or repositories or (flatpak_enabled and flatpak_packages))
+        has_extra_work = bool(extra_packages or repositories or flatpak_enabled or flatpak_packages)
         
         print(f"Additional packages check:")
         print(f"  packages (extra only): {extra_packages}")

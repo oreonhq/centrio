@@ -16,6 +16,8 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
     """
     
     is_root = os.geteuid() == 0
+    live_priv = "/usr/libexec/oreon-installer-priv"
+    on_live = not is_root and os.path.isfile("/run/oreon-live")
     final_command_list = []
     execution_method = ""
 
@@ -23,8 +25,16 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         final_command_list = command_list
         execution_method = "directly as root"
         print(f"Executing Backend Step ({execution_method}): {description} -> {' '.join(shlex.quote(c) for c in final_command_list)}")
+    elif on_live and os.path.isfile(live_priv):
+        # Live session: use polkit-allowed helper instead of pkexec (GIS kiosk / liveuser)
+        final_command_list = [live_priv] + command_list
+        execution_method = "via oreon-installer-priv (live)"
+        cmd_str = ' '.join(shlex.quote(c) for c in final_command_list)
+        print(f"Executing Backend Step ({execution_method}): {description} -> {cmd_str}")
+        if progress_callback:
+            progress_callback(f"Requesting privileges for: {description}...")
     else:
-        # Prepend pkexec if not running as root
+        # Prepend pkexec if not running as root and not on live
         final_command_list = ["pkexec"] + command_list
         execution_method = "via pkexec"
         cmd_str = ' '.join(shlex.quote(c) for c in final_command_list)
@@ -662,11 +672,11 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     elif not packages:
         # Use default package list if none specified
         packages = [
-            "@core", "kernel", 
-            "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "efibootmgr", 
+            "@core", "kernel",
+            "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "efibootmgr",
             "grub2-common", "grub2-tools",
             "shim-x64", "shim",
-            "linux-firmware", "NetworkManager", "systemd-resolved", 
+            "linux-firmware", "NetworkManager", "systemd-resolved",
             "bash-completion", "dnf-utils"
         ]
         print("Using default package list")
@@ -953,7 +963,12 @@ def setup_flatpak(target_root, progress_callback=None):
     success, err, _ = _run_in_chroot(target_root, flathub_cmd, "Add Flathub repository", progress_callback, timeout=60)
     if not success:
         return False, f"Failed to add Flathub repository: {err}"
-    
+    # Refresh Flatpak metadata so GNOME Software sees Flathub apps without re-login
+    try:
+        _run_in_chroot(target_root, ["flatpak", "update", "--system", "-y"], "Refresh Flatpak metadata", progress_callback, timeout=120)
+    except Exception:
+        pass
+
     # Enable Flatpak user installations
     if progress_callback:
         progress_callback("Configuring Flatpak...", 0.8)
@@ -1760,6 +1775,17 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"Warning: Could not remove livesys-scripts: {e}")
 
+    # --- Plymouth: ensure dracut includes plymouth so initramfs shows splash ---
+    dracut_d = os.path.join(target_root, "etc/dracut.conf.d")
+    try:
+        os.makedirs(dracut_d, exist_ok=True)
+        plymouth_conf = os.path.join(dracut_d, "01-plymouth.conf")
+        with open(plymouth_conf, "w") as f:
+            f.write('# Force Plymouth into initramfs (Centrio installer)\nadd_dracutmodules+=" plymouth "\n')
+        print("Added dracut drop-in for Plymouth module")
+    except Exception as e:
+        print(f"Warning: Could not write dracut Plymouth config: {e}")
+
     # --- Plymouth: set default theme and rebuild initramfs for installed system ---
     for theme in ["spinner", "bgrt", "spin-gdm", "details"]:
         try:
@@ -1770,7 +1796,7 @@ WantedBy=multi-user.target
         except Exception as e:
             print(f"Warning: Plymouth theme {theme}: {e}")
 
-    # --- Ensure kernel cmdline has rhgb quiet (and rd.plymouth=1) so Plymouth splash shows ---
+    # --- Ensure kernel cmdline has rhgb quiet splash (and rd.plymouth=1) so Plymouth splash shows ---
     grub_default = os.path.join(target_root, "etc/default/grub")
     if os.path.exists(grub_default):
         try:
@@ -1780,14 +1806,14 @@ WantedBy=multi-user.target
             match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
                 quote_char, args = match.group(1), match.group(2)
-                for param in ["rhgb", "quiet", "rd.plymouth=1"]:
+                for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
                     if param not in args.split():
                         args = (args + " " + param).strip()
                 new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
                 content = content[:match.start()] + new_line + content[match.end():]
                 with open(grub_default, "w") as f:
                     f.write(content)
-                print("Ensured rhgb quiet rd.plymouth=1 in /etc/default/grub for Plymouth splash")
+                print("Ensured rhgb quiet splash rd.plymouth=1 in /etc/default/grub for Plymouth splash")
         except Exception as e:
             print(f"Warning: Could not patch /etc/default/grub: {e}")
 
@@ -1803,6 +1829,45 @@ WantedBy=multi-user.target
                 print(f"Removed live config: {d}")
             except Exception as e:
                 print(f"Warning: Could not remove {d}: {e}")
+
+    # --- Re-enable GNOME Software updates tab (livesys-scripts disables it on live boot) ---
+    # Livesys appends allow-updates=false, download-updates=false to this override; remove it so installed system has updates.
+    gs_override = os.path.join(target_root, "usr/share/glib-2.0/schemas/org.gnome.software.gschema.override")
+    if os.path.exists(gs_override):
+        try:
+            os.remove(gs_override)
+            print("Removed org.gnome.software.gschema.override so updates tab is enabled")
+        except Exception as e:
+            print(f"Warning: Could not remove GNOME Software schema override: {e}")
+    # Replace with an override that explicitly enables updates (in case distro default is false)
+    try:
+        schemas_dir = os.path.join(target_root, "usr/share/glib-2.0/schemas")
+        os.makedirs(schemas_dir, exist_ok=True)
+        with open(gs_override, "w") as f:
+            f.write("[org.gnome.software]\nallow-updates=true\ndownload-updates=true\n")
+        print("Wrote org.gnome.software.gschema.override with updates enabled")
+    except Exception as e:
+        print(f"Warning: Could not write GNOME Software schema override: {e}")
+    # Rebuild schema cache
+    try:
+        _run_in_chroot(target_root, ["glib-compile-schemas", "/usr/share/glib-2.0/schemas"], "Compile GLib schemas", progress_callback)
+    except Exception as e:
+        print(f"Warning: Could not compile schemas: {e}")
+
+    # --- Re-enable GNOME Software search provider (livesys sets DefaultDisabled=true) ---
+    search_ini = os.path.join(target_root, "usr/share/gnome-shell/search-providers/org.gnome.Software-search-provider.ini")
+    if os.path.exists(search_ini):
+        try:
+            with open(search_ini, "r") as f:
+                content = f.read()
+            content = content.replace("DefaultDisabled=true", "DefaultDisabled=false")
+            if "DefaultDisabled=" not in content:
+                content = content.rstrip() + "\nDefaultDisabled=false\n"
+            with open(search_ini, "w") as f:
+                f.write(content)
+            print("Re-enabled GNOME Software search provider")
+        except Exception as e:
+            print(f"Warning: Could not fix search provider ini: {e}")
 
     # --- Ensure essential directories exist ---
     essential_dirs = [

@@ -5,10 +5,27 @@ Centrio Installer - Main entry point
 
 import sys
 import os
+import subprocess
 import logging
 import gettext
 import locale
 from pathlib import Path
+
+# --- Privileged helper mode (for live session: oreon-installer-priv runs us as root) ---
+if "--backend=priv" in sys.argv:
+    idx = sys.argv.index("--backend=priv")
+    cmd_argv = sys.argv[idx + 1:]
+    if not cmd_argv:
+        sys.exit(1)
+    try:
+        result = subprocess.run(cmd_argv, stdin=sys.stdin, timeout=None)
+        sys.exit(result.returncode)
+    except FileNotFoundError:
+        print(f"Command not found: {cmd_argv[0]}", file=sys.stderr)
+        sys.exit(127)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
 # Set up logging
 logging.basicConfig(
@@ -25,8 +42,11 @@ INSTALLER_LANG_FILE = os.environ.get(
 
 def setup_i18n():
     """Set up internationalization from installer language file or system locale."""
-    project_root = Path(__file__).resolve().parent.parent
-    locale_dir = str(project_root / 'locale')
+    # When installed: /usr/share/centrio/main.py -> parent = /usr/share/centrio
+    # When development: src/main.py -> parent = src, parent.parent = repo root
+    _dir = Path(__file__).resolve().parent
+    project_root = _dir.parent if (_dir / "locale").exists() else _dir
+    locale_dir = str(project_root / "locale")
 
     current_locale = None
     if os.path.isfile(INSTALLER_LANG_FILE):
@@ -63,6 +83,10 @@ def setup_i18n():
 def main():
     """Main entry point for the Centrio installer."""
     setup_i18n()
+
+    # Optional: --frontend=gis (run in GNOME Initial Setup / live kiosk; no extra handling needed)
+    if "--frontend=gis" in sys.argv:
+        pass  # Run GUI as usual; GIS/kiosk is environment
 
     import gi
     gi.require_version('Gtk', '4.0')
