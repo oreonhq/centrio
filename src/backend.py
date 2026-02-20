@@ -10,14 +10,12 @@ import time   # For delays
 import shutil # For copying bootloader files
 
 def _run_command(command_list, description, progress_callback=None, timeout=None, pipe_input=None):
-    """Runs a command, using pkexec if not already root, captures output, handles errors.
+    """Runs a command, using sudo if not already root, captures output, handles errors.
     
     Checks os.geteuid() to determine if running as root.
     """
     
     is_root = os.geteuid() == 0
-    live_priv = "/usr/libexec/oreon-installer-priv"
-    on_live = not is_root and os.path.isfile("/run/oreon-live")
     final_command_list = []
     execution_method = ""
 
@@ -25,27 +23,18 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         final_command_list = command_list
         execution_method = "directly as root"
         print(f"Executing Backend Step ({execution_method}): {description} -> {' '.join(shlex.quote(c) for c in final_command_list)}")
-    elif on_live and os.path.isfile(live_priv):
-        # Live session: use polkit-allowed helper instead of pkexec (GIS kiosk / liveuser)
-        final_command_list = [live_priv] + command_list
-        execution_method = "via oreon-installer-priv (live)"
-        cmd_str = ' '.join(shlex.quote(c) for c in final_command_list)
-        print(f"Executing Backend Step ({execution_method}): {description} -> {cmd_str}")
-        if progress_callback:
-            progress_callback(f"Requesting privileges for: {description}...")
     else:
-        # Prepend pkexec if not running as root and not on live
-        final_command_list = ["pkexec"] + command_list
-        execution_method = "via pkexec"
+        final_command_list = ["sudo"] + command_list
+        execution_method = "via sudo"
         cmd_str = ' '.join(shlex.quote(c) for c in final_command_list)
         print(f"Executing Backend Step ({execution_method}): {description} -> {cmd_str}")
         if progress_callback:
             progress_callback(f"Requesting privileges for: {description}...")
-        
+
     stderr_output = ""
     stdout_output = ""
     try:
-        # Run the command (either directly or with pkexec)
+        # Run the command (either directly or with sudo)
         process = subprocess.Popen(
             final_command_list, # Use the decided command list
             stdout=subprocess.PIPE,
@@ -58,9 +47,9 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         
         print(f"  Command {description} stdout:\n{stdout_output.strip()}")
         if stderr_output:
-             # Filter pkexec messages only if running via pkexec
+             # Filter sudo noise when running via sudo
              filtered_stderr = stderr_output
-             if execution_method == "via pkexec":
+             if execution_method == "via sudo":
                   filtered_stderr = "\n".join(line for line in stderr_output.splitlines() if "using backend" not in line)
              
              if filtered_stderr.strip():
@@ -68,14 +57,13 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
 
         if process.returncode != 0:
             error_detail = stderr_output.strip() or f"Exited with code {process.returncode}"
-            # Check for pkexec/PolicyKit errors only if running via pkexec
+            # Check for sudo/auth errors only if running via sudo
             error_msg = f"{description} failed ({execution_method}): {error_detail}"
-            if execution_method == "via pkexec":
-                if "Authentication failed" in error_detail or process.returncode == 127:
-                     error_msg = f"Authorization failed for {description}. Check PolicyKit rules or password."
-                elif "Cannot run program" in error_detail or process.returncode == 126:
-                     error_msg = f"Command not found or not permitted by PolicyKit for {description}: {command_list[0]}"
-                # else: use the generic error_msg already set
+            if execution_method == "via sudo":
+                if "password" in error_detail.lower() or process.returncode == 1:
+                     error_msg = f"Authorization failed for {description}. Check sudo or password."
+                elif process.returncode == 127:
+                     error_msg = f"Command not found for {description}: {command_list[0]}"
             
             print(f"ERROR: {error_msg}")
             
@@ -107,11 +95,10 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         return True, "", stdout_output.strip()
 
     except FileNotFoundError:
-        # Handle command-not-found specifically
         cmd_not_found = final_command_list[0]
         err = f"Command not found: {cmd_not_found}. Ensure it's installed and in the PATH."
-        if execution_method == "via pkexec" and cmd_not_found == "pkexec":
-            err = "Command not found: pkexec. Cannot run privileged commands."
+        if execution_method == "via sudo" and cmd_not_found == "sudo":
+            err = "Command not found: sudo. Cannot run privileged commands."
         print(f"ERROR: {err}")
         return False, err, None 
     except subprocess.TimeoutExpired:

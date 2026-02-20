@@ -7,4 +7,4 @@ if ! grep -qE 'rd\.live\.image|boot=live|liveimg' /proc/cmdline 2>/dev/null; the
   exit 1
 fi
 
-exec /usr/bin/python3 /usr/share/centrio/main.py --frontend=gis
+/usr/bin/python3 /usr/share/centrio/main.py --frontend=gis
