@@ -1,0 +1,13 @@
+[Unit]
+Description=Create /run/oreon-live marker when booted from live media
+DefaultDependencies=no
+After=local-fs.target
+Before=polkit.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'grep -qE "rd\\.live\\.image|boot=live|liveimg" /proc/cmdline 2>/dev/null && touch /run/oreon-live || true'
+
+[Install]
+WantedBy=sysinit.target

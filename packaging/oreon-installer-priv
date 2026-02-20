@@ -1,0 +1,10 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+# Live-media hard gate
+if ! grep -qE 'rd\.live\.image|boot=live|liveimg' /proc/cmdline 2>/dev/null; then
+  echo "Refusing: not live media" >&2
+  exit 1
+fi
+
+exec /usr/bin/python3 /usr/share/centrio/main.py --backend=priv "$@"

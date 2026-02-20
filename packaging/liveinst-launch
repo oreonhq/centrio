@@ -1,0 +1,10 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+# Live-media only
+if ! grep -qE 'rd\.live\.image|boot=live|liveimg' /proc/cmdline 2>/dev/null; then
+  /usr/bin/zenity --error --text="Installer is only available in the live session."
+  exit 1
+fi
+
+exec /usr/bin/python3 /usr/share/centrio/main.py --frontend=gis
