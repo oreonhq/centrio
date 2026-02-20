@@ -301,11 +301,12 @@ def _install_bios_bootloader(target_root, primary_disk, progress_callback=None):
 
 
 def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None):
-    """Generate /boot/grub2/grub.cfg for target (must run inside chroot to see target's /boot). Returns (success, error_msg)."""
+    """Generate /boot/grub2/grub.cfg for target (must run inside chroot to see target's /boot). Returns (success, error_msg).
+    GRUB_DISABLE_OS_PROBER=true avoids os-prober scanning block devices in chroot, which can hang indefinitely."""
     grub_cfg_chroot = "/boot/grub2/grub.cfg"
     ok, err, _ = _run_in_chroot(
         target_root,
-        ["grub2-mkconfig", "-o", grub_cfg_chroot],
+        ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", grub_cfg_chroot],
         "grub2-mkconfig",
         progress_callback
     )
