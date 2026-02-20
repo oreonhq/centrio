@@ -354,7 +354,7 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
             kernels = sorted([f for f in os.listdir(vmlinuz_dir) if f.startswith("vmlinuz-") and "rescue" not in f])
             for k in reversed(kernels):
                 kver = k.replace("vmlinuz-", "")
-                _run_in_chroot(target_root, ["dracut", "--force", "--kver", kver], f"dracut {kver}", progress_callback)
+                _run_in_chroot(target_root, ["dracut", "--force", "--add", "plymouth", "--kver", kver], f"dracut {kver}", progress_callback)
         # After dracut, re-apply Plymouth so the final initramfs includes the splash (dracut overwrote earlier plymouth initramfs).
         try:
             _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R"], "Plymouth initramfs", progress_callback)

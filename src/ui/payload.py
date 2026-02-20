@@ -1,6 +1,7 @@
 # centrio_installer/ui/payload.py
 
 import os
+import subprocess
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
@@ -9,6 +10,20 @@ from gi.repository import Gtk, Adw, GLib
 from .base import BaseConfigurationPage
 
 _ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'icons')
+
+
+def _detect_nvidia_gpu():
+    """Return True if an NVIDIA GPU is detected via lspci (no drivers required)."""
+    try:
+        r = subprocess.run(
+            ["lspci", "-n"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return r.returncode == 0 and "10de:" in r.stdout  # NVIDIA PCI vendor ID
+    except Exception:
+        return False
 
 # Default package groups and packages
 DEFAULT_PACKAGE_GROUPS = {
@@ -89,6 +104,8 @@ class PayloadPage(BaseConfigurationPage):
         self.package_group_rows = {}
         self.custom_repositories = COMMON_REPOSITORIES.copy()
         self.flatpak_enabled = True
+        self.nvidia_drivers = _detect_nvidia_gpu()
+        self.server_install = False  # False=Desktop, True=Server
         self.custom_packages = []
         self.oem_packages = []
         self.oem_repo_url = ""
@@ -132,6 +149,28 @@ class PayloadPage(BaseConfigurationPage):
         self.network_warning_group.add(self.network_warning_row)
         self.network_warning_group.set_visible(False)
         self.add(self.network_warning_group)
+
+        # Installation Type: Desktop vs Server
+        self.install_type_section = Adw.PreferencesGroup(
+            title="Installation Type",
+            description="Choose desktop or server installation"
+        )
+        self.add(self.install_type_section)
+        self.desktop_server_radios = {}
+        first_radio = None
+        for opt_id, label in [("desktop", "Desktop Installation"), ("server", "Server Installation")]:
+            row = Adw.ActionRow(title=label)
+            radio = Gtk.CheckButton()
+            if first_radio is None:
+                first_radio = radio
+                radio.set_active(True)
+            else:
+                radio.set_group(first_radio)
+            radio.connect("toggled", self._on_install_type_toggled, opt_id)
+            row.add_suffix(radio)
+            row.set_activatable_widget(radio)
+            self.install_type_section.add(row)
+            self.desktop_server_radios[opt_id] = (row, radio)
 
         # Installation Method Section
         self.method_section = Adw.PreferencesGroup(
@@ -250,6 +289,15 @@ class PayloadPage(BaseConfigurationPage):
         )
         self.add(self.advanced_section)
         
+        # NVIDIA Drivers (Oreon ships NVIDIA repo)
+        self.nvidia_row = Adw.SwitchRow(
+            title="NVIDIA Drivers",
+            subtitle="Install dkms-nvidia, nvidia-driver, nvidia-driver-cuda"
+        )
+        self.nvidia_row.set_active(self.nvidia_drivers)
+        self.nvidia_row.connect("notify::active", self._on_nvidia_toggled)
+        self.advanced_section.add(self.nvidia_row)
+
         # Package cache option
         self.cache_row = Adw.SwitchRow(
             title="Keep Package Cache",
@@ -275,18 +323,21 @@ class PayloadPage(BaseConfigurationPage):
         self.button_section.add(confirm_row)
 
         self._refresh_flatpak_dependent()
+        self._refresh_server_dependent()
         
     def _populate_package_groups(self):
         """Populate the package groups section."""
         for group_id, group_info in self.package_groups.items():
+            subtitle = group_info["description"]
+            if group_info["required"] and "(required)" not in subtitle:
+                subtitle = subtitle + " (required)"
             row = Adw.SwitchRow(
                 title=group_info["name"],
-                subtitle=group_info["description"]
+                subtitle=subtitle
             )
             self.package_group_rows[group_id] = row
             if group_info["required"]:
                 row.set_sensitive(False)
-                row.set_subtitle(group_info["description"] + " (required)")
             row.set_active(group_info["selected"])
             row.connect("notify::active", self.on_group_toggled, group_id)
             self.additional_section.add(row)
@@ -304,10 +355,13 @@ class PayloadPage(BaseConfigurationPage):
             
     def on_group_toggled(self, switch_row, pspec, group_id):
         """Handle package group toggle."""
+        if group_id not in self.package_groups:
+            return
         is_active = switch_row.get_active()
-        if group_id in self.package_groups:
-            self.package_groups[group_id]["selected"] = is_active
-            print(f"Package group '{group_id}' {'enabled' if is_active else 'disabled'}")
+        if self.package_groups[group_id]["selected"] == is_active:
+            return  # No change, avoid fighting with programmatic set_active
+        self.package_groups[group_id]["selected"] = is_active
+        print(f"Package group '{group_id}' {'enabled' if is_active else 'disabled'}")
             
     def on_repo_toggled(self, switch_row, pspec, repo_id):
         """Handle repository toggle."""
@@ -321,16 +375,51 @@ class PayloadPage(BaseConfigurationPage):
             self.selected_browser = bid
             print(f"Browser selected: {bid}")
 
+    def _on_install_type_toggled(self, radio, opt_id):
+        if radio.get_active():
+            self.server_install = opt_id == "server"
+            self._refresh_server_dependent()
+            print(f"Installation type: {'Server' if self.server_install else 'Desktop'}")
+
+    def _on_nvidia_toggled(self, switch_row, pspec):
+        self.nvidia_drivers = switch_row.get_active()
+        print(f"NVIDIA drivers: {'enabled' if self.nvidia_drivers else 'disabled'}")
+
+    def _refresh_server_dependent(self):
+        """Gray out bundle and browser options when Server installation is selected."""
+        desktop = not self.server_install
+        self.additional_section.set_sensitive(desktop)
+        if self.server_install:
+            for gid, row in self.package_group_rows.items():
+                if not self.package_groups[gid].get("required"):
+                    self.package_groups[gid]["selected"] = False
+                    row.set_active(False)
+            self.selected_browser = "none"
+            for bid, radio in self.browser_radios.items():
+                radio.set_active(bid == "none")
+            self.flatpak_enabled = False
+            self.flatpak_row.set_active(False)
+            self.browser_section.set_sensitive(False)
+            self.flatpak_section.set_sensitive(False)
+        else:
+            # Desktop: restore Flatpak and sensitivities
+            self.flatpak_enabled = True
+            self.flatpak_row.set_active(True)
+            self.flatpak_section.set_sensitive(True)
+            self.browser_section.set_sensitive(True)
+            self._refresh_flatpak_dependent()
+
     def _refresh_flatpak_dependent(self):
         """Gray out Flatpak-dependent options when Flatpak is disabled."""
-        enabled = self.flatpak_enabled
+        enabled = self.flatpak_enabled and not self.server_install
         self.browser_section.set_sensitive(enabled)
         for gid, ginfo in self.package_groups.items():
             if ginfo.get("flatpak_packages") and gid in self.package_group_rows:
-                self.package_group_rows[gid].set_sensitive(enabled)
+                row = self.package_group_rows[gid]
+                row.set_sensitive(enabled)
                 if not enabled:
                     self.package_groups[gid]["selected"] = False
-                    self.package_group_rows[gid].set_active(False)
+                    row.set_active(False)
 
     def on_flatpak_toggled(self, switch_row, pspec):
         """Handle Flatpak toggle."""
@@ -375,16 +464,18 @@ class PayloadPage(BaseConfigurationPage):
         dnf_packages = []
         flatpak_packages = []
         
-        # Add packages from selected groups
+        # Add packages from selected groups (skip bundles when server install)
         for group_id, group_info in self.package_groups.items():
+            if self.server_install and not group_info.get("required"):
+                continue
             if group_info["selected"] or group_info["required"]:
                 dnf_packages.extend(group_info.get("packages", []))
-                # Add flatpak packages only when Flatpak is enabled
-                if self.flatpak_enabled and "flatpak_packages" in group_info:
+                # Add flatpak packages only when Flatpak enabled and desktop
+                if not self.server_install and self.flatpak_enabled and "flatpak_packages" in group_info:
                     flatpak_packages.extend(group_info["flatpak_packages"])
         
-        # Add selected browser (Flatpak only) when Flatpak enabled
-        if self.flatpak_enabled and self.selected_browser != "none":
+        # Add selected browser (Flatpak only) when Flatpak enabled and desktop
+        if not self.server_install and self.flatpak_enabled and self.selected_browser != "none":
             fp = self.browser_options.get(self.selected_browser, {}).get("flatpak")
             if fp:
                 flatpak_packages.append(fp)
@@ -452,6 +543,10 @@ class PayloadPage(BaseConfigurationPage):
         print(f"  Enabled repositories: {[r['id'] for r in enabled_repos]}")
         print(f"  Flatpak enabled: {self.flatpak_enabled}")
         
+        # Add NVIDIA driver packages if enabled
+        if self.nvidia_drivers:
+            selected_packages = list(selected_packages) + ["dkms-nvidia", "nvidia-driver", "nvidia-driver-cuda"]
+
         # Build configuration data
         config_values = {
             "package_groups": {gid: ginfo["selected"] for gid, ginfo in self.package_groups.items()},
@@ -459,6 +554,8 @@ class PayloadPage(BaseConfigurationPage):
             "flatpak_packages": flatpak_packages,
             "repositories": enabled_repos,
             "flatpak_enabled": flatpak_enabled_effective,
+            "nvidia_drivers": self.nvidia_drivers,
+            "server_install": self.server_install,
             "custom_packages": self.custom_packages,
             "oem_repo_url": self.oem_repo_url,
             "keep_cache": self.cache_row.get_active(),

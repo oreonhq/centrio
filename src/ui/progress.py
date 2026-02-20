@@ -697,9 +697,11 @@ class ProgressPage(Gtk.Box):
         # Step 2: Setup the copied environment (0.60 -> 0.68)
         self._update_progress_text("Setting up copied environment...", 0.62)
         setup_cb = self._scaled_progress_callback(0.60, 0.68)
+        server_install = payload_config.get("server_install", False)
         success, err = backend.setup_live_environment_post_copy(
             self.target_root,
-            progress_callback=setup_cb
+            progress_callback=setup_cb,
+            server_install=server_install
         )
         
         if not success:
@@ -734,7 +736,7 @@ class ProgressPage(Gtk.Box):
         _CORE_PACKAGES = frozenset([
             "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common",
             "grub2-tools", "shim-x64", "shim", "efibootmgr", "NetworkManager", "systemd-resolved",
-            "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"
+            "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "centrio-installer"
         ])
         extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
         has_extra_work = bool(extra_packages or repositories or flatpak_enabled or flatpak_packages)
@@ -764,6 +766,8 @@ class ProgressPage(Gtk.Box):
                 "repositories": repositories,
                 "flatpak_enabled": flatpak_enabled,
                 "flatpak_packages": flatpak_packages,
+                "nvidia_drivers": payload_config.get("nvidia_drivers", False),
+                "server_install": payload_config.get("server_install", False),
                 "minimal_install": False,
                 "keep_cache": True
             }
@@ -1021,6 +1025,8 @@ class ProgressPage(Gtk.Box):
             if final_success and not self.stop_requested:
                 final_message = "Installation finished successfully!"
                 self._update_progress_text(final_message, 1.0)
+                # Remove installer from live system in background (best effort)
+                threading.Thread(target=backend.remove_centrio_installer, daemon=True).start()
                 GLib.timeout_add(1500, self.main_window.navigate_to_page, "finished")
             elif self.stop_requested:
                  self._update_progress_text("Installation stopped.", self.progress_bar.get_fraction())

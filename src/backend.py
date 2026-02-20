@@ -444,10 +444,16 @@ def create_user_in_container(target_root, user_config, progress_callback=None):
     success, err, _ = _run_in_chroot(target_root, useradd_cmd, f"Create User {username}", progress_callback, timeout=30)
     if not success: return False, err, None
     
-    # Set password using chpasswd - only if password was provided
-    if password is not None: # Check if password exists (even if empty string, let chpasswd decide)
-        chpasswd_input = f"{username}:{password}"
-        success, err, _ = _run_in_chroot(target_root, ["chpasswd"], f"Set Password for {username}", progress_callback, timeout=15, pipe_input=chpasswd_input)
+    # Set password using chpasswd -R (runs on host, updates target's passwd; avoids chroot PAM/NSS hang)
+    if password is not None:
+        chpasswd_input = f"{username}:{password}\n"
+        success, err, _ = _run_command(
+            ["chpasswd", "-R", target_root],
+            f"Set Password for {username}",
+            progress_callback,
+            timeout=15,
+            pipe_input=chpasswd_input
+        )
         if not success: 
             print(f"Warning: Failed to set password for {username} after user creation: {err}")
             # Decide if this should be a fatal error for the whole installation
@@ -708,6 +714,9 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         if pkg.startswith("almalinux-"):
             print(f"Filtering out conflicting package: {pkg}")
             continue
+        if pkg == "centrio-installer":
+            print("Filtering out centrio-installer (installer must not be installed on target)")
+            continue
         filtered_packages.append(pkg)
     
     packages = filtered_packages
@@ -739,6 +748,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         "--exclude=wine",
         "--exclude=libreoffice*",
         "--exclude=oreon-*",
+        "--exclude=centrio-installer",
         "--setopt=tsflags=noscripts",  # Skip problematic scriptlets
         "--setopt=installonly_limit=0",  # Don't limit kernel installations
         "--setopt=keepcache=1" if keep_cache else "--setopt=keepcache=0"
@@ -1107,6 +1117,23 @@ def _stop_service(service_name):
 def _start_service(service_name):
     print(f"Attempting to start service: {service_name}...")
     return _manage_service("start", service_name)
+
+
+def remove_centrio_installer():
+    """Remove the centrio-installer package from the live system after successful install (best effort)."""
+    try:
+        success, err, _ = _run_command(
+            ["dnf", "remove", "-y", "centrio-installer"],
+            "Remove centrio-installer from live system",
+            timeout=60
+        )
+        if success:
+            print("Centrio-installer removed from live system.")
+        else:
+            print(f"Could not remove centrio-installer (non-fatal): {err}")
+    except Exception as e:
+        print(f"Could not remove centrio-installer (non-fatal): {e}")
+
 
 # --- LVM Deactivation Helper --- 
 def _deactivate_lvm_on_disk(disk_device, progress_callback=None):
@@ -1574,7 +1601,7 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None):
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -1582,6 +1609,7 @@ def setup_live_environment_post_copy(target_root, progress_callback=None):
     - Setting up bootloader
     - Configuring network
     - Setting up users
+    - When server_install: remove GNOME/desktop packages
     """
     
     print("Setting up live environment for target disk...")
@@ -1793,6 +1821,9 @@ WantedBy=multi-user.target
             match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
                 quote_char, args = match.group(1), match.group(2)
+                # Remove nomodeset (disables KMS, Plymouth needs KMS for graphical splash)
+                args_list = [p for p in args.split() if p and p != "nomodeset"]
+                args = " ".join(args_list)
                 for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
                     if param not in args.split():
                         args = (args + " " + param).strip()
@@ -1803,6 +1834,15 @@ WantedBy=multi-user.target
                 print("Ensured rhgb quiet splash rd.plymouth=1 in /etc/default/grub for Plymouth splash")
         except Exception as e:
             print(f"Warning: Could not patch /etc/default/grub: {e}")
+
+    # --- Server install: remove GNOME/desktop packages ---
+    if server_install:
+        try:
+            gnome_pkgs = ["gdm", "gnome-shell", "gnome-session", "gnome-initial-setup", "gnome-software", "@gnome-desktop"]
+            _run_in_chroot(target_root, ["dnf", "remove", "-y"] + gnome_pkgs, "Remove GNOME (server install)", progress_callback, timeout=300)
+            print("Removed GNOME packages for server installation")
+        except Exception as e:
+            print(f"Warning: Could not remove GNOME packages: {e}")
 
     # --- Remove live-specific GNOME/Software config overrides ---
     live_dconf_dirs = [

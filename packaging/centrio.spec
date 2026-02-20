@@ -7,10 +7,6 @@ URL:            https://github.com/centrio/centrio
 BuildArch:      noarch
 Source0:        centrio-%{version}.tar.gz
 Source1:        liveinst.desktop
-Source2:        liveinst-launch
-Source3:        oreon-installer-priv
-Source4:        49-oreon-liveinst.rules
-Source5:        oreon-live-marker.service
 Requires:       python3-gobject gtk4 libadwaita
 Requires:       polkit
 Requires:       zenity
@@ -31,9 +27,6 @@ Centrio is the Oreon installer. It runs in the live session and in the GIS kiosk
 %{__mkdir_p} %{buildroot}%{_datadir}/centrio/icons
 %{__mkdir_p} %{buildroot}%{_datadir}/centrio/locale
 %{__mkdir_p} %{buildroot}%{_datadir}/applications
-%{__mkdir_p} %{buildroot}%{_libexecdir}
-%{__mkdir_p} %{buildroot}%{_sysconfdir}/polkit-1/rules.d
-%{__mkdir_p} %{buildroot}%{_unitdir}
 
 # Application and UI (from tarball)
 install -p -m 0644 %{_builddir}/centrio-%{version}/src/*.py %{buildroot}%{_datadir}/centrio/
@@ -43,18 +36,10 @@ cp -a %{_builddir}/centrio-%{version}/locale/* %{buildroot}%{_datadir}/centrio/l
 
 # Live env (from SOURCES)
 install -p -m 0644 %{_sourcedir}/liveinst.desktop %{buildroot}%{_datadir}/applications/
-install -p -m 0755 %{_sourcedir}/liveinst-launch %{buildroot}%{_libexecdir}/
-install -p -m 0755 %{_sourcedir}/oreon-installer-priv %{buildroot}%{_libexecdir}/
-install -p -m 0644 %{_sourcedir}/49-oreon-liveinst.rules %{buildroot}%{_sysconfdir}/polkit-1/rules.d/
-install -p -m 0644 %{_sourcedir}/oreon-live-marker.service %{buildroot}%{_unitdir}/
 
 %files
 %{_datadir}/centrio/
 %{_datadir}/applications/liveinst.desktop
-%{_libexecdir}/liveinst-launch
-%{_libexecdir}/oreon-installer-priv
-%config(noreplace) %{_sysconfdir}/polkit-1/rules.d/49-oreon-liveinst.rules
-%{_unitdir}/oreon-live-marker.service
 
 %post
 %systemd_post oreon-live-marker.service
