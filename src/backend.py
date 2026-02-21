@@ -1790,15 +1790,16 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"Warning: Could not remove livesys-scripts: {e}")
 
-    # --- Remove centrio-installer desktop shortcut and app (copy brings these from live; installer must not remain on target) ---
-    liveinst_desktop = os.path.join(target_root, "usr/share/applications/liveinst.desktop")
+    # --- Remove installer desktop shortcuts and app (copy brings these from live; liveinst can be renamed to anaconda.desktop by GNOME) ---
     centrio_app = os.path.join(target_root, "usr/share/centrio")
-    try:
-        if os.path.lexists(liveinst_desktop):
-            os.remove(liveinst_desktop)
-            print("Removed liveinst.desktop from target")
-    except Exception as e:
-        print(f"Warning: Could not remove liveinst.desktop: {e}")
+    for name in ["liveinst.desktop", "anaconda.desktop"]:
+        path = os.path.join(target_root, "usr/share/applications", name)
+        try:
+            if os.path.lexists(path):
+                os.remove(path)
+                print(f"Removed {name} from target")
+        except Exception as e:
+            print(f"Warning: Could not remove {name}: {e}")
     try:
         if os.path.exists(centrio_app) and os.path.isdir(centrio_app):
             shutil.rmtree(centrio_app)
@@ -1806,26 +1807,42 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"Warning: Could not remove centrio app directory: {e}")
 
-    # --- Plymouth: preserve live environment's setup (do not overwrite dracut/plymouth/grub) ---
-    # Only remove nomodeset from kernel params if present; it disables KMS and breaks Plymouth.
+    # --- Plymouth/GRUB: ensure /etc/default/grub has kernel params for splash ---
+    # grub2-mkconfig needs GRUB_CMDLINE_LINUX; if file is empty or missing the line, write minimal config.
     grub_default = os.path.join(target_root, "etc/default/grub")
-    if os.path.exists(grub_default):
-        try:
+    grub_dir = os.path.dirname(grub_default)
+    try:
+        os.makedirs(grub_dir, exist_ok=True)
+        content = ""
+        if os.path.exists(grub_default):
             with open(grub_default, "r") as f:
                 content = f.read()
-            match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
-            if match:
-                quote_char, args = match.group(1), match.group(2)
-                args_list = [p for p in args.split() if p and p != "nomodeset"]
-                if len(args_list) != len([p for p in args.split() if p]):
-                    args = " ".join(args_list)
-                    new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
-                    content = content[:match.start()] + new_line + content[match.end():]
-                    with open(grub_default, "w") as f:
-                        f.write(content)
-                    print("Removed nomodeset from kernel params (kept live Plymouth/grub otherwise intact)")
-        except Exception as e:
-            print(f"Warning: Could not patch /etc/default/grub: {e}")
+        match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
+        if match:
+            quote_char, args = match.group(1), match.group(2)
+            args_list = [p for p in args.split() if p and p != "nomodeset"]
+            if len(args_list) != len([p for p in args.split() if p]):
+                args = " ".join(args_list)
+                new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
+                content = content[:match.start()] + new_line + content[match.end():]
+                with open(grub_default, "w") as f:
+                    f.write(content)
+                print("Removed nomodeset from kernel params")
+        elif not content.strip() or "GRUB_CMDLINE_LINUX=" not in content:
+            # File empty or missing kernel params; ensure minimal config for Plymouth splash
+            if content.strip() and "GRUB_CMDLINE_LINUX=" not in content:
+                content = content.rstrip() + "\nGRUB_CMDLINE_LINUX=\"quiet splash\"\n"
+            else:
+                content = (
+                    "# Centrio: minimal grub for Plymouth boot splash\n"
+                    "GRUB_TIMEOUT=5\n"
+                    "GRUB_CMDLINE_LINUX=\"quiet splash\"\n"
+                )
+            with open(grub_default, "w") as f:
+                f.write(content)
+            print("Ensured minimal /etc/default/grub with quiet splash")
+    except Exception as e:
+        print(f"Warning: Could not patch /etc/default/grub: {e}")
 
     # --- Server install: remove GNOME/desktop packages ---
     if server_install:
