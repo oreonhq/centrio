@@ -840,17 +840,14 @@ class ProgressPage(Gtk.Box):
         return success
 
     def _remove_live_users_and_configure_oobe(self, config_data):
-        """Remove live users (e.g. liveuser) from target and configure OOBE for first boot."""
+        """Remove live users (e.g. liveuser) from target. OOBE handles user creation on first boot."""
         if self.stop_requested:
             return False
-        user_config = config_data.get("user") or {}
-        username = user_config.get("username") if user_config else None
-        install_user_created = bool(username)
-        self._update_progress_text("Removing live users and configuring first boot...", 0.85)
+        self._update_progress_text("Removing live users and configuring first boot...", 0.82)
         success, err = backend.remove_live_users_and_configure_oobe(
             self.target_root,
-            install_user_created=install_user_created,
-            install_username=username,
+            install_user_created=False,
+            install_username=None,
             progress_callback=self._update_progress_text,
         )
         if not success:
@@ -955,11 +952,10 @@ class ProgressPage(Gtk.Box):
              (self._execute_storage_setup,      config_data.get('disk', {}), 0.00,  0.30),  # 30% disk
              (self._copy_live_environment,      config_data,             0.30,  0.75),  # 45% payload
              (self._generate_fstab,             config_data,             0.75,  0.76),  # fstab
-             (self._configure_system,           config_data,             0.76,  0.80),  # 4% config
-             (self._create_user,                config_data,             0.80,  0.85),  # 5% user
-             (self._remove_live_users_and_configure_oobe, config_data,   0.85,  0.86),  # live user removal + OOBE
-             (self._enable_network_manager_step, config_data,            0.86,  0.87),  # 2% network
-             (self._install_bootloader,         config_data,             0.87,  0.97),  # 10% bootloader
+             (self._configure_system,           config_data,             0.76,  0.82),  # config
+             (self._remove_live_users_and_configure_oobe, config_data,   0.82,  0.83),  # live user removal; OOBE creates users
+             (self._enable_network_manager_step, config_data,            0.83,  0.84),  # network
+             (self._install_bootloader,         config_data,             0.84,  0.97),  # bootloader
         ]
         
         final_success = True

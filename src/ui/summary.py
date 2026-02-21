@@ -63,14 +63,6 @@ class SummaryPage(Adw.PreferencesPage):
         self.add(software_group)
         self._add_config_row(software_group, "payload", "Software Packages", "Package selection and repositories", True)
 
-        # --- User Settings Group ---
-        user_group = Adw.PreferencesGroup(
-            title="User Accounts",
-            description="User account creation and authentication"
-        )
-        self.add(user_group)
-        self._add_config_row(user_group, "user", "User Creation", "Create administrator and user accounts", False)
-
         # --- Installation Ready Status ---
         self.status_group = Adw.PreferencesGroup(
             title="Installation Status"

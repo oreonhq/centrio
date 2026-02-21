@@ -1790,48 +1790,40 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"Warning: Could not remove livesys-scripts: {e}")
 
-    # --- Plymouth: ensure dracut includes plymouth so initramfs shows splash ---
-    dracut_d = os.path.join(target_root, "etc/dracut.conf.d")
+    # --- Remove centrio-installer desktop shortcut and app (copy brings these from live; installer must not remain on target) ---
+    liveinst_desktop = os.path.join(target_root, "usr/share/applications/liveinst.desktop")
+    centrio_app = os.path.join(target_root, "usr/share/centrio")
     try:
-        os.makedirs(dracut_d, exist_ok=True)
-        plymouth_conf = os.path.join(dracut_d, "01-plymouth.conf")
-        with open(plymouth_conf, "w") as f:
-            f.write('# Force Plymouth into initramfs (Centrio installer)\nadd_dracutmodules+=" plymouth "\n')
-        print("Added dracut drop-in for Plymouth module")
+        if os.path.lexists(liveinst_desktop):
+            os.remove(liveinst_desktop)
+            print("Removed liveinst.desktop from target")
     except Exception as e:
-        print(f"Warning: Could not write dracut Plymouth config: {e}")
+        print(f"Warning: Could not remove liveinst.desktop: {e}")
+    try:
+        if os.path.exists(centrio_app) and os.path.isdir(centrio_app):
+            shutil.rmtree(centrio_app)
+            print("Removed centrio app directory from target")
+    except Exception as e:
+        print(f"Warning: Could not remove centrio app directory: {e}")
 
-    # --- Plymouth: set default theme and rebuild initramfs for installed system ---
-    for theme in ["spinner", "bgrt", "spin-gdm", "details"]:
-        try:
-            ok, _, _ = _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R", theme], "Set Plymouth theme", progress_callback, timeout=120)
-            if ok:
-                print(f"Set Plymouth theme to {theme}")
-                break
-        except Exception as e:
-            print(f"Warning: Plymouth theme {theme}: {e}")
-
-    # --- Ensure kernel cmdline has rhgb quiet splash (and rd.plymouth=1) so Plymouth splash shows ---
+    # --- Plymouth: preserve live environment's setup (do not overwrite dracut/plymouth/grub) ---
+    # Only remove nomodeset from kernel params if present; it disables KMS and breaks Plymouth.
     grub_default = os.path.join(target_root, "etc/default/grub")
     if os.path.exists(grub_default):
         try:
             with open(grub_default, "r") as f:
                 content = f.read()
-            # Match GRUB_CMDLINE_LINUX="..." or GRUB_CMDLINE_LINUX='...'
             match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
                 quote_char, args = match.group(1), match.group(2)
-                # Remove nomodeset (disables KMS, Plymouth needs KMS for graphical splash)
                 args_list = [p for p in args.split() if p and p != "nomodeset"]
-                args = " ".join(args_list)
-                for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
-                    if param not in args.split():
-                        args = (args + " " + param).strip()
-                new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
-                content = content[:match.start()] + new_line + content[match.end():]
-                with open(grub_default, "w") as f:
-                    f.write(content)
-                print("Ensured rhgb quiet splash rd.plymouth=1 in /etc/default/grub for Plymouth splash")
+                if len(args_list) != len([p for p in args.split() if p]):
+                    args = " ".join(args_list)
+                    new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
+                    content = content[:match.start()] + new_line + content[match.end():]
+                    with open(grub_default, "w") as f:
+                        f.write(content)
+                    print("Removed nomodeset from kernel params (kept live Plymouth/grub otherwise intact)")
         except Exception as e:
             print(f"Warning: Could not patch /etc/default/grub: {e}")
 

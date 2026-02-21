@@ -20,7 +20,6 @@ from ui.language import LanguagePage
 from ui.timedate import TimeDatePage
 from ui.disk import DiskPage
 from ui.network import NetworkConnectivityPage
-from ui.user import UserPage
 from ui.payload import PayloadPage
 from ui.bootloader import BootloaderPage
 
@@ -33,7 +32,7 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         self.required_configs = set() # Set of keys for required configurations
         self.main_page_order = ["welcome", "summary", "progress", "finished"]
         # All known configuration page keys
-        self.config_page_keys = ["keyboard", "language", "timedate", "disk", "network", "user", "payload", "bootloader"]
+        self.config_page_keys = ["keyboard", "language", "timedate", "disk", "network", "payload", "bootloader"]
         self.final_config = {} # Stores final selected values passed back from ui
 
         self.set_title("Centrio Installer")
@@ -82,9 +81,6 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         
         self.network_page = NetworkConnectivityPage(main_window=self, overlay_widget=self.toast_overlay)
         self.view_stack.add_titled(self.network_page, "network", "Network Settings")
-        
-        self.user_page = UserPage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.user_page, "user", "User Settings")
         
         self.payload_page = PayloadPage(main_window=self, overlay_widget=self.toast_overlay)
         self.view_stack.add_titled(self.payload_page, "payload", "Payload Settings")
