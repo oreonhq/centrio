@@ -401,21 +401,19 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
         print("Skipping keymap configuration (not provided).")
         
     # --- Hostname --- 
-    hostname = config_data.get('network', {}).get('hostname')
-    if hostname:
-        print(f"Configuring Hostname to {hostname}...")
-        hostname_path = os.path.join(target_root, "etc/hostname")
-        try:
-            print(f"  Writing hostname to {hostname_path}...")
-            with open(hostname_path, 'w') as f:
-                f.write(f"{hostname}\n")
-        except Exception as e:
-            err_msg = f"Failed to configure hostname {hostname}: {e}"
-            print(f"  ERROR: {err_msg}")
-            errors.append(err_msg)
-            all_success = False
-    else:
-        print("Skipping hostname configuration (not provided).")
+    # Use "oreon" as default so installed system does not inherit live env hostname
+    hostname = config_data.get('network', {}).get('hostname') or "oreon"
+    print(f"Configuring Hostname to {hostname}...")
+    hostname_path = os.path.join(target_root, "etc/hostname")
+    try:
+        print(f"  Writing hostname to {hostname_path}...")
+        with open(hostname_path, 'w') as f:
+            f.write(f"{hostname}\n")
+    except Exception as e:
+        err_msg = f"Failed to configure hostname {hostname}: {e}"
+        print(f"  ERROR: {err_msg}")
+        errors.append(err_msg)
+        all_success = False
 
     final_error_str = "\n".join(errors)
     return all_success, final_error_str
@@ -1790,22 +1788,16 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"Warning: Could not remove livesys-scripts: {e}")
 
-    # --- Remove installer desktop shortcuts (liveinst can be renamed to anaconda.desktop by GNOME) ---
-    for name in ["liveinst.desktop", "anaconda.desktop"]:
-        path = os.path.join(target_root, "usr/share/applications", name)
-        try:
-            if os.path.lexists(path):
-                os.remove(path)
-                print(f"Removed {name} from target")
-        except Exception as e:
-            print(f"Warning: Could not remove {name}: {e}")
-    try:
-        centrio_app = os.path.join(target_root, "usr/share/centrio")
-        if os.path.exists(centrio_app) and os.path.isdir(centrio_app):
-            shutil.rmtree(centrio_app)
-            print("Removed centrio app directory from target")
-    except Exception as e:
-        print(f"Warning: Could not remove centrio app directory: {e}")
+    # --- Remove installer desktop files (anaconda.desktop, liveinst.desktop) ---
+    for desktop_name in ["anaconda.desktop", "liveinst.desktop"]:
+        for subdir in ["usr/share/applications", "etc/xdg/autostart"]:
+            desktop_path = os.path.join(target_root, subdir, desktop_name)
+            try:
+                if os.path.exists(desktop_path) and os.path.isfile(desktop_path):
+                    os.remove(desktop_path)
+                    print(f"Removed {desktop_name} from /{subdir}")
+            except Exception as e:
+                print(f"Warning: Could not remove {desktop_path}: {e}")
 
     # --- Plymouth: ensure dracut includes plymouth so initramfs shows splash ---
     dracut_d = os.path.join(target_root, "etc/dracut.conf.d")
@@ -1828,35 +1820,107 @@ WantedBy=multi-user.target
         except Exception as e:
             print(f"Warning: Plymouth theme {theme}: {e}")
 
-    # --- Ensure kernel cmdline has rhgb quiet splash (and rd.plymouth=1) so Plymouth splash shows ---
+    # --- Ensure /etc/default/grub exists with full content for Plymouth boot splash ---
     grub_default = os.path.join(target_root, "etc/default/grub")
-    grub_dir = os.path.dirname(grub_default)
+    grub_default_dir = os.path.dirname(grub_default)
     try:
-        os.makedirs(grub_dir, exist_ok=True)
         content = ""
         if os.path.exists(grub_default):
             with open(grub_default, "r") as f:
                 content = f.read()
-        match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
-        if match:
-            quote_char, args = match.group(1), match.group(2)
-            args_list = [p for p in args.split() if p and p != "nomodeset"]
-            args = " ".join(args_list)
-            for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
-                if param not in args.split():
-                    args = (args + " " + param).strip()
-            new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, args, quote_char)
-            content = content[:match.start()] + new_line + content[match.end():]
+        # If file is missing or empty/minimal, write full template (live env may have empty grub)
+        if not content.strip() or len(content) < 80:
+            os.makedirs(grub_default_dir, exist_ok=True)
+            grub_template = '''GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
+GRUB_DEFAULT=saved
+GRUB_DISABLE_SUBMENU=true
+GRUB_TERMINAL_OUTPUT="console"
+GRUB_CMDLINE_LINUX="crashkernel=auto rhgb quiet splash rd.plymouth=1"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_DISABLE_RECOVERY="true"
+GRUB_ENABLE_BLSCFG=true
+'''
             with open(grub_default, "w") as f:
-                f.write(content)
-            print("Ensured rhgb quiet splash rd.plymouth=1 in /etc/default/grub for Plymouth splash")
-        elif not content.strip() or "GRUB_CMDLINE_LINUX=" not in content:
-            minimal = "# Centrio: minimal grub for Plymouth boot splash\nGRUB_TIMEOUT=5\nGRUB_CMDLINE_LINUX=\"quiet splash\"\n"
-            with open(grub_default, "w") as f:
-                f.write(minimal)
-            print("Wrote minimal /etc/default/grub with quiet splash (file was empty or missing)")
+                f.write(grub_template)
+            print("Created /etc/default/grub with full template (was empty or missing)")
+        else:
+            # Patch existing content to ensure quiet splash
+            modified = False
+            match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
+            if match:
+                quote_char, args = match.group(1), match.group(2)
+                args_list = [p for p in args.split() if p and p != "nomodeset"]
+                for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
+                    if param not in args_list:
+                        args_list.append(param)
+                new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, " ".join(args_list), quote_char)
+                content = content[:match.start()] + new_line + content[match.end():]
+                modified = True
+            match_default = re.search(r'^GRUB_CMDLINE_LINUX_DEFAULT=(["\'])([^\'"]*)\1', content, re.MULTILINE)
+            if match_default:
+                quote_char, args = match_default.group(1), match_default.group(2)
+                args_list = [p for p in args.split() if p and p != "nomodeset"]
+                for param in ["quiet", "splash"]:
+                    if param not in args_list:
+                        args_list.append(param)
+                new_line = "GRUB_CMDLINE_LINUX_DEFAULT=%s%s%s\n" % (quote_char, " ".join(args_list), quote_char)
+                content = content[:match_default.start()] + new_line + content[match_default.end():]
+                modified = True
+            elif "GRUB_CMDLINE_LINUX_DEFAULT=" not in content:
+                content = content.rstrip() + '\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash"\n'
+                modified = True
+            if modified:
+                with open(grub_default, "w") as f:
+                    f.write(content)
+                print("Ensured quiet splash in /etc/default/grub")
     except Exception as e:
-        print(f"Warning: Could not patch /etc/default/grub: {e}")
+        print(f"Warning: Could not write /etc/default/grub: {e}")
+
+    # --- Fix BLS boot entries: live env uses LVM (rd.lvm.lv=oreon/root); centrio uses plain partitions ---
+    # Replace root= and remove rd.lvm.lv params so the installed system boots from its actual root (UUID)
+    bls_dir = os.path.join(target_root, "boot", "loader", "entries")
+    if os.path.isdir(bls_dir):
+        try:
+            r = subprocess.run(
+                ["findmnt", "-n", "-o", "UUID", "--target", target_root],
+                capture_output=True, text=True, check=False, timeout=10
+            )
+            target_root_uuid = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+            if target_root_uuid:
+                rd_lvm_re = re.compile(r'\brd\.lvm\.lv=[^\s]+\s*')
+                root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
+                resume_re = re.compile(r'\bresume=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
+                for name in os.listdir(bls_dir):
+                    if not name.endswith(".conf"):
+                        continue
+                    path = os.path.join(bls_dir, name)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        with open(path, "r") as f:
+                            content = f.read()
+                        new_lines = []
+                        for line in content.splitlines():
+                            if line.startswith("options "):
+                                opts = line[8:]  # strip "options "
+                                opts = rd_lvm_re.sub("", opts)  # remove rd.lvm.lv=oreon/root etc
+                                opts = root_uuid_re.sub("", opts)  # remove old root=
+                                opts = resume_re.sub("", opts)  # remove resume= (live's swap UUID; installed system differs)
+                                opts = opts.strip()
+                                add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
+                                for p in add:
+                                    if p not in opts.split():
+                                        opts = (opts + " " + p).strip()
+                                line = "options " + opts
+                            new_lines.append(line)
+                        with open(path, "w") as f:
+                            f.write("\n".join(new_lines) + "\n")
+                        print(f"Fixed BLS entry {name} (root=UUID=..., removed rd.lvm.lv)")
+                    except Exception as e:
+                        print(f"Warning: Could not patch BLS entry {path}: {e}")
+        except Exception as e:
+            print(f"Warning: Could not fix BLS boot entries: {e}")
 
     # --- Server install: remove GNOME/desktop packages ---
     if server_install:

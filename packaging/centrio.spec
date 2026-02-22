@@ -5,7 +5,7 @@ Summary:        Oreon live installer
 License:        GPL-2.0-or-later
 URL:            https://github.com/centrio/centrio
 BuildArch:      noarch
-Source0:        centrio-%{version}.tar.gz
+Source0:        centrio-%{version}.tar.xz
 Source1:        liveinst.desktop
 Requires:       python3-gobject gtk4 libadwaita
 Requires:       polkit

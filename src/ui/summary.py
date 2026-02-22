@@ -56,6 +56,7 @@ class SummaryPage(Adw.PreferencesPage):
         self._add_config_row(storage_group, "bootloader", "Bootloader Configuration", "Boot manager installation settings", True)
 
         # --- Software Group ---
+        # user creation is handled by gnome-initial-setup on first boot
         software_group = Adw.PreferencesGroup(
             title="Software Selection",
             description="Package groups and application configuration"

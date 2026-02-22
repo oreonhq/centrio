@@ -300,10 +300,70 @@ def _install_bios_bootloader(target_root, primary_disk, progress_callback=None):
     return True, ""
 
 
+def _get_live_root_uuid():
+    """Return UUID of the live system's root filesystem (/)."""
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "UUID", "--target", "/"],
+            capture_output=True, text=True, check=False, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progress_callback=None):
+    """Copy /boot/grub2/grub.cfg from live env to target and replace live root UUID with target's."""
+    live_grub_cfg = "/boot/grub2/grub.cfg"
+    cfg_path = os.path.join(target_root, "boot", "grub2", "grub.cfg")
+    if not os.path.exists(live_grub_cfg) or os.path.getsize(live_grub_cfg) < 50:
+        return False, "Live system has no usable /boot/grub2/grub.cfg to copy."
+    live_uuid = _get_live_root_uuid()
+    if not live_uuid:
+        return False, "Could not determine live root UUID for grub.cfg patch."
+    try:
+        with open(live_grub_cfg, "r") as f:
+            content = f.read()
+        # Replace live root UUID with target root UUID (handles search.fs_uuid, root=UUID=..., etc.)
+        content = content.replace(live_uuid, target_root_uuid)
+        # Ensure quiet splash in kernel cmdline so Plymouth boot screen shows (not verbose log)
+        lines_out = []
+        for line in content.splitlines():
+            stripped = line.rstrip()
+            if stripped.startswith("linux ") or stripped.startswith("linuxefi "):
+                parts = stripped.split(None, 2)  # cmd, path, rest
+                if len(parts) >= 3:
+                    args = [a for a in parts[2].split()
+                            if not a.startswith("resume=") and not a.startswith("rd.lvm.lv=")]
+                    for param in ["quiet", "splash", "rhgb", "rd.plymouth=1"]:
+                        if param not in args:
+                            args.append(param)
+                    lines_out.append(parts[0] + " " + parts[1] + " " + " ".join(args))
+                else:
+                    lines_out.append(stripped)
+            else:
+                lines_out.append(stripped)
+        content = "\n".join(lines_out) + "\n"
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        with open(cfg_path, "w") as f:
+            f.write(content)
+        if progress_callback:
+            progress_callback("Transferred grub.cfg from live env and patched root UUID", None)
+        print("Transferred grub.cfg from live env and patched root UUID.")
+        return True, ""
+    except Exception as e:
+        return False, "Failed to copy/patch grub.cfg from live: %s" % e
+
+
 def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None):
     """Generate /boot/grub2/grub.cfg for target (must run inside chroot to see target's /boot). Returns (success, error_msg).
-    GRUB_DISABLE_OS_PROBER=true avoids os-prober scanning block devices in chroot, which can hang indefinitely."""
+    GRUB_DISABLE_OS_PROBER=true avoids os-prober scanning block devices in chroot, which can hang indefinitely.
+    If grub2-mkconfig produces empty/small output, falls back to copying grub.cfg from the live env and patching root UUID."""
     grub_cfg_chroot = "/boot/grub2/grub.cfg"
+    cfg_path = os.path.join(target_root, "boot", "grub2", "grub.cfg")
+
     ok, err, _ = _run_in_chroot(
         target_root,
         ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", grub_cfg_chroot],
@@ -311,12 +371,25 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
         progress_callback
     )
     if not ok:
+        # Fall back to copying from live env
+        target_root_uuid = _get_root_uuid(target_root)
+        if target_root_uuid:
+            ok2, err2 = _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progress_callback)
+            if ok2:
+                return True, ""
         return False, err or "grub2-mkconfig failed."
 
-    cfg_path = os.path.join(target_root, "boot", "grub2", "grub.cfg")
-    if not os.path.exists(cfg_path) or os.path.getsize(cfg_path) < 100:
-        return False, "GRUB config missing or too small."
-    return True, ""
+    if os.path.exists(cfg_path) and os.path.getsize(cfg_path) >= 100:
+        return True, ""
+
+    # grub2-mkconfig produced empty or too-small output; fall back to live env
+    target_root_uuid = _get_root_uuid(target_root)
+    if not target_root_uuid:
+        return False, "GRUB config missing or too small and could not get target root UUID."
+    ok2, err2 = _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progress_callback)
+    if ok2:
+        return True, ""
+    return False, "GRUB config missing or too small after grub2-mkconfig; fallback failed: %s" % err2
 
 
 def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
