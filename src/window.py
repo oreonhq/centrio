@@ -21,8 +21,6 @@ from ui.timedate import TimeDatePage
 from ui.disk import DiskPage
 from ui.network import NetworkConnectivityPage
 from ui.payload import PayloadPage
-from ui.bootloader import BootloaderPage
-
 class CentrioInstallerWindow(Adw.ApplicationWindow):
     def __init__(self, installer_script=None, **kwargs):
         super().__init__(**kwargs)
@@ -32,7 +30,7 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         self.required_configs = set() # Set of keys for required configurations
         self.main_page_order = ["welcome", "summary", "progress", "finished"]
         # All known configuration page keys
-        self.config_page_keys = ["keyboard", "language", "timedate", "disk", "network", "payload", "bootloader"]
+        self.config_page_keys = ["keyboard", "language", "timedate", "disk", "network", "payload"]
         self.final_config = {} # Stores final selected values passed back from ui
 
         self.set_title("Centrio Installer")
@@ -84,9 +82,6 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         
         self.payload_page = PayloadPage(main_window=self, overlay_widget=self.toast_overlay)
         self.view_stack.add_titled(self.payload_page, "payload", "Payload Settings")
-        
-        self.bootloader_page = BootloaderPage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.bootloader_page, "bootloader", "Bootloader Settings")
         
         # Ensure required_configs is populated based on SummaryPage rows
         # (Should be done within SummaryPage._add_config_row now)

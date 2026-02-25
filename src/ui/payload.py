@@ -30,7 +30,7 @@ DEFAULT_PACKAGE_GROUPS = {
     "core": {
         "name": "Core System",
         "description": "Essential system packages (required)",
-        "packages": ["@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common", "grub2-tools", "shim-x64", "shim", "efibootmgr", "NetworkManager", "systemd-resolved", "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"],
+        "packages": ["@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common", "grub2-tools", "shim-x64", "shim", "efibootmgr", "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"],
         "required": True,
         "selected": True
     },
@@ -231,6 +231,7 @@ class PayloadPage(BaseConfigurationPage):
         self.browser_rows = {}
         self.browser_radios = {}
         first_radio = None
+        first_bid = None
         for bid, binfo in self.browser_options.items():
             row = Adw.ActionRow(title=binfo["name"], subtitle="You can always install one later" if bid == "none" else "")
             if binfo["icon_file"]:
@@ -242,6 +243,7 @@ class PayloadPage(BaseConfigurationPage):
             radio = Gtk.CheckButton()
             if first_radio is None:
                 first_radio = radio
+                first_bid = bid
                 radio.set_active(True)
             else:
                 radio.set_group(first_radio)
@@ -251,6 +253,8 @@ class PayloadPage(BaseConfigurationPage):
             self.browser_section.add(row)
             self.browser_rows[bid] = row
             self.browser_radios[bid] = radio
+        if first_bid:
+            self.selected_browser = first_bid  # Sync state with default selected radio
 
         # Custom Repositories Section
         self.repos_section = Adw.PreferencesGroup(
@@ -528,6 +532,11 @@ class PayloadPage(BaseConfigurationPage):
     def apply_settings_and_return(self, button):
         """Apply the software configuration and return to summary."""
         print(f"--- Apply Software Settings START ---")
+        # Sync selected browser from active radio (handles default Firefox when user never toggled)
+        for bid, radio in self.browser_radios.items():
+            if radio.get_active():
+                self.selected_browser = bid
+                break
         net = self.main_window.final_config.get("network", {}) if self.main_window else {}
         has_network = net.get("network_status") == "connected" and not net.get("skip_network", True)
         selected_packages, flatpak_packages = self._get_selected_packages()

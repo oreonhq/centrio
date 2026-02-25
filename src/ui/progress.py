@@ -6,7 +6,6 @@ import os         # For creating directories
 import shlex      # For logging commands safely
 import threading  # For running install in background
 import time       # For small delays maybe
-import shutil     # For copying resolv.conf
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
@@ -701,7 +700,7 @@ class ProgressPage(Gtk.Box):
         # Live copy already has base; exclude core-group packages so we only run DNF when user selected extra
         _CORE_PACKAGES = frozenset([
             "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common",
-            "grub2-tools", "shim-x64", "shim", "efibootmgr", "NetworkManager", "systemd-resolved",
+            "grub2-tools", "shim-x64", "shim", "efibootmgr",
             "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "centrio-installer"
         ])
         extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
@@ -720,6 +719,9 @@ class ProgressPage(Gtk.Box):
             return True
         
         if has_extra_work:
+            # Restart NetworkManager to refresh networking/DNS for DNF and Flatpak
+            self._update_progress_text("Refreshing network...", 0.68)
+            backend.restart_network_manager()
             # Runtime check: do not run DNF/Flatpak when there is no internet at all
             if not backend.check_network_connectivity():
                 self._update_progress_text("No internet - only base system installed.", 0.70)
@@ -824,21 +826,6 @@ class ProgressPage(Gtk.Box):
             return False
         return True
 
-    def _enable_network_manager_step(self, config_data):
-        """Step wrapper for enabling NetworkManager."""
-        if self.stop_requested: return False, "Stop requested"
-        # No initial message needed, backend function sends one
-        success, warning = backend.enable_network_manager(
-             self.target_root, 
-             progress_callback=self._update_progress_text
-        )
-        # Success is always True unless a fatal error occurred in _run_command
-        # A warning is not considered a failure for this step
-        if not success: # Should only happen if _run_command fails badly
-             self.installation_error = warning
-             return False 
-        return True 
-
     def _generate_fstab(self, config_data):
         """Generate /etc/fstab in the target root after copying the system."""
         if self.stop_requested: return False, "Stop requested"
@@ -858,8 +845,10 @@ class ProgressPage(Gtk.Box):
         if self.stop_requested: return False, "Stop requested"
         bootloader_config = config_data.get('bootloader', {})
         disk_config = config_data.get('disk', {})
+        # Bootloader always installed (page removed); respect config if present
+        install_bootloader = bootloader_config.get('install_bootloader', True)
         
-        if not bootloader_config.get('install_bootloader', False):
+        if not install_bootloader:
             print("Skipping bootloader installation.")
             self._update_progress_text("Bootloader installation skipped.", 0.97)
             return True
@@ -923,8 +912,7 @@ class ProgressPage(Gtk.Box):
              (self._generate_fstab,             config_data,             0.75,  0.76),  # fstab
              (self._configure_system,           config_data,             0.76,  0.82),  # 6% config
              (self._remove_live_users_and_configure_oobe, config_data,   0.82,  0.83),  # live user removal + OOBE
-             (self._enable_network_manager_step, config_data,            0.83,  0.84),  # network
-             (self._install_bootloader,         config_data,             0.84,  0.97),  # bootloader
+             (self._install_bootloader,         config_data,             0.83,  0.97),  # bootloader
         ]
         
         final_success = True
@@ -941,9 +929,7 @@ class ProgressPage(Gtk.Box):
                 # --- Add explicit /etc check+create after package install ---
                 if func == self._copy_live_environment and step_success:
                     etc_path = os.path.join(self.target_root, "etc")
-                    resolv_conf_target = os.path.join(etc_path, "resolv.conf")
-                    host_resolv_conf = "/etc/resolv.conf"
-                    
+
                     # Ensure /etc exists
                     if not os.path.exists(etc_path):
                         print(f"Warning: {etc_path} not found after package install. Creating it...")
@@ -953,21 +939,8 @@ class ProgressPage(Gtk.Box):
                         except OSError as e:
                             print(f"ERROR: Failed to create {etc_path}: {e}")
                             self.installation_error = f"Failed to create essential directory {etc_path}: {e}"
-                            step_success = False # Mark step as failed
-                    
-                    # Copy host resolv.conf if /etc creation succeeded
-                    if step_success and os.path.exists(host_resolv_conf):
-                        print(f"Copying {host_resolv_conf} to {resolv_conf_target}...")
-                        try:
-                            shutil.copy2(host_resolv_conf, resolv_conf_target)
-                            print(f"Successfully copied resolv.conf.")
-                        except Exception as copy_e:
-                            # Log warning but don't necessarily fail the whole install?
-                            # Chroot might still work for some things without network.
-                            print(f"Warning: Failed to copy {host_resolv_conf} to {resolv_conf_target}: {copy_e}")
-                    elif step_success and not os.path.exists(host_resolv_conf):
-                         print(f"Warning: Host {host_resolv_conf} not found. Cannot copy to target.")
-                         
+                            step_success = False  # Mark step as failed
+
                 # ---------------------------------------------------------
                 
                 if not step_success:

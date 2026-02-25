@@ -53,7 +53,6 @@ class SummaryPage(Adw.PreferencesPage):
         )
         self.add(storage_group)
         self._add_config_row(storage_group, "disk", "Installation Destination", "Disk selection and partitioning method", True)
-        self._add_config_row(storage_group, "bootloader", "Bootloader Configuration", "Boot manager installation settings", True)
 
         # --- Software Group ---
         # user creation is handled by gnome-initial-setup on first boot

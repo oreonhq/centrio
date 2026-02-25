@@ -11,61 +11,51 @@ from .base import BaseConfigurationPage
 
 
 def _detect_connection_type():
-    """Returns ('wired'|'wifi'|'none', connected: bool)."""
+    """Returns ('wired'|'wifi'|'none', connected: bool). Uses nmcli networking connectivity
+    for reliable connectivity; dev status alone can report 'connected' incorrectly."""
     try:
-        r = subprocess.run(
-            ["nmcli", "-t", "-f", "TYPE,STATE,DEVICE", "dev", "status"],
+        r_conn = subprocess.run(
+            ["nmcli", "networking", "connectivity", "check"],
             capture_output=True, text=True, timeout=5
         )
-        if r.returncode != 0:
-            return "none", False
-        wired_conn = False
-        wifi_conn = False
-        for line in r.stdout.strip().split("\n"):
-            parts = line.split(":")
-            if len(parts) >= 2:
-                t, state = parts[0], (parts[1] if len(parts) > 1 else "").lower()
-                connected = "connected" in state or "activated" in state
-                if t == "ethernet" and connected:
-                    wired_conn = True
-                elif t == "wifi" and connected:
-                    wifi_conn = True
-        if wired_conn:
-            return "wired", True
-        if wifi_conn:
-            return "wifi", True
-        return "wifi" if subprocess.run(["nmcli", "-t", "-f", "NAME", "dev", "wifi"], capture_output=True, text=True, timeout=3).returncode == 0 else "none", False
+        actually_connected = False
+        if r_conn.returncode == 0 and r_conn.stdout:
+            out = r_conn.stdout.strip().lower()
+            actually_connected = out in ("full", "limited")
+
+        conn_type = "none"
+        r_active = subprocess.run(
+            ["nmcli", "-t", "-f", "TYPE,DEVICE", "connection", "show", "--active"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r_active.returncode == 0 and r_active.stdout.strip():
+            for line in r_active.stdout.strip().split("\n"):
+                parts = line.split(":", 1)
+                t = (parts[0] or "").lower()
+                if t == "loopback":
+                    continue
+                if t in ("802-3-ethernet", "ethernet"):
+                    conn_type = "wired"
+                    break
+                if t in ("wifi", "802-11-wireless", "wireless"):
+                    conn_type = "wifi"
+                    break
+
+        if conn_type == "none":
+            r_wifi = subprocess.run(
+                ["nmcli", "-t", "-f", "TYPE", "dev", "status"],
+                capture_output=True, text=True, timeout=3
+            )
+            if r_wifi.returncode == 0 and "wifi" in (r_wifi.stdout or "").lower():
+                conn_type = "wifi"
+
+        return conn_type, actually_connected
     except Exception:
         return "none", False
 
 
-def _get_wifi_networks():
-    """Returns list of {"ssid": str, "signal": str, "security": str}."""
-    out = []
-    try:
-        r = subprocess.run(
-            ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
-            capture_output=True, text=True, timeout=10
-        )
-        if r.returncode != 0:
-            return []
-        seen = set()
-        for line in r.stdout.strip().split("\n"):
-            parts = line.split(":", 2)
-            ssid = (parts[0] if len(parts) > 0 else "").strip() or "(hidden)"
-            if ssid in seen:
-                continue
-            seen.add(ssid)
-            signal = parts[1] if len(parts) > 1 else ""
-            security = parts[2] if len(parts) > 2 else ""
-            out.append({"ssid": ssid, "signal": signal, "security": security})
-        return out[:20]
-    except Exception:
-        return []
-
-
 class NetworkConnectivityPage(BaseConfigurationPage):
-    """Page for network connectivity. Wired status, WiFi selection, or continue without network."""
+    """Page for network connectivity. Status and instructions to use control center for Wi‑Fi."""
 
     def __init__(self, main_window, overlay_widget, **kwargs):
         super().__init__(
@@ -79,7 +69,6 @@ class NetworkConnectivityPage(BaseConfigurationPage):
         self.skip_network = False
         self.network_status = "unknown"
         self.connection_type = "none"
-        self.wifi_networks = []
         self._build_ui()
         self._check_network_status()
 
@@ -91,20 +80,11 @@ class NetworkConnectivityPage(BaseConfigurationPage):
         self.status_row.add_prefix(self.status_icon)
         self.status_section.add(self.status_row)
 
-        self.wifi_section = Adw.PreferencesGroup(title="Wi‑Fi Networks", description="Select a network to connect")
-        self.wifi_section.set_visible(False)
-        self.add(self.wifi_section)
-
-        self.wifi_list_box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.wifi_list_box.add_css_class("boxed-list")
-        self.wifi_section.add(self.wifi_list_box)
-
-        self.rescan_row = Adw.ActionRow(title="Rescan", subtitle="Refresh the list of networks")
-        self.rescan_btn = Gtk.Button(label="Rescan")
-        self.rescan_btn.add_css_class("compact")
-        self.rescan_btn.connect("clicked", self._rescan_wifi)
-        self.rescan_row.add_suffix(self.rescan_btn)
-        self.wifi_section.add(self.rescan_row)
+        self.help_section = Adw.PreferencesGroup(
+            title="Connecting to Wi‑Fi",
+            description="To connect to Wi‑Fi, use the control center in the bottom panel below this installer."
+        )
+        self.add(self.help_section)
 
         self.buttons_section = Adw.PreferencesGroup(title="Continue", description="")
         self.buttons_section.set_margin_top(6)
@@ -136,7 +116,6 @@ class NetworkConnectivityPage(BaseConfigurationPage):
             self.connection_type = conn_type
             self.network_status = "connected" if connected else "disconnected"
             self.network_enabled = connected
-            self.wifi_networks = _get_wifi_networks() if conn_type == "wifi" else []
             GLib.idle_add(self._update_ui)
 
         threading.Thread(target=check, daemon=True).start()
@@ -144,7 +123,7 @@ class NetworkConnectivityPage(BaseConfigurationPage):
     def _update_ui(self):
         if self.network_status == "connected":
             if self.connection_type == "wired":
-                self.status_row.set_subtitle("Already connected via wired network")
+                self.status_row.set_subtitle("Connected via wired network")
                 self.status_icon.set_from_icon_name("network-wired-symbolic")
             else:
                 self.status_row.set_subtitle("Connected via Wi‑Fi")
@@ -156,55 +135,7 @@ class NetworkConnectivityPage(BaseConfigurationPage):
             self.status_icon.set_from_icon_name("network-offline-symbolic")
             self.status_icon.add_css_class("error")
             self.apply_btn.set_sensitive(False)
-        self._populate_wifi()
         self.skip_btn.set_sensitive(True)
-
-    def _populate_wifi(self):
-        while True:
-            child = self.wifi_list_box.get_row_at_index(0)
-            if child is None:
-                break
-            self.wifi_list_box.remove(child)
-        self.wifi_section.set_visible(self.connection_type == "wifi" and not self.network_enabled)
-        if not self.wifi_section.get_visible():
-            return
-        for net in self.wifi_networks:
-            row = Adw.ActionRow(
-                title=net["ssid"],
-                subtitle=f"Signal: {net['signal']}%  {net['security']}"
-            )
-            conn_btn = Gtk.Button(label="Connect")
-            conn_btn.add_css_class("compact")
-            conn_btn.connect("clicked", self._on_wifi_connect, net["ssid"])
-            row.add_suffix(conn_btn)
-            self.wifi_list_box.append(row)
-
-    def _rescan_wifi(self, btn):
-        btn.set_sensitive(False)
-        def scan():
-            self.wifi_networks = _get_wifi_networks()
-            GLib.idle_add(lambda: (btn.set_sensitive(True), self._populate_wifi()))
-        threading.Thread(target=scan, daemon=True).start()
-
-    def _on_wifi_connect(self, btn, ssid):
-        btn.set_sensitive(False)
-        def connect():
-            r = subprocess.run(
-                ["nmcli", "dev", "wifi", "connect", ssid],
-                capture_output=True, text=True, timeout=30
-            )
-            ok = r.returncode == 0
-            GLib.idle_add(lambda: self._after_wifi_connect(btn, ok))
-
-        threading.Thread(target=connect, daemon=True).start()
-
-    def _after_wifi_connect(self, btn, ok):
-        btn.set_sensitive(True)
-        if ok:
-            self.show_toast("Connected")
-            self._check_network_status()
-        else:
-            self.show_toast("Connection failed. Check password and try again.")
 
     def _on_apply(self, btn):
         self.skip_network = False

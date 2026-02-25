@@ -61,9 +61,12 @@ def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="btrfs", dual_b
         commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
     else:
         if dual_boot and preserve_efi:
-            # Don't create new GPT table or EFI partition if preserving existing
-            root_start = efi_end  # Still calculate from expected EFI end
-            root_end = "100%"
+            # Create partition in actual free space (user must have unallocated space)
+            region = get_free_space_region(disk_path)
+            if not region:
+                print("ERROR: Dual boot requires free space but none found on disk.")
+                return []
+            root_start, root_end = region
             commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
         else:
             # Normal UEFI installation - create full layout
@@ -77,15 +80,15 @@ def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="btrfs", dual_b
     
     return commands
 
-def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False):
+def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False, root_part_override=None):
     """Generates mkfs commands for partitions.
     - include_efi=True: partition 1 is EFI (vfat), partition 2 is root
-    - include_efi=False: partition 1 is root
+    - dual_boot+preserve_efi: use root_part_override for the new partition (part N+1)
     """
     commands = []
-    # Determine partition device names consistently
-    if bios_mode:
-        # BIOS layout: p1 is bios_grub (no fs), p2 is root
+    if root_part_override:
+        root_part = root_part_override
+    elif bios_mode:
         root_part = f"{disk_path}{partition_prefix}2"
     elif include_efi:
         efi_part = f"{disk_path}{partition_prefix}1"
@@ -93,7 +96,6 @@ def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", d
         if not (dual_boot and preserve_efi):
             commands.append(["mkfs.vfat", "-F32", efi_part])
     else:
-        # Non-UEFI layout without bios_grub (unlikely here)
         root_part = f"{disk_path}{partition_prefix}1"
 
     # Format root partition with selected filesystem
@@ -150,18 +152,74 @@ def get_host_lvm_pvs():
 
 def disk_has_unallocated_space(disk_path):
     """Check if a disk has unallocated (free) space for dual boot. Returns True if yes."""
+    return get_free_space_region(disk_path) is not None
+
+
+def get_free_space_region(disk_path):
+    """Get the (start, end) of the largest free space region on disk for dual boot.
+    Returns (start_str, end_str) e.g. ('256GiB', '500GiB') or None if no free space."""
     if not disk_path or not os.path.exists(disk_path):
-        return False
+        return None
     try:
         r = subprocess.run(
-            ["parted", "-s", disk_path, "unit", "s", "print", "free"],
+            ["parted", "-s", disk_path, "unit", "MiB", "print", "free"],
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
-            return False
-        return "Free Space" in r.stdout or "free" in r.stdout.lower()
+            return None
+        # Parse lines like "       262144MiB  512000MiB  249856MiB   Free Space"
+        lines = r.stdout.strip().split("\n")
+        best_start, best_end, best_size_mb = None, None, 0
+        for line in lines:
+            if "Free Space" not in line and "free" not in line.lower():
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                start_s, end_s, size_s = parts[0], parts[1], parts[2]
+                try:
+                    s = size_s.upper().replace("GIB", "").replace("MIB", "").replace("KB", "").replace("B", "").strip()
+                    num = float(s) if s else 0
+                    if "GIB" in size_s.upper() or "GB" in size_s.upper():
+                        num *= 1024  # to MiB
+                    if num > best_size_mb and num > 100:  # at least 100 MiB
+                        best_start, best_end, best_size_mb = start_s, end_s, num
+                except (ValueError, IndexError):
+                    pass
+        if best_start and best_end:
+            return (best_start, best_end)
+        return None
     except Exception:
-        return False
+        return None
+
+
+def get_next_partition_device(disk_path, partition_prefix=""):
+    """Return the device path for the next partition to be created (e.g. /dev/sda3).
+    Used for dual boot where we add one partition to existing layout."""
+    if not disk_path:
+        return None
+    try:
+        r = subprocess.run(
+            ["lsblk", "-n", "-o", "NAME", "-l", disk_path],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            return None
+        max_num = 0
+        base = disk_path.split("/")[-1]  # e.g. sda or nvme0n1
+        for line in r.stdout.strip().split("\n"):
+            name = line.strip()
+            if not name or name == base:
+                continue
+            # sda1, sda2 or nvme0n1p1, nvme0n1p2
+            suffix = name[len(base):].lstrip("p")
+            if suffix.isdigit():
+                max_num = max(max_num, int(suffix))
+        next_num = max_num + 1
+        if "nvme" in disk_path or "mmcblk" in disk_path:
+            return f"{disk_path}p{next_num}"
+        return f"{disk_path}{next_num}"
+    except Exception:
+        return None
 
 
 def get_parent_disk(partition_path):
@@ -176,43 +234,48 @@ def get_parent_disk(partition_path):
 
 def detect_existing_efi_partitions():
     """Detect existing EFI system partitions that could be reused for dual boot."""
+    efi_guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
     efi_partitions = []
+    seen_paths = set()
     try:
+        # Fallback: if /boot/efi is mounted, use that partition
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "/boot/efi"],
+            capture_output=True, text=True, check=False, timeout=5
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            src = r.stdout.strip()
+            if src and src not in seen_paths:
+                seen_paths.add(src)
+                efi_partitions.append({"path": src, "size": None, "fstype": "vfat"})
+
         cmd = ["lsblk", "-J", "-o", "PATH,FSTYPE,PARTTYPE,SIZE"]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
         lsblk_data = json.loads(result.stdout)
-        
+
         def scan_device(device):
             path = device.get("path")
             fstype = device.get("fstype")
-            parttype = device.get("parttype")
+            parttype = (device.get("parttype") or "").lower()
             size = device.get("size")
-            
-            # Check if this is an EFI System Partition
+            if not path or path in seen_paths:
+                return
+            # EFI GUID (case-insensitive); also accept vfat first partition on GPT
             is_efi = (
-                fstype == "vfat" and 
-                parttype == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"  # EFI System Partition GUID
+                fstype == "vfat" and parttype == efi_guid
             ) or (
-                fstype == "vfat" and path and "efi" in path.lower()
+                fstype == "vfat" and "efi" in (path or "").lower()
             )
-            
-            if is_efi and path:
-                efi_partitions.append({
-                    "path": path,
-                    "size": size,
-                    "fstype": fstype
-                })
-            
-            # Recursively check children
+            if is_efi:
+                seen_paths.add(path)
+                efi_partitions.append({"path": path, "size": size, "fstype": fstype or "vfat"})
             for child in device.get("children", []):
                 scan_device(child)
-        
+
         for device in lsblk_data.get("blockdevices", []):
             scan_device(device)
-            
     except Exception as e:
         print(f"Warning: Failed to detect EFI partitions: {e}")
-    
     return efi_partitions
 
 class DiskPage(BaseConfigurationPage):
@@ -230,7 +293,9 @@ class DiskPage(BaseConfigurationPage):
         self.selected_efi_partition = None
         self.custom_format_enabled = False
         self.disk_widgets = {}
+        self.disk_list_rows = []  # Track rows for proper cleanup on rescan
         self.efi_partitions = []
+        self.disks_with_free_space = set()
         
         self._build_ui()
             
@@ -288,9 +353,11 @@ class DiskPage(BaseConfigurationPage):
         self.dual_boot_row.set_activatable_widget(self.dual_boot_radio)
         self.mode_group.add(self.dual_boot_row)
         
-        # EFI partition selection (for dual boot)
-        self.efi_group = Adw.PreferencesGroup(title="EFI System Partition")
-        self.efi_group.set_description("Select existing EFI partition to preserve")
+        # EFI partition selection (for dual boot) - placed right after mode so it's visible when dual boot selected
+        self.efi_group = Adw.PreferencesGroup(
+            title="EFI Partition Selection",
+            description="Select an existing EFI system partition to reuse (required for dual boot)"
+        )
         self.efi_group.set_visible(False)
         self.add(self.efi_group)
         
@@ -353,25 +420,30 @@ class DiskPage(BaseConfigurationPage):
         # No _connect_dbus needed anymore
         # self._connect_dbus() 
             
+    def _get_disks_with_free_space(self):
+        """Return set of disk paths that have unallocated space (for dual boot)."""
+        result = set()
+        for disk in self.detected_disks:
+            path = disk.get("path")
+            if path and not disk.get("is_live_os_disk") and disk_has_unallocated_space(path):
+                result.add(path)
+        return result
+
     def _check_dual_boot_available(self):
         """Check if dual boot is possible: EFI partitions exist and at least one disk has unallocated space."""
         self.efi_partitions = detect_existing_efi_partitions()
+        self.disks_with_free_space = self._get_disks_with_free_space()
         if not self.efi_partitions:
             self.dual_boot_row.set_sensitive(False)
             self.dual_boot_row.set_subtitle("No existing EFI partitions found. Use clean installation.")
             return False
-        disks_checked = set()
-        for efi in self.efi_partitions:
-            disk = get_parent_disk(efi.get("path", ""))
-            if disk and disk not in disks_checked and disk_has_unallocated_space(disk):
-                disks_checked.add(disk)
-                self.dual_boot_row.set_sensitive(True)
-                self.dual_boot_row.set_subtitle("Install alongside existing OS. Select an EFI partition below.")
-                return True
-            disks_checked.add(disk) if disk else None
-        self.dual_boot_row.set_sensitive(False)
-        self.dual_boot_row.set_subtitle("No unallocated space on disks with EFI. Shrink a partition in Windows Disk Management or GParted to create free space.")
-        return False
+        if not self.disks_with_free_space:
+            self.dual_boot_row.set_sensitive(False)
+            self.dual_boot_row.set_subtitle("No disk has unallocated space. Shrink a partition in Windows Disk Management or GParted first.")
+            return False
+        self.dual_boot_row.set_sensitive(True)
+        self.dual_boot_row.set_subtitle("Select a disk with free space, then choose EFI partition below.")
+        return True
 
     def on_install_mode_changed(self, button, mode):
         """Handle installation mode selection."""
@@ -386,12 +458,21 @@ class DiskPage(BaseConfigurationPage):
             self.dual_boot_enabled = False
             self.preserve_efi = False
             self.efi_group.set_visible(False)
+            for disk_path, widget_info in self.disk_widgets.items():
+                disk = next((d for d in self.detected_disks if d["path"] == disk_path), None)
+                if disk and not disk.get("is_live_os_disk"):
+                    widget_info["row"].set_sensitive(True)
+                    widget_info["row"].set_subtitle(format_bytes(disk.get("size")))
             print("Installation mode: Normal (clean installation)")
         elif mode == "dual_boot":
             self.dual_boot_enabled = True
             if self._check_dual_boot_available():
+                self._update_disk_list_for_dual_boot()
                 self._populate_efi_partitions()
                 self.efi_group.set_visible(True)
+                if self.efi_partitions and not self.selected_efi_partition:
+                    self.selected_efi_partition = self.efi_partitions[0].get("path")
+                    self.preserve_efi = True
                 print(f"Installation mode: Dual boot (found {len(self.efi_partitions)} EFI partitions)")
             else:
                 self.normal_radio.set_active(True)
@@ -414,6 +495,29 @@ class DiskPage(BaseConfigurationPage):
         self.advanced_group.set_visible(self.custom_format_enabled)
         print(f"Custom formatting: {self.custom_format_enabled}")
     
+    def _update_disk_list_for_dual_boot(self):
+        """When dual boot is selected, only enable disks with free space; clear invalid selection."""
+        for disk_path, widget_info in self.disk_widgets.items():
+            row, radio = widget_info["row"], widget_info["radio"]
+            disk = next((d for d in self.detected_disks if d["path"] == disk_path), None)
+            size_str = format_bytes(disk["size"]) if disk else "N/A"
+            if disk_path in self.disks_with_free_space:
+                row.set_sensitive(True)
+                row.set_subtitle(f"{size_str} — has free space")
+            else:
+                row.set_sensitive(False)
+                row.set_subtitle(f"{size_str} — no free space (shrink a partition first)")
+                if radio.get_active():
+                    radio.set_active(False)
+                    self.selected_disks.discard(disk_path)
+        if not self.selected_disks and self.disks_with_free_space:
+            first_valid = next(iter(self.disks_with_free_space))
+            w = self.disk_widgets.get(first_valid)
+            if w:
+                w["radio"].set_active(True)
+                self.selected_disks.add(first_valid)
+            self.show_toast("Select a disk with free space for dual boot")
+
     def on_efi_partition_selected(self, button, partition_path):
         """Handle EFI partition selection for dual boot."""
         if button.get_active():
@@ -741,11 +845,10 @@ class DiskPage(BaseConfigurationPage):
             
     def _populate_disk_list(self):
         """Populate the disk list with detected disks."""
-        # Clear existing rows
-        # In GTK 4, we need to remove rows differently
-        for widget in list(self.disk_list_group):
-            self.disk_list_group.remove(widget)
-        
+        # Remove previously added rows (AdwPreferencesGroup iterates internal structure; we track our own)
+        for row in self.disk_list_rows:
+            row.unparent()
+        self.disk_list_rows = []
         self.disk_widgets = {}
 
         if not self.detected_disks:
@@ -755,6 +858,7 @@ class DiskPage(BaseConfigurationPage):
             )
             row.set_activatable(False)
             self.disk_list_group.add(row)
+            self.disk_list_rows.append(row)
             return
 
         disk_radio_group = None
@@ -768,17 +872,17 @@ class DiskPage(BaseConfigurationPage):
             
             row = Adw.ActionRow(title=title, subtitle=subtitle)
             
-            if disk["is_live_os_disk"]: 
+            if disk["is_live_os_disk"]:
                  print(f"!!! UI Update: Marking {disk['path']} (Live OS Disk) as insensitive.")
                  row.set_subtitle(subtitle + " (Live OS Disk - Cannot select)")
-                 row.set_sensitive(False) 
+                 row.set_sensitive(False)
                  warning_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
                  warning_icon.set_tooltip_text("This disk contains the live operating system")
                  row.add_suffix(warning_icon)
             else:
                  found_usable_disk = True
-                 radio = Gtk.CheckButton() if i == 0 else Gtk.CheckButton(group=disk_radio_group)
-                 if i == 0:
+                 radio = Gtk.CheckButton() if disk_radio_group is None else Gtk.CheckButton(group=disk_radio_group)
+                 if disk_radio_group is None:
                      disk_radio_group = radio
                      radio.set_active(True)  # Select first usable disk by default
                      self.selected_disks.add(disk_path)
@@ -790,6 +894,7 @@ class DiskPage(BaseConfigurationPage):
                  self.disk_widgets[disk_path] = {"row": row, "radio": radio}
 
             self.disk_list_group.add(row)
+            self.disk_list_rows.append(row)
             
         if not found_usable_disk:
              print("Warning: No usable disks detected (only Live OS disk found?).")
@@ -811,11 +916,16 @@ class DiskPage(BaseConfigurationPage):
         print(f"  Selected disks: {self.selected_disks}")
         print(f"  Partitioning method: {self.partitioning_method}")
         
+        selected_disk = next(iter(self.selected_disks), None) if self.selected_disks else None
+        dual_boot_ok = (
+            selected_disk in self.disks_with_free_space and
+            self.selected_efi_partition is not None
+        )
         can_proceed = (
             self.scan_completed and 
             len(self.selected_disks) > 0 and 
             self.partitioning_method is not None and
-            (not self.dual_boot_enabled or self.selected_efi_partition is not None)
+            (not self.dual_boot_enabled or dual_boot_ok)
         )
         
         print(f"  Setting Complete button sensitive: {can_proceed}")
@@ -893,6 +1003,12 @@ class DiskPage(BaseConfigurationPage):
             print(f"Parted commands: {parted_cmds}")
             
             include_efi = is_uefi and not (self.dual_boot_enabled and self.preserve_efi)
+            root_part_override = None
+            if self.dual_boot_enabled and self.preserve_efi:
+                root_part_override = get_next_partition_device(primary_disk, partition_prefix)
+                if not root_part_override:
+                    self.show_toast("Could not determine new partition device for dual boot.")
+                    return
             mkfs_cmds = generate_mkfs_commands(
                 primary_disk,
                 filesystem=self.filesystem_type,
@@ -900,7 +1016,8 @@ class DiskPage(BaseConfigurationPage):
                 dual_boot=self.dual_boot_enabled,
                 preserve_efi=self.preserve_efi if is_uefi else False,
                 include_efi=include_efi,
-                bios_mode=not is_uefi
+                bios_mode=not is_uefi,
+                root_part_override=root_part_override
             )
             config_values["commands"].extend(mkfs_cmds)
             print(f"Mkfs commands: {mkfs_cmds}")
@@ -923,6 +1040,7 @@ class DiskPage(BaseConfigurationPage):
                         "fstype": "vfat"
                     })
                     print(f"EFI partition: device={efi_device}, mountpoint=/boot/efi, fstype=vfat")
+                    root_device = f"{primary_disk}{part2_suffix}"
                 elif self.selected_efi_partition:
                     partitions.append({
                         "device": self.selected_efi_partition,
@@ -930,7 +1048,9 @@ class DiskPage(BaseConfigurationPage):
                         "fstype": "vfat"
                     })
                     print(f"Using existing EFI partition: device={self.selected_efi_partition}")
-                root_device = f"{primary_disk}{part2_suffix}"
+                    root_device = root_part_override or f"{primary_disk}{partition_prefix}2"
+                else:
+                    root_device = root_part_override or f"{primary_disk}{part2_suffix}"
             else:
                 # BIOS (GPT): partition 1 is bios_grub, partition 2 is root
                 root_device = f"{primary_disk}{part2_suffix}"

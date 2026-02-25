@@ -9,6 +9,7 @@ import errno # For checking mount errors
 import time   # For delays
 import shutil # For copying bootloader files
 
+
 def _run_command(command_list, description, progress_callback=None, timeout=None, pipe_input=None):
     """Runs a command, using sudo if not already root, captures output, handles errors.
     
@@ -183,16 +184,14 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
              except OSError as e:
                  raise RuntimeError(f"Failed to create target directory {resolv_conf_dir}: {e}") from e
                  
-        # Ensure target /etc/resolv.conf file exists for bind mount
-        # --- Block MODIFIED TO DO NOTHING --- 
-        if not os.path.exists(resolv_conf_target):
-            # Try block is now empty
+        # Ensure target /etc/resolv.conf exists for bind mount (chroot needs host DNS for DNF/Flatpak)
+        if not os.path.lexists(resolv_conf_target):
             try:
-                pass # Do nothing, file should be copied by progress.py
+                with open(resolv_conf_target, "w") as f:
+                    f.write("")
+                print(f"  Created placeholder {resolv_conf_target} for bind mount")
             except OSError as e:
-                 # This should now be unreachable
-                 raise RuntimeError(f"Failed to create target file {resolv_conf_target}: {e}") from e
-        # --- End Block MODIFIED --- 
+                raise RuntimeError(f"Failed to create target file {resolv_conf_target}: {e}") from e
                  
         if os.path.exists(host_dbus_socket):
              dbus_target_dir = os.path.dirname(mount_points["dbus"])
@@ -207,11 +206,14 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
              print(f"Warning: Host D-Bus socket {host_dbus_socket} not found. Services inside chroot might fail.")
 
         # Refactored structure: (name, source, target, fstype, options_list)
+        # resolv.conf: bind host's DNS config so chroot (Flatpak, dnf in chroot) can reach network
+        host_resolv = "/etc/resolv.conf"
         mount_commands = [
             ("proc",    "proc",                mount_points["proc"],        "proc",    ["nodev","noexec","nosuid"]), 
             ("sysfs",   "sys",                 mount_points["sys"],         "sysfs",   ["nodev","noexec","nosuid"]), 
             ("devtmpfs","udev",               mount_points["dev"],         "devtmpfs",["mode=0755","nosuid"]), 
             ("devpts",  "devpts",              mount_points["dev/pts"],     "devpts",  ["mode=0620","gid=5","nosuid","noexec"]), 
+            ("resolv",  host_resolv,           mount_points["resolv.conf"],  None,     ["--bind"]),
             ("bind",    host_dbus_socket,      mount_points["dbus"],        None,      ["--bind"]),
             # Conditionally add efivars mount
             ("efivars", "efivarfs",            mount_points.get("efivars"), "efivarfs",["nosuid","noexec","nodev"]), # Source is the fstype
@@ -220,6 +222,10 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
         ]
 
         for name, source, target, fstype, options_list in mount_commands:
+            # Skip resolv.conf if host has none
+            if name == "resolv" and not os.path.exists(host_resolv):
+                print(f"  Skipping resolv.conf bind (source {host_resolv} not found).")
+                continue
             # Skip D-Bus mount if source doesn't exist
             if name == "bind" and source == host_dbus_socket and not os.path.exists(host_dbus_socket):
                  print(f"  Skipping D-Bus socket mount (source {host_dbus_socket} not found).")
@@ -241,15 +247,16 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                  continue
                  
             try:
-                # Ensure target dir exists for non-file bind mounts
-                if name != "bind" or source == "/etc/resolv.conf": # resolv.conf needs dir
-                     os.makedirs(target, exist_ok=True)
-                # For the dbus socket bind mount
+                # Ensure target exists: dir for most, file for resolv/dbus bind mounts
+                if name == "resolv":
+                    pass  # resolv target file already ensured above
                 elif name == "bind" and source == host_dbus_socket:
                      os.makedirs(os.path.dirname(target), exist_ok=True)
                      # Create empty file as mount target if it doesn't exist? Bind mount needs a target.
                      if not os.path.exists(target):
-                         open(target, 'a').close() 
+                         open(target, 'a').close()
+                else:
+                    os.makedirs(target, exist_ok=True)
                           
                 # Construct mount command correctly
                 mount_cmd = ["mount"]
@@ -658,7 +665,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     
     if minimal_install:
         # For minimal install, use only core packages
-        packages = ["@core", "kernel", "grub2-efi-x64", "grub2-pc", "NetworkManager"]
+        packages = ["@core", "kernel", "grub2-efi-x64", "grub2-pc"]
         print("Minimal installation: using core packages only")
     elif not packages:
         # Use default package list if none specified
@@ -667,7 +674,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
             "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "efibootmgr",
             "grub2-common", "grub2-tools",
             "shim-x64", "shim",
-            "linux-firmware", "NetworkManager", "systemd-resolved",
+            "linux-firmware",
             "bash-completion", "dnf-utils"
         ]
         print("Using default package list")
@@ -1028,7 +1035,7 @@ def install_packages_dnf(target_root, progress_callback=None):
             "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "efibootmgr", 
             "grub2-common", "grub2-tools",
             "shim-x64", "shim",
-            "linux-firmware", "NetworkManager", "systemd-resolved", 
+            "linux-firmware", 
             "bash-completion", "dnf-utils"
         ],
         "repositories": [],
@@ -1038,26 +1045,6 @@ def install_packages_dnf(target_root, progress_callback=None):
     }
     
     return install_packages_enhanced(target_root, package_config, progress_callback)
-
-# --- Move NetworkManager Enable --- 
-# We need a function that uses _run_in_chroot (and thus _run_command for root check)
-def enable_network_manager(target_root, progress_callback=None):
-    """Enables NetworkManager service in the target system via chroot."""
-    if progress_callback:
-        progress_callback("Enabling NetworkManager service...", 0.96) # Example fraction
-    
-    nm_enable_cmd = ["systemctl", "enable", "NetworkManager.service"]
-    success, err, _ = _run_in_chroot(target_root, nm_enable_cmd, "Enable NetworkManager Service", progress_callback=None, timeout=30)
-    if not success: 
-        warning_msg = f"Warning: Failed to enable NetworkManager service: {err}"
-        print(warning_msg)
-        if progress_callback: progress_callback(warning_msg, 0.97) # Update UI with warning
-        # Continue installation even if service enabling fails? Let's return True but log warning.
-        return True, warning_msg # Indicate success overall, but pass warning
-    else:
-        print("Successfully enabled NetworkManager service.")
-        if progress_callback: progress_callback("NetworkManager service enabled.", 0.97)
-        return True, ""
 
 # --- Bootloader Installation ---
 # Installation logic is in install_logic.py
@@ -1421,6 +1408,69 @@ def verify_grub_packages(target_root):
 
 # --- Live Environment Copy Functions ---
 
+def _clear_target_root(target_root):
+    """Clear contents of target root before copy. Avoids merging with leftover content
+    (manual partitioning, prior failed install) and prevents .img files at root."""
+    try:
+        for name in os.listdir(target_root):
+            path = os.path.join(target_root, name)
+            if os.path.ismount(path):
+                continue
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except OSError as e:
+                print(f"Warning: Could not remove {path}: {e}")
+        print("Cleared target root before copy")
+    except OSError as e:
+        print(f"Warning: Could not list/clear target root: {e}")
+
+
+def _cleanup_installed_root_junk(target_root):
+    """Remove leftover junk from installed root: .img files, LiveOS, live user homes."""
+    junk_names = [
+        "erofs-root.img", "squashfs-root.img", "squash-root.img", "rootfs.img",
+        "LiveOS",
+    ]
+    for name in junk_names:
+        path = os.path.join(target_root, name.lstrip("/"))
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                print(f"Removed junk: {path}")
+        except OSError as e:
+            print(f"Warning: Could not remove {path}: {e}")
+    # Remove any other *.img at root
+    try:
+        for name in os.listdir(target_root):
+            if name.endswith(".img"):
+                path = os.path.join(target_root, name)
+                if not os.path.ismount(path):
+                    try:
+                        os.remove(path)
+                        print(f"Removed root junk: {path}")
+                    except OSError as e:
+                        print(f"Warning: Could not remove {path}: {e}")
+    except OSError:
+        pass
+    # Remove leftover live user home dirs (userdel -r may fail or leave dirs)
+    home_root = os.path.join(target_root, "home")
+    if os.path.isdir(home_root):
+        for username in LIVE_USERNAMES:
+            user_home = os.path.join(home_root, username)
+            if os.path.isdir(user_home) and not os.path.islink(user_home):
+                try:
+                    shutil.rmtree(user_home)
+                    print(f"Removed leftover live user home: {user_home}")
+                except OSError as e:
+                    print(f"Warning: Could not remove {user_home}: {e}")
+
+
 def copy_live_environment(target_root, progress_callback=None):
     """Copies the entire live environment to the target disk.
     
@@ -1458,6 +1508,10 @@ def copy_live_environment(target_root, progress_callback=None):
             progress_callback(err, 0.0)
         return False, err
     
+    # Clear target root before copy to avoid merging with leftovers (e.g. from manual
+    # partitioning or a previous failed install). Prevents .img files at root.
+    _clear_target_root(target_root)
+
     # Define directories to copy (exclude system-specific and volatile/mount directories)
     # Note: Excluding /mnt and /media prevents copying mounted volumes and avoids
     # recursively copying the target root (e.g., /mnt/sysimage) into itself.
@@ -1483,6 +1537,16 @@ def copy_live_environment(target_root, progress_callback=None):
         "/run",
         "/sys",
         "/tmp"
+    ]
+    
+    # Live image files to never copy (squashfs/erofs/rootfs.img etc.)
+    exclude_patterns = [
+        "*.img",
+        "squashfs*.img",
+        "erofs*.img",
+        "squash-root.img",
+        "rootfs.img",
+        "LiveOS",
     ]
     
     # Files to exclude
@@ -1568,9 +1632,11 @@ def copy_live_environment(target_root, progress_callback=None):
                 "-W",              # Whole-file transfer (skip delta calc for local)
                 "--omit-dir-times", # Skip mtime on dirs (minor speedup)
                 "--no-compress",   # Explicit: no compression for local copy
-                f"{source}/",
-                destination,
+                "--delete",        # Remove files in dest not in source (washes leftovers)
             ]
+            for pat in exclude_patterns:
+                rsync_cmd.extend(["--exclude", pat])
+            rsync_cmd.extend([f"{source}/", destination])
             result = subprocess.run(rsync_cmd, capture_output=True, text=True, check=True, timeout=1800)
             
             completed_dirs += 1
@@ -1759,19 +1825,6 @@ WantedBy=multi-user.target
                 print(f"Cleared {log_dir}")
         except Exception as e:
             print(f"Warning: Could not clear {log_dir}: {e}")
-    
-    # --- Copy essential files from host ---
-    print("Copying essential files from host...")
-    
-    # Copy resolv.conf
-    host_resolv = "/etc/resolv.conf"
-    target_resolv = os.path.join(target_root, "etc/resolv.conf")
-    try:
-        if os.path.exists(host_resolv):
-            shutil.copy2(host_resolv, target_resolv)
-            print("Copied resolv.conf from host")
-    except Exception as e:
-        print(f"Warning: Could not copy resolv.conf: {e}")
     
     # --- Remove livesys-scripts (live-install popups like "Welcome to Oreon") ---
     try:
@@ -1998,6 +2051,9 @@ GRUB_ENABLE_BLSCFG=true
         except Exception as e:
             print(f"Warning: Could not create {dir_path}: {e}")
     
+    # Remove leftover junk: .img files, LiveOS, live user homes
+    _cleanup_installed_root_junk(target_root)
+    
     print("Live environment setup complete.")
     if progress_callback:
         progress_callback("Live environment setup complete.", 1.0)
@@ -2083,6 +2139,22 @@ def generate_fstab_for_target(target_root):
         return True, ""
     except Exception as e:
         return False, f"Failed to generate fstab: {e}"
+
+def restart_network_manager():
+    """Restart NetworkManager on the host to refresh networking/DNS for DNF and Flatpak."""
+    success, err, _ = _run_command(
+        ["systemctl", "restart", "NetworkManager.service"],
+        "Restart NetworkManager",
+        timeout=30,
+    )
+    if success:
+        print("NetworkManager restarted successfully")
+        # Brief pause for NM to come up and reconnect
+        time.sleep(2)
+    else:
+        print(f"Warning: Failed to restart NetworkManager: {err}")
+    return success
+
 
 def check_network_connectivity():
     """Return True if the system has usable network connectivity (for DNF/Flatpak)."""
