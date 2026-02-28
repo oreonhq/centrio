@@ -5,6 +5,20 @@ Centrio Installer - Main entry point
 
 import sys
 import os
+import platform
+
+# work around MESA "Failed to attach to x11 shm" (common on ARM/Wayland)
+if platform.machine().lower() in ("aarch64", "arm64"):
+    for k, v in [
+        ("GDK_BACKEND", "x11"),
+        ("LIBGL_ALWAYS_SOFTWARE", "1"),
+        ("GALLIUM_DRIVER", "llvmpipe"),
+        # Disable MIT-SHM so Mesa doesn't try to attach to X11 shared memory
+        ("QT_X11_NO_MITSHM", "1"),
+        ("_X11_NO_MITSHM", "1"),
+        ("_MITSHM", "0"),
+    ]:
+        os.environ[k] = v
 import subprocess
 import logging
 import gettext

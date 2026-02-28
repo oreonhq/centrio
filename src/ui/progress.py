@@ -96,21 +96,20 @@ class ProgressPage(Gtk.Box):
                      continue
                      
                 print(f"    Unmounting {mp}...")
-                umount_cmd = ["umount", mp]
                 try:
-                    # Sync before trying to unmount
-                    try: subprocess.run(["sync"], check=False, timeout=5) 
+                    try: subprocess.run(["sync"], check=False, timeout=5)
                     except Exception: pass
-                    # Try normal unmount first
-                    subprocess.run(umount_cmd, check=True, timeout=15, capture_output=True)
-                    print(f"      Successfully unmounted {mp}")
-                except subprocess.CalledProcessError as e:
-                    print(f"      Failed to unmount {mp}: {e.stderr.strip()}")
-                    raise
+                    ok, err, _ = backend._run_command(["umount", mp], f"Unmount {mp}", timeout=15)
+                    if ok:
+                        print(f"      Successfully unmounted {mp}")
+                    else:
+                        print(f"      Failed to unmount {mp}: {err}")
+                        raise RuntimeError(err or "umount failed")
                 except subprocess.TimeoutExpired:
                      print(f"      Warning: Timeout unmounting {mp}")
                 except Exception as e:
                      print(f"      Warning: Error unmounting {mp}: {e}")
+                     raise
                      
             # Final sync after all attempts
             try: subprocess.run(["sync"], check=False, timeout=5) 
@@ -239,36 +238,28 @@ class ProgressPage(Gtk.Box):
                 print(f"  Attempting to unmount: {sorted(list(mount_targets_to_check))}")
                 for path in sorted(list(mount_targets_to_check), reverse=True):
                     print(f"    Unmounting {path}...")
-                    umount_cmd = ["umount", path]
                     try:
-                        # Sync before unmount
-                        try: subprocess.run(["sync"], check=False, timeout=5) 
+                        try: subprocess.run(["sync"], check=False, timeout=5)
                         except Exception: pass
-                        result = subprocess.run(umount_cmd, check=True, timeout=10, capture_output=True, text=True)
-                        print(f"      Successfully unmounted {path} (stdout: {result.stdout.strip()}, stderr: {result.stderr.strip()}) ")
-                        time.sleep(1) # Shorter sleep, sync is more important
-                    except subprocess.CalledProcessError as e:
-                        print(f"      Warning: Failed standard unmount {path} (rc={e.returncode}, stdout: {e.stdout.strip()}, stderr: {e.stderr.strip()}). Trying lazy unmount...")
-                        # Sync before lazy unmount
-                        try: subprocess.run(["sync"], check=False, timeout=5) 
-                        except Exception: pass
-                        umount_lazy_cmd = ["umount", "-l", path]
-                        try:
-                            result_lazy = subprocess.run(umount_lazy_cmd, check=True, timeout=10, capture_output=True, text=True)
-                            print(f"        Lazy unmount successful for {path} (stdout: {result_lazy.stdout.strip()}, stderr: {result_lazy.stderr.strip()}) ")
+                        ok, err, _ = backend._run_command(["umount", path], f"Unmount {path}", timeout=10)
+                        if ok:
+                            print(f"      Successfully unmounted {path}")
                             time.sleep(1)
-                        except Exception as lazy_e:
-                            # Capture specific error for lazy unmount failure
-                            lazy_err_msg = f"Failed to unmount {path} even with lazy option: {lazy_e}"
-                            if isinstance(lazy_e, subprocess.CalledProcessError):
-                                lazy_err_msg += f" (rc={lazy_e.returncode}, stdout: {lazy_e.stdout.strip()}, stderr: {lazy_e.stderr.strip()})"
-                            print(f"      ERROR: {lazy_err_msg}")
-                            self.installation_error = lazy_err_msg
-                            unmount_failed = True
-                            break # Stop trying to unmount if one fails fatally
+                        else:
+                            print(f"      Warning: Failed standard unmount {path}. Trying lazy unmount...")
+                            try: subprocess.run(["sync"], check=False, timeout=5)
+                            except Exception: pass
+                            ok_lazy, err_lazy, _ = backend._run_command(["umount", "-l", path], f"Lazy unmount {path}", timeout=10)
+                            if ok_lazy:
+                                print(f"        Lazy unmount successful for {path}")
+                                time.sleep(1)
+                            else:
+                                lazy_err_msg = f"Failed to unmount {path} even with lazy option: {err_lazy}"
+                                print(f"      ERROR: {lazy_err_msg}")
+                                self.installation_error = lazy_err_msg
+                                unmount_failed = True
                     except Exception as std_e:
-                        # Catch other errors during standard unmount
-                        std_err_msg = f"Error during standard unmount of {path}: {std_e}"
+                        std_err_msg = f"Error during unmount of {path}: {std_e}"
                         print(f"      ERROR: {std_err_msg}")
                         self.installation_error = std_err_msg
                         unmount_failed = True
@@ -282,7 +273,7 @@ class ProgressPage(Gtk.Box):
                  # Sync before final base unmount
                  try: subprocess.run(["sync"], check=False, timeout=5) 
                  except Exception: pass
-                 subprocess.run(["umount", primary_disk], check=False, capture_output=True, text=True, timeout=10)
+                 backend._run_command(["umount", primary_disk], f"Unmount {primary_disk}", timeout=10)
             except Exception as base_umount_e:
                  print(f"  Warning: Error during final base device umount: {base_umount_e}")
                  
@@ -462,7 +453,8 @@ class ProgressPage(Gtk.Box):
         print("=== END PARTITION MOUNT DEBUG ===")
         
         try:
-            os.makedirs(self.target_root, exist_ok=True)
+            if not backend.ensure_directory(self.target_root):
+                raise OSError("Failed to create target root")
         except OSError as e:
             self.installation_error = f"Failed to create root mount point {self.target_root}: {e}"
             return False
@@ -492,7 +484,8 @@ class ProgressPage(Gtk.Box):
             try:
                  # Only create if it's not the root mountpoint itself (which already exists)
                  if full_mount_path != self.target_root:
-                     os.makedirs(full_mount_path, exist_ok=True)
+                     if not backend.ensure_directory(full_mount_path):
+                         raise OSError(f"Failed to create {full_mount_path}")
             except OSError as e:
                  err_msg = f"Failed to create mount point {full_mount_path}: {e}"
                  print(f"ERROR: {err_msg}")
@@ -564,9 +557,13 @@ class ProgressPage(Gtk.Box):
                 print(f"=== End EFI Partition Verification ===")
             
             try:
-                 # Use subprocess.run directly as we are already root
-                 result = subprocess.run(mount_cmd, capture_output=True, text=True, check=True, timeout=30)
-                 print(f"  Mount successful. stdout: {result.stdout.strip()}, stderr: {result.stderr.strip()}")
+                 ok, err, stdout = backend._run_command(mount_cmd, mount_desc, self._update_progress_text, timeout=30)
+                 if ok:
+                     print(f"  Mount successful. stdout: {stdout or ''}")
+                 else:
+                     self.installation_error = err or f"Failed to mount {device}"
+                     self._attempt_unmount()
+                     return False
                  
                  # Verify the mount was successful by checking if it's actually mounted
                  try:
@@ -698,9 +695,10 @@ class ProgressPage(Gtk.Box):
         flatpak_enabled = payload_config.get('flatpak_enabled', False)
         flatpak_packages = payload_config.get('flatpak_packages', [])
         # Live copy already has base; exclude core-group packages so we only run DNF when user selected extra
+        # Include both x64 and aa64 so either arch gets filtered (live copy has base)
         _CORE_PACKAGES = frozenset([
-            "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common",
-            "grub2-tools", "shim-x64", "shim", "efibootmgr",
+            "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-efi-aa64", "grub2-efi-aa64-modules",
+            "grub2-pc", "grub2-common", "grub2-tools", "shim-x64", "shim-aa64", "shim", "efibootmgr",
             "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "centrio-installer"
         ])
         extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
@@ -831,7 +829,7 @@ class ProgressPage(Gtk.Box):
         if self.stop_requested: return False, "Stop requested"
         self._update_progress_text("Generating fstab...", 0.75)
         try:
-            success, err = backend.generate_fstab_for_target(self.target_root)
+            success, err = backend.generate_fstab_for_target(self.target_root, self._update_progress_text)
             if not success:
                 # Not fatal, but warn and continue
                 print(f"Warning: fstab generation issue: {err}")
@@ -933,13 +931,12 @@ class ProgressPage(Gtk.Box):
                     # Ensure /etc exists
                     if not os.path.exists(etc_path):
                         print(f"Warning: {etc_path} not found after package install. Creating it...")
-                        try:
-                            os.makedirs(etc_path, exist_ok=True)
-                            print(f"Successfully created {etc_path}.")
-                        except OSError as e:
-                            print(f"ERROR: Failed to create {etc_path}: {e}")
-                            self.installation_error = f"Failed to create essential directory {etc_path}: {e}"
+                        if not backend.ensure_directory(etc_path):
+                            print(f"ERROR: Failed to create {etc_path}")
+                            self.installation_error = f"Failed to create essential directory {etc_path}"
                             step_success = False  # Mark step as failed
+                        else:
+                            print(f"Successfully created {etc_path}.")
 
                 # ---------------------------------------------------------
                 
@@ -958,13 +955,16 @@ class ProgressPage(Gtk.Box):
              print("Installation sequence finished or stopped. Ensuring udisks2 service is started...")
              backend._start_service("udisks2.service")
         
+        # --- Remove installer from live system (run in worker thread before finalize) ---
+        if final_success and not self.stop_requested:
+            self._update_progress_text("Cleaning up installer from live system...", 1.0)
+            backend.remove_centrio_installer()
+        
         # --- Finalize UI --- 
         def finalize_ui():
             if final_success and not self.stop_requested:
                 final_message = "Installation finished successfully!"
                 self._update_progress_text(final_message, 1.0)
-                # Remove installer from live system in background (best effort)
-                threading.Thread(target=backend.remove_centrio_installer, daemon=True).start()
                 GLib.timeout_add(1500, self.main_window.navigate_to_page, "finished")
             elif self.stop_requested:
                  self._update_progress_text("Installation stopped.", self.progress_bar.get_fraction())

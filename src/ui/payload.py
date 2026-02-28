@@ -3,6 +3,7 @@
 import os
 import subprocess
 import gi
+from utils import get_host_architecture
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
@@ -25,12 +26,20 @@ def _detect_nvidia_gpu():
     except Exception:
         return False
 
+def _get_core_packages():
+    """Arch-aware core package list."""
+    arch = get_host_architecture()
+    pkgs = ["@core", "kernel", arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "grub2-common", "grub2-tools", arch["shim_pkg"], "shim", "efibootmgr", "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"]
+    if arch["has_bios"]:
+        pkgs.insert(pkgs.index(arch["grub_efi_modules_pkg"]) + 1, "grub2-pc")
+    return pkgs
+
 # Default package groups and packages
 DEFAULT_PACKAGE_GROUPS = {
     "core": {
         "name": "Core System",
         "description": "Essential system packages (required)",
-        "packages": ["@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "grub2-common", "grub2-tools", "shim-x64", "shim", "efibootmgr", "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk"],
+        "packages": _get_core_packages(),
         "required": True,
         "selected": True
     },

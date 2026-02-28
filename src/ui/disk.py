@@ -11,6 +11,7 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
 
 from .base import BaseConfigurationPage
+import backend
 # D-Bus imports are no longer needed here
 # from ..utils import dasbus, DBusError, dbus_available 
 # from ..constants import (...) 
@@ -239,19 +240,21 @@ def detect_existing_efi_partitions():
     seen_paths = set()
     try:
         # Fallback: if /boot/efi is mounted, use that partition
-        r = subprocess.run(
+        ok_fm, _, out_fm = backend._run_command(
             ["findmnt", "-n", "-o", "SOURCE", "/boot/efi"],
-            capture_output=True, text=True, check=False, timeout=5
+            "Find EFI mount", timeout=5
         )
-        if r.returncode == 0 and r.stdout.strip():
-            src = r.stdout.strip()
+        if ok_fm and out_fm and out_fm.strip():
+            src = out_fm.strip()
             if src and src not in seen_paths:
                 seen_paths.add(src)
                 efi_partitions.append({"path": src, "size": None, "fstype": "vfat"})
 
         cmd = ["lsblk", "-J", "-o", "PATH,FSTYPE,PARTTYPE,SIZE"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
-        lsblk_data = json.loads(result.stdout)
+        ok, _, stdout = backend._run_command(cmd, "List block devices for EFI", timeout=10)
+        if not ok:
+            raise RuntimeError("lsblk failed")
+        lsblk_data = json.loads(stdout or "{}")
 
         def scan_device(device):
             path = device.get("path")
@@ -732,11 +735,13 @@ class DiskPage(BaseConfigurationPage):
         self.dual_boot_radio.set_active(False)
 
         try:
-            # Run lsblk ONCE, get JSON tree, include MOUNTPOINT
+            # Run lsblk ONCE, get JSON tree, include MOUNTPOINT (use backend for sudo when not root)
             cmd = ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT,TRAN"]
             print(f"Running: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
-            lsblk_data = json.loads(result.stdout)
+            ok, err, stdout = backend._run_command(cmd, "Scan block devices", timeout=10)
+            if not ok:
+                raise subprocess.CalledProcessError(1, cmd, err or "")
+            lsblk_data = json.loads(stdout or "{}")
             
             self.detected_disks = []
             all_block_devices = lsblk_data.get("blockdevices", [])
@@ -800,10 +805,10 @@ class DiskPage(BaseConfigurationPage):
                     print(f"  Processing disk: {disk_path}, Is Live OS Disk? {is_live_os_disk}")
 
                     disk_info = {
-                        "name": device.get("name", "N/A"),
+                        "name": device.get("name") or "N/A",
                         "path": disk_path,
                         "size": device.get("size"),
-                        "model": device.get("model", "Unknown Model").strip(),
+                        "model": (device.get("model") or "Unknown Model").strip(),
                         "is_live_os_disk": is_live_os_disk # Changed flag name
                     }
                     self.detected_disks.append(disk_info)

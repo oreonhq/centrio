@@ -1,19 +1,18 @@
 Name:           centrio-installer
 Version:        1.0
-Release:        9%{?dist}
+Release:        32%{?dist}
 Summary:        Oreon live installer
 License:        GPL-2.0-or-later
 URL:            https://github.com/centrio/centrio
 BuildArch:      noarch
 Source0:        centrio-%{version}.tar.xz
 Source1:        liveinst.desktop
+Source2:        centrio-live-sudoers
 Requires:       python3-gobject gtk4 libadwaita
-Requires:       polkit
-Requires:       zenity
 BuildRequires:  python3-devel
 
 %description
-Centrio is the Oreon installer. It runs in the live session and in the GIS kiosk.
+Centrio is the Oreon installer. It runs in the live session.
 
 %prep
 %autosetup -n centrio-%{version}
@@ -27,6 +26,10 @@ Centrio is the Oreon installer. It runs in the live session and in the GIS kiosk
 %{__mkdir_p} %{buildroot}%{_datadir}/centrio/icons
 %{__mkdir_p} %{buildroot}%{_datadir}/centrio/locale
 %{__mkdir_p} %{buildroot}%{_datadir}/applications
+%{__mkdir_p} %{buildroot}%{_sysconfdir}/sudoers.d
+
+# GUI runs as user (Wayland/display); live user needs NOPASSWD for sudo
+install -p -m 0440 %{_sourcedir}/centrio-live-sudoers %{buildroot}%{_sysconfdir}/sudoers.d/99-centrio-live
 
 # Application and UI (from tarball)
 install -p -m 0644 %{_builddir}/centrio-%{version}/src/*.py %{buildroot}%{_datadir}/centrio/
@@ -38,6 +41,7 @@ cp -a %{_builddir}/centrio-%{version}/locale/* %{buildroot}%{_datadir}/centrio/l
 install -p -m 0644 %{_sourcedir}/liveinst.desktop %{buildroot}%{_datadir}/applications/
 
 %files
+%{_sysconfdir}/sudoers.d/99-centrio-live
 %{_datadir}/centrio/
 %{_datadir}/applications/liveinst.desktop
 

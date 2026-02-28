@@ -1,0 +1,6 @@
+# Centrio installer: live user needs passwordless sudo.
+# GUI runs as user (required for Wayland/display); privileged ops use sudo.
+liveuser ALL=(ALL) NOPASSWD: ALL
+live ALL=(ALL) NOPASSWD: ALL
+fedora ALL=(ALL) NOPASSWD: ALL
+gnome ALL=(ALL) NOPASSWD: ALL

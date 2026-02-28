@@ -2,6 +2,7 @@
 
 
 import os
+import platform
 import re
 import subprocess
 
@@ -121,6 +122,52 @@ def ana_get_available_locales():
         raise RuntimeError(f"Unexpected error fetching locales: {e}") from e 
 
 # Note: Avoid importing GUI or app-specific constants here to keep utils lightweight.
+
+def get_host_architecture():
+    """Return architecture-specific bootloader and package names.
+    Supports x86_64 and aarch64 (ARM64). Returns dict with keys:
+    efi_suffix, efi_shim, efi_grub, efi_boot, grub_efi_pkg, grub_efi_modules_pkg,
+    shim_pkg, has_bios (grub2-pc for legacy BIOS; False on ARM64).
+    """
+    mach = platform.machine().lower()
+    if mach in ("x86_64", "amd64"):
+        return {
+            "arch": "x86_64",
+            "efi_suffix": "x64",
+            "efi_shim": "shimx64.efi",
+            "efi_grub": "grubx64.efi",
+            "efi_boot": "BOOTX64.EFI",
+            "grub_efi_pkg": "grub2-efi-x64",
+            "grub_efi_modules_pkg": "grub2-efi-x64-modules",
+            "shim_pkg": "shim-x64",
+            "has_bios": True,
+        }
+    if mach in ("aarch64", "arm64"):
+        return {
+            "arch": "aarch64",
+            "efi_suffix": "aa64",
+            "efi_shim": "shimaa64.efi",
+            "efi_grub": "grubaa64.efi",
+            "efi_boot": "BOOTAA64.EFI",
+            "grub_efi_pkg": "grub2-efi-aa64",
+            "grub_efi_modules_pkg": "grub2-efi-aa64-modules",
+            "shim_pkg": "shim-aa64",
+            "has_bios": False,
+        }
+    # Fallback: treat as x86_64 for unknown arch (may fail)
+    print(f"Warning: Unsupported architecture {mach}, defaulting to x86_64 packages")
+    return {
+        "arch": mach,
+        "efi_suffix": "x64",
+        "efi_shim": "shimx64.efi",
+        "efi_grub": "grubx64.efi",
+        "efi_boot": "BOOTX64.EFI",
+        "grub_efi_pkg": "grub2-efi-x64",
+        "grub_efi_modules_pkg": "grub2-efi-x64-modules",
+        "shim_pkg": "shim-x64",
+        "has_bios": True,
+    }
+
 
 def get_os_release_info(target_root=None):
     """Parses /etc/os-release (or /usr/lib/os-release) to get NAME and VERSION_ID.

@@ -4,7 +4,7 @@ import subprocess
 import shlex
 import os
 import re # For parsing os-release
-from utils import get_os_release_info
+from utils import get_os_release_info, get_host_architecture
 import errno # For checking mount errors
 import time   # For delays
 import shutil # For copying bootloader files
@@ -58,13 +58,20 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
 
         if process.returncode != 0:
             error_detail = stderr_output.strip() or f"Exited with code {process.returncode}"
-            # Check for sudo/auth errors only if running via sudo
             error_msg = f"{description} failed ({execution_method}): {error_detail}"
             if execution_method == "via sudo":
-                if "password" in error_detail.lower() or process.returncode == 1:
-                     error_msg = f"Authorization failed for {description}. Check sudo or password."
+                err_lower = error_detail.lower()
+                is_sudo_auth = (
+                    "sudo:" in err_lower or "no tty" in err_lower or "not in the sudoers" in err_lower or
+                    "authentication failure" in err_lower or "password is required" in err_lower
+                )
+                if is_sudo_auth:
+                    error_msg = (
+                        f"Privilege escalation failed for {description}. "
+                        "The live user must have NOPASSWD sudo. Check /etc/sudoers on the live ISO."
+                    )
                 elif process.returncode == 127:
-                     error_msg = f"Command not found for {description}: {command_list[0]}"
+                    error_msg = f"Command not found for {description}: {command_list[0]}"
             
             print(f"ERROR: {error_msg}")
             
@@ -115,6 +122,54 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         err = f"Unexpected error during {description} ({execution_method}): {err_detail}"
         print(f"ERROR: {err}")
         return False, err, stdout_output.strip()
+
+
+def ensure_directory(path, progress_callback=None):
+    """Create directory, using sudo if not root. Use for paths under target_root etc."""
+    if os.geteuid() == 0:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return True
+        except OSError:
+            return False
+    ok, _, _ = _run_command(["mkdir", "-p", path], f"Create directory {path}", progress_callback)
+    return ok
+
+
+def write_file_as_root(path, content, progress_callback=None):
+    """Write content to path with elevated privileges. Use for target_root files when not root."""
+    if os.geteuid() == 0:
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(content)
+            return True
+        except OSError as e:
+            if progress_callback:
+                progress_callback(f"Write failed: {e}", 0)
+            return False
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".centrio", text=True)
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.close(fd)
+        d = os.path.dirname(path)
+        if d:
+            ok, _, _ = _run_command(["mkdir", "-p", d], f"Create directory {d}", progress_callback)
+            if not ok:
+                return False
+        ok, _, _ = _run_command(["cp", tmp, path], f"Write file {path}", progress_callback)
+        return ok
+    except Exception:
+        return False
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
 
 # --- New _run_in_chroot function ---
 def _run_in_chroot(target_root, command_list, description, progress_callback=None, timeout=None, pipe_input=None):
@@ -178,42 +233,35 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
         
         # Ensure target /etc directory exists (still needed for potential D-Bus dir below)
         if not os.path.exists(resolv_conf_dir):
-             try:
-                 print(f"  Creating directory {resolv_conf_dir}...")
-                 os.makedirs(resolv_conf_dir, exist_ok=True)
-             except OSError as e:
-                 raise RuntimeError(f"Failed to create target directory {resolv_conf_dir}: {e}") from e
+             print(f"  Creating directory {resolv_conf_dir}...")
+             if not ensure_directory(resolv_conf_dir, progress_callback):
+                 raise RuntimeError(f"Failed to create target directory {resolv_conf_dir}") from None
                  
         # Ensure target /etc/resolv.conf exists for bind mount (chroot needs host DNS for DNF/Flatpak)
         if not os.path.lexists(resolv_conf_target):
-            try:
-                with open(resolv_conf_target, "w") as f:
-                    f.write("")
-                print(f"  Created placeholder {resolv_conf_target} for bind mount")
-            except OSError as e:
-                raise RuntimeError(f"Failed to create target file {resolv_conf_target}: {e}") from e
+            print(f"  Created placeholder {resolv_conf_target} for bind mount")
+            if not write_file_as_root(resolv_conf_target, "", progress_callback):
+                raise RuntimeError(f"Failed to create target file {resolv_conf_target}") from None
                  
         if os.path.exists(host_dbus_socket):
              dbus_target_dir = os.path.dirname(mount_points["dbus"])
-             try:
-                 os.makedirs(dbus_target_dir, exist_ok=True)
-                 # Create an empty file for the socket bind mount target?
-                 # Or maybe just mount the socket file directly? Mount requires dir for source/target usually?
-                 # Let's try mounting the socket file directly using --bind.
-             except OSError as e:
-                 raise RuntimeError(f"Failed to prepare target D-Bus directory {dbus_target_dir}: {e}") from e
+             if not ensure_directory(dbus_target_dir, progress_callback):
+                 raise RuntimeError(f"Failed to prepare target D-Bus directory {dbus_target_dir}") from None
         else:
              print(f"Warning: Host D-Bus socket {host_dbus_socket} not found. Services inside chroot might fail.")
 
         # Refactored structure: (name, source, target, fstype, options_list)
         # resolv.conf: bind host's DNS config so chroot (Flatpak, dnf in chroot) can reach network
+        # /tmp: bind host's /tmp so DNF/librepo can create temp files (avoids "mkstemp ... No such file or directory")
         host_resolv = "/etc/resolv.conf"
+        target_tmp = os.path.join(target_root, "tmp")
         mount_commands = [
             ("proc",    "proc",                mount_points["proc"],        "proc",    ["nodev","noexec","nosuid"]), 
             ("sysfs",   "sys",                 mount_points["sys"],         "sysfs",   ["nodev","noexec","nosuid"]), 
             ("devtmpfs","udev",               mount_points["dev"],         "devtmpfs",["mode=0755","nosuid"]), 
             ("devpts",  "devpts",              mount_points["dev/pts"],     "devpts",  ["mode=0620","gid=5","nosuid","noexec"]), 
             ("resolv",  host_resolv,           mount_points["resolv.conf"],  None,     ["--bind"]),
+            ("tmp",     "/tmp",                target_tmp,                  None,     ["--bind"]),
             ("bind",    host_dbus_socket,      mount_points["dbus"],        None,      ["--bind"]),
             # Conditionally add efivars mount
             ("efivars", "efivarfs",            mount_points.get("efivars"), "efivarfs",["nosuid","noexec","nodev"]), # Source is the fstype
@@ -251,12 +299,11 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                 if name == "resolv":
                     pass  # resolv target file already ensured above
                 elif name == "bind" and source == host_dbus_socket:
-                     os.makedirs(os.path.dirname(target), exist_ok=True)
-                     # Create empty file as mount target if it doesn't exist? Bind mount needs a target.
+                     ensure_directory(os.path.dirname(target), progress_callback)
                      if not os.path.exists(target):
-                         open(target, 'a').close()
+                         write_file_as_root(target, "", progress_callback)
                 else:
-                    os.makedirs(target, exist_ok=True)
+                    ensure_directory(target, progress_callback)
                           
                 # Construct mount command correctly
                 mount_cmd = ["mount"]
@@ -285,10 +332,14 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                 mount_cmd.extend([source, target])
                 
                 print(f"  Mounting {source} -> {target} ({name}) with command: {' '.join(shlex.quote(c) for c in mount_cmd)}")
-                result = subprocess.run(mount_cmd, check=True, capture_output=True, text=True, timeout=15)
+                ok, err, _ = _run_command(mount_cmd, f"Mount {name}", progress_callback, timeout=15)
+                if not ok:
+                    raise RuntimeError(err or f"Failed to mount {source} to {target}")
                 mounted_paths.append((target, name))
             except FileNotFoundError:
                  raise RuntimeError("Mount command failed: 'mount' executable not found.")
+            except RuntimeError:
+                 raise
             except subprocess.CalledProcessError as e:
                 # Check if already mounted (exit code 32 often means this)
                 if e.returncode == 32 and ("already mounted" in e.stderr or "mount point does not exist" in e.stderr or "Not a directory" in e.stderr): # Added check for dbus socket
@@ -320,9 +371,11 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                  
                  try:
                      print(f"  Unmounting {mount_target}...")
-                     umount_cmd = ["umount", mount_target]
-                     result = subprocess.run(umount_cmd, capture_output=True, text=True, check=True, timeout=30)
-                     print(f"    Successfully unmounted {mount_target}")
+                     ok, err, _ = _run_command(["umount", mount_target], f"Unmount {mount_target}", progress_callback, timeout=30)
+                     if ok:
+                         print(f"    Successfully unmounted {mount_target}")
+                     else:
+                         raise RuntimeError(err or f"Failed to unmount {mount_target}")
                  except subprocess.CalledProcessError as e:
                      print(f"    Failed to unmount {mount_target}: {e.stderr.strip()}")
                      raise
@@ -351,16 +404,17 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
         try:
             # Write timezone name to /etc/timezone
             print(f"  Writing timezone name to {tz_file_path}...")
-            with open(tz_file_path, 'w') as f:
-                f.write(f"{tz}\n")
+            if not write_file_as_root(tz_file_path, f"{tz}\n", progress_callback):
+                raise OSError(f"Failed to write {tz_file_path}")
             
             # Link /etc/localtime to zoneinfo file
             if os.path.exists(zoneinfo_path):
                 print(f"  Linking {localtime_path} -> {zoneinfo_path}...")
-                # Remove existing link/file first if it exists
                 if os.path.lexists(localtime_path):
-                    os.remove(localtime_path)
-                os.symlink(f"/usr/share/zoneinfo/{tz}", localtime_path) # Link relative to root
+                    _run_command(["rm", "-f", localtime_path], "Remove existing localtime", progress_callback)
+                ok, _, _ = _run_command(["ln", "-sf", f"/usr/share/zoneinfo/{tz}", localtime_path], "Create localtime symlink", progress_callback)
+                if not ok:
+                    raise OSError("Failed to create localtime symlink")
             else:
                 print(f"  Warning: Zoneinfo file not found at {zoneinfo_path}. Cannot link /etc/localtime.")
                 # Don't mark as failure, system might cope or use /etc/timezone
@@ -380,8 +434,8 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
         locale_conf_path = os.path.join(target_root, "etc/locale.conf")
         try:
             print(f"  Writing locale to {locale_conf_path}...")
-            with open(locale_conf_path, 'w') as f:
-                f.write(f"LANG={locale}\n")
+            if not write_file_as_root(locale_conf_path, f"LANG={locale}\n", progress_callback):
+                raise OSError(f"Failed to write {locale_conf_path}")
         except Exception as e:
             err_msg = f"Failed to configure locale {locale}: {e}"
             print(f"  ERROR: {err_msg}")
@@ -397,8 +451,8 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
         vconsole_conf_path = os.path.join(target_root, "etc/vconsole.conf")
         try:
             print(f"  Writing keymap to {vconsole_conf_path}...")
-            with open(vconsole_conf_path, 'w') as f:
-                f.write(f"KEYMAP={keymap}\n")
+            if not write_file_as_root(vconsole_conf_path, f"KEYMAP={keymap}\n", progress_callback):
+                raise OSError(f"Failed to write {vconsole_conf_path}")
         except Exception as e:
             err_msg = f"Failed to configure keymap {keymap}: {e}"
             print(f"  ERROR: {err_msg}")
@@ -414,8 +468,8 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
     hostname_path = os.path.join(target_root, "etc/hostname")
     try:
         print(f"  Writing hostname to {hostname_path}...")
-        with open(hostname_path, 'w') as f:
-            f.write(f"{hostname}\n")
+        if not write_file_as_root(hostname_path, f"{hostname}\n", progress_callback):
+            raise OSError(f"Failed to write {hostname_path}")
     except Exception as e:
         err_msg = f"Failed to configure hostname {hostname}: {e}"
         print(f"  ERROR: {err_msg}")
@@ -628,12 +682,6 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     - minimal_install: whether to perform minimal installation
     """
     
-    # --- Root Check --- 
-    if os.geteuid() != 0:
-        err = "install_packages_enhanced must be run as root."
-        print(f"ERROR: {err}")
-        return False, err
-    
     print("Starting enhanced package installation...")
     
     # Get configuration
@@ -663,20 +711,24 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     if progress_callback:
         progress_callback("Installing packages...", 0.2)
     
+    arch = get_host_architecture()
     if minimal_install:
-        # For minimal install, use only core packages
-        packages = ["@core", "kernel", "grub2-efi-x64", "grub2-pc"]
+        pkgs = ["@core", "kernel", arch["grub_efi_pkg"]]
+        if arch["has_bios"]:
+            pkgs.append("grub2-pc")
+        packages = pkgs
         print("Minimal installation: using core packages only")
     elif not packages:
-        # Use default package list if none specified
         packages = [
             "@core", "kernel",
-            "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "efibootmgr",
+            arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "efibootmgr",
             "grub2-common", "grub2-tools",
-            "shim-x64", "shim",
+            arch["shim_pkg"], "shim",
             "linux-firmware",
             "bash-completion", "dnf-utils"
         ]
+        if arch["has_bios"]:
+            packages.insert(packages.index(arch["grub_efi_modules_pkg"]) + 1, "grub2-pc")
         print("Using default package list")
     
     success, err = _install_packages_dnf_impl(target_root, packages, progress_callback, keep_cache)
@@ -1028,16 +1080,14 @@ def install_flatpak_packages(target_root, flatpak_packages, progress_callback=No
 def install_packages_dnf(target_root, progress_callback=None):
     """Legacy function - installs base packages using DNF --installroot."""
     
-    # Use default package configuration
+    arch = get_host_architecture()
+    base_pkgs = ["@core", "kernel", arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "efibootmgr",
+                 "grub2-common", "grub2-tools", arch["shim_pkg"], "shim", "linux-firmware",
+                 "bash-completion", "dnf-utils"]
+    if arch["has_bios"]:
+        base_pkgs.insert(base_pkgs.index(arch["grub_efi_modules_pkg"]) + 1, "grub2-pc")
     package_config = {
-        "packages": [
-            "@core", "kernel", 
-            "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-pc", "efibootmgr", 
-            "grub2-common", "grub2-tools",
-            "shim-x64", "shim",
-            "linux-firmware", 
-            "bash-completion", "dnf-utils"
-        ],
+        "packages": base_pkgs,
         "repositories": [],
         "flatpak_enabled": False,
         "minimal_install": False,
@@ -1105,7 +1155,19 @@ def _start_service(service_name):
 
 
 def remove_centrio_installer():
-    """Remove the centrio-installer package from the live system after successful install (best effort)."""
+    """Remove the centrio-installer package and installer desktop files from the live system after successful install."""
+    # Remove desktop files from LIVE system first (user sees "Install Oreon" on live session)
+    for desktop_name in ["anaconda.desktop", "liveinst.desktop"]:
+        for subdir in ["/usr/share/applications", "/etc/xdg/autostart"]:
+            path = f"{subdir}/{desktop_name}"
+            ok, err, _ = _run_command(
+                ["rm", "-f", path],
+                f"Remove {desktop_name} from live system",
+                timeout=5
+            )
+            if ok:
+                print(f"Removed {desktop_name} from {subdir}")
+    # Remove the package (also removes its desktop file if not already deleted)
     try:
         success, err, _ = _run_command(
             ["dnf", "remove", "-y", "centrio-installer"],
@@ -1315,35 +1377,22 @@ def verify_grub_packages(target_root):
     
     print(f"Detected distribution: {distro_id}, like: {distro_like}")
     
+    arch = get_host_architecture()
+    efi_pkgs = [arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "grub2-common", "grub2-tools"]
+    if arch["arch"] == "x86_64":
+        efi_pkgs.extend(["grub2-tools-efi", "grub2-tools-minimal"])
+    if arch["has_bios"]:
+        efi_pkgs.insert(2, "grub2-pc")
     # Set package names based on distribution
     if "fedora" in distro_id or "fedora" in distro_like or "oreon" in distro_id or "oreon" in distro_like:
-        required_grub_packages = [
-            "grub2-efi-x64",
-            "grub2-efi-x64-modules", 
-            "grub2-pc",
-            "grub2-common",
-            "grub2-tools",
-            "grub2-tools-efi",
-            "grub2-tools-minimal"
-        ]
+        required_grub_packages = efi_pkgs
     elif "centos" in distro_id or "rhel" in distro_like or "rocky" in distro_like or "almalinux" in distro_like:
-        required_grub_packages = [
-            "grub2-efi-x64",
-            "grub2-efi-x64-modules",
-            "grub2-pc", 
-            "grub2-common",
-            "grub2-tools",
-            "grub2-tools-efi",
-            "grub2-tools-minimal"
-        ]
+        required_grub_packages = efi_pkgs
     elif "ubuntu" in distro_id or "debian" in distro_like:
-        required_grub_packages = [
-            "grub-efi-amd64",
-            "grub-efi-amd64-bin",
-            "grub-common",
-            "grub2-common",
-            "grub-pc-bin"
-        ]
+        if arch["arch"] == "aarch64":
+            required_grub_packages = ["grub-efi-arm64", "grub-efi-arm64-bin", "grub-common", "grub2-common"]
+        else:
+            required_grub_packages = ["grub-efi-amd64", "grub-efi-amd64-bin", "grub-common", "grub2-common", "grub-pc-bin"]
     elif "arch" in distro_id or "archlinux" in distro_like:
         required_grub_packages = [
             "grub",
@@ -1408,19 +1457,39 @@ def verify_grub_packages(target_root):
 
 # --- Live Environment Copy Functions ---
 
-def _clear_target_root(target_root):
+def _clear_target_root(target_root, progress_callback=None):
     """Clear contents of target root before copy. Avoids merging with leftover content
     (manual partitioning, prior failed install) and prevents .img files at root."""
     try:
-        for name in os.listdir(target_root):
+        if os.geteuid() != 0:
+            ok, _, stdout = _run_command(["ls", "-1", "-A", target_root], "List target root", progress_callback)
+            names = [n.strip() for n in (stdout or "").splitlines() if n.strip()]
+            ok2, _, mnt_out = _run_command(
+                ["findmnt", "-n", "-r", "-o", "TARGET", f"--target={target_root}"],
+                "List mounts under target", progress_callback
+            )
+            mount_points = set(mp.strip() for mp in (mnt_out or "").splitlines() if mp.strip()) if ok2 else set()
+        else:
+            names = os.listdir(target_root)
+            mount_points = None
+        for name in names:
             path = os.path.join(target_root, name)
-            if os.path.ismount(path):
+            if mount_points is not None:
+                is_mount = path in mount_points
+            else:
+                is_mount = os.path.ismount(path)
+            if is_mount:
                 continue
             try:
-                if os.path.isdir(path) and not os.path.islink(path):
-                    shutil.rmtree(path)
+                if os.geteuid() == 0:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
                 else:
-                    os.remove(path)
+                    ok, err, _ = _run_command(["rm", "-rf", path], f"Clear {path}", progress_callback)
+                    if not ok:
+                        print(f"Warning: Could not remove {path}: {err}")
             except OSError as e:
                 print(f"Warning: Could not remove {path}: {e}")
         print("Cleared target root before copy")
@@ -1478,12 +1547,6 @@ def copy_live_environment(target_root, progress_callback=None):
     has exactly the same software as the live environment.
     """
     
-    # --- Root Check --- 
-    if os.geteuid() != 0:
-        err = "copy_live_environment must be run as root."
-        print(f"ERROR: {err}")
-        return False, err
-    
     print("Starting live environment copy...")
     
     if progress_callback:
@@ -1492,15 +1555,17 @@ def copy_live_environment(target_root, progress_callback=None):
     # Validate target_root is mounted and writable before proceeding
     try:
         if not os.path.exists(target_root):
-            os.makedirs(target_root, exist_ok=True)
+            ensure_directory(target_root, progress_callback)
         # Best-effort: ensure it's a mount point
         if not os.path.ismount(target_root):
             print(f"WARNING: {target_root} is not a mount point. Proceeding may copy into live FS.")
-        # Write test
+        # Write test (use privileged helpers when not root)
         test_path = os.path.join(target_root, ".copy_write_test")
-        with open(test_path, "w") as f:
-            f.write("ok")
-        os.remove(test_path)
+        if not write_file_as_root(test_path, "ok", progress_callback):
+            raise OSError("Could not write to target root")
+        ok, _, _ = _run_command(["rm", "-f", test_path], "Remove write test file", progress_callback)
+        if not ok:
+            print(f"Warning: Could not remove write test file {test_path}")
     except Exception as e:
         err = f"Target root not writable at {target_root}: {e}"
         print(f"ERROR: {err}")
@@ -1510,7 +1575,7 @@ def copy_live_environment(target_root, progress_callback=None):
     
     # Clear target root before copy to avoid merging with leftovers (e.g. from manual
     # partitioning or a previous failed install). Prevents .img files at root.
-    _clear_target_root(target_root)
+    _clear_target_root(target_root, progress_callback)
 
     # Define directories to copy (exclude system-specific and volatile/mount directories)
     # Note: Excluding /mnt and /media prevents copying mounted volumes and avoids
@@ -1584,18 +1649,25 @@ def copy_live_environment(target_root, progress_callback=None):
             if os.path.islink(source):
                 try:
                     link_target = os.readlink(source)
-                    # Ensure parent directory exists
-                    os.makedirs(os.path.dirname(destination), exist_ok=True)
-                    # If destination exists (as file/dir/link), remove it to replace with symlink
+                    ensure_directory(os.path.dirname(destination), progress_callback)
+                    # If destination exists, remove it first (use privileged op when not root)
                     if os.path.lexists(destination):
-                        try:
-                            if os.path.isdir(destination) and not os.path.islink(destination):
-                                shutil.rmtree(destination)
-                            else:
-                                os.remove(destination)
-                        except Exception:
-                            pass
-                    os.symlink(link_target, destination)
+                        if os.geteuid() == 0:
+                            try:
+                                if os.path.isdir(destination) and not os.path.islink(destination):
+                                    shutil.rmtree(destination)
+                                else:
+                                    os.remove(destination)
+                            except Exception:
+                                pass
+                        else:
+                            _run_command(["rm", "-rf", destination], f"Remove {destination} for symlink", progress_callback)
+                    if os.geteuid() == 0:
+                        os.symlink(link_target, destination)
+                    else:
+                        ok, _, _ = _run_command(["ln", "-s", link_target, destination], f"Create symlink {directory}", progress_callback)
+                        if not ok:
+                            raise OSError("ln -s failed")
                     completed_dirs += 1
                     progress_fraction = 0.1 + (completed_dirs / total_dirs) * 0.8
                     if progress_callback:
@@ -1609,7 +1681,7 @@ def copy_live_environment(target_root, progress_callback=None):
             print(f"Warning: Symlink handling failed for {directory}: {e}. Copying contents instead.")
         
         # Create destination directory if it doesn't exist
-        os.makedirs(destination, exist_ok=True)
+        ensure_directory(destination, progress_callback)
         
         print(f"Copying {source} to {destination}...")
         
@@ -1637,7 +1709,9 @@ def copy_live_environment(target_root, progress_callback=None):
             for pat in exclude_patterns:
                 rsync_cmd.extend(["--exclude", pat])
             rsync_cmd.extend([f"{source}/", destination])
-            result = subprocess.run(rsync_cmd, capture_output=True, text=True, check=True, timeout=1800)
+            ok, err, _ = _run_command(rsync_cmd, f"Copy {directory}", progress_callback, timeout=1800)
+            if not ok:
+                raise subprocess.CalledProcessError(1, rsync_cmd, err or "")
             
             completed_dirs += 1
             progress_fraction = 0.1 + (completed_dirs / total_dirs) * 0.8
@@ -1648,7 +1722,7 @@ def copy_live_environment(target_root, progress_callback=None):
             print(f"Successfully copied {directory}")
             
         except subprocess.CalledProcessError as e:
-            error_msg = f"Failed to copy {directory}: {e.stderr.strip()}"
+            error_msg = f"Failed to copy {directory}: {(e.stderr or e.stdout or str(e)).strip()}"
             print(f"ERROR: {error_msg}")
             if progress_callback:
                 progress_callback(error_msg, progress_fraction)
@@ -1691,21 +1765,19 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
 
     def _write_machine_id_fallback():
         import secrets
-        new_id = secrets.token_hex(16)
-        os.makedirs(os.path.dirname(machine_id_path), exist_ok=True)
-        with open(machine_id_path, "w") as f:
-            f.write(new_id + "\n")
-        os.makedirs(os.path.dirname(dbus_machine_id_path), exist_ok=True)
-        with open(dbus_machine_id_path, "w") as f:
-            f.write(new_id + "\n")
+        new_id = secrets.token_hex(16) + "\n"
+        ensure_directory(os.path.dirname(machine_id_path), progress_callback)
+        write_file_as_root(machine_id_path, new_id, progress_callback)
+        ensure_directory(os.path.dirname(dbus_machine_id_path), progress_callback)
+        write_file_as_root(dbus_machine_id_path, new_id, progress_callback)
         print("Created new machine-id (fallback)")
 
     try:
-        r = subprocess.run(
+        ok, _, _ = _run_command(
             ["systemd-machine-id-setup", f"--root={target_root}"],
-            capture_output=True, text=True, timeout=30
+            "Create machine-id", progress_callback, timeout=30
         )
-        if r.returncode == 0:
+        if ok:
             print("Created new machine-id via systemd-machine-id-setup")
         else:
             _write_machine_id_fallback()
@@ -1729,68 +1801,52 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
             print("SELinux relabel completed")
         else:
             print("Warning: restorecon may have failed; creating /.autorelabel for first boot fallback")
-            try:
-                open(os.path.join(target_root, ".autorelabel"), "w").close()
-            except Exception:
-                pass
+            write_file_as_root(os.path.join(target_root, ".autorelabel"), "", progress_callback)
     except Exception as e:
         print(f"Warning: SELinux relabel failed: {e}; creating /.autorelabel")
-        try:
-            open(os.path.join(target_root, ".autorelabel"), "w").close()
-        except Exception:
-            pass
+        write_file_as_root(os.path.join(target_root, ".autorelabel"), "", progress_callback)
     # First boot in permissive so systemd can complete (/dev and /run get correct labels at runtime).
     # A first-boot oneshot will relabel, set enforcing, then reboot; second boot is enforcing.
     selinux_config = os.path.join(target_root, "etc/selinux/config")
-    if os.path.exists(os.path.dirname(selinux_config)):
-        try:
-            content = ""
-            if os.path.exists(selinux_config):
-                with open(selinux_config, "r") as f:
-                    content = f.read()
-            content = re.sub(r"^SELINUX=.*", "SELINUX=permissive", content, flags=re.MULTILINE)
-            if "SELINUX=" not in content:
-                content = "SELINUX=permissive\n" + content
-            with open(selinux_config, "w") as f:
-                f.write(content)
-            print("Set SELINUX=permissive for first boot in /etc/selinux/config")
-        except Exception as e:
-            print(f"Warning: Could not update SELinux config: {e}")
+    ok_cat, _, content = _run_command(["cat", selinux_config], "Read SELinux config", progress_callback, timeout=5)
+    if ok_cat:
+        content = content or ""
+    else:
+        content = ""
+    content = re.sub(r"^SELINUX=.*", "SELINUX=permissive", content, flags=re.MULTILINE)
+    if "SELINUX=" not in content:
+        content = "SELINUX=permissive\n" + content
+    if write_file_as_root(selinux_config, content, progress_callback):
+        print("Set SELINUX=permissive for first boot in /etc/selinux/config")
 
     # First-boot oneshot: run when marker exists; relabel, switch to enforcing, remove marker, reboot.
     # Marker file ensures the service runs (ConditionFirstBoot can be unreliable); removing it before reboot means one-shot.
-    systemd_system = os.path.join(target_root, "etc/systemd/system")
-    firstboot_unit = os.path.join(systemd_system, "centrio-selinux-firstboot.service")
-    firstboot_marker = "/etc/centrio-selinux-firstboot"
-    try:
-        os.makedirs(systemd_system, exist_ok=True)
-        open(os.path.join(target_root, firstboot_marker.lstrip("/")), "w").close()
-        unit_content = """[Unit]
+    firstboot_unit = os.path.join(target_root, "etc/systemd/system/centrio-selinux-firstboot.service")
+    firstboot_marker = os.path.join(target_root, "etc/centrio-selinux-firstboot")
+    firstboot_marker_chroot = "/etc/centrio-selinux-firstboot"
+    unit_content = """[Unit]
 Description=Centrio first boot: relabel SELinux and switch to enforcing
-ConditionPathExists=""" + firstboot_marker + """
+ConditionPathExists=""" + firstboot_marker_chroot + """
 
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/restorecon -Rv /
 ExecStart=/bin/sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
 ExecStart=/bin/rm -f /.autorelabel
-ExecStart=/bin/rm -f """ + firstboot_marker + """
+ExecStart=/bin/rm -f """ + firstboot_marker_chroot + """
 ExecStart=/usr/bin/systemctl reboot
 
 [Install]
 WantedBy=multi-user.target
 """
-        with open(firstboot_unit, "w") as f:
-            f.write(unit_content)
+    if write_file_as_root(firstboot_marker, "", progress_callback) and write_file_as_root(firstboot_unit, unit_content, progress_callback):
         wants_dir = os.path.join(target_root, "etc/systemd/system/multi-user.target.wants")
-        os.makedirs(wants_dir, exist_ok=True)
         want_link = os.path.join(wants_dir, "centrio-selinux-firstboot.service")
-        if os.path.lexists(want_link):
-            os.remove(want_link)
-        os.symlink("../centrio-selinux-firstboot.service", want_link)
-        print("Installed and enabled centrio-selinux-firstboot.service (marker: %s)" % firstboot_marker)
-    except Exception as e:
-        print(f"Warning: Could not install SELinux first-boot service: {e}")
+        ensure_directory(wants_dir, progress_callback)
+        _run_command(["rm", "-f", want_link], "Remove old firstboot link", progress_callback, timeout=5)
+        ok_ln, _, _ = _run_command(["ln", "-sf", "../centrio-selinux-firstboot.service", want_link], "Enable firstboot service", progress_callback, timeout=5)
+        if ok_ln:
+            print("Installed and enabled centrio-selinux-firstboot.service (marker: %s)" % firstboot_marker_chroot)
 
     # Clear systemd random seed
     random_seed_path = os.path.join(target_root, "var/lib/systemd/random-seed")
@@ -1841,32 +1897,34 @@ WantedBy=multi-user.target
     except Exception as e:
         print(f"Warning: Could not remove livesys-scripts: {e}")
 
-    # --- Remove installer desktop files (anaconda.desktop, liveinst.desktop) ---
+    # --- Remove installer desktop files (anaconda.desktop, liveinst.desktop) from TARGET ---
+    # Use _run_command (sudo) since target files are root-owned
     for desktop_name in ["anaconda.desktop", "liveinst.desktop"]:
         for subdir in ["usr/share/applications", "etc/xdg/autostart"]:
             desktop_path = os.path.join(target_root, subdir, desktop_name)
-            try:
-                if os.path.exists(desktop_path) and os.path.isfile(desktop_path):
-                    os.remove(desktop_path)
-                    print(f"Removed {desktop_name} from /{subdir}")
-            except Exception as e:
-                print(f"Warning: Could not remove {desktop_path}: {e}")
+            ok, err, _ = _run_command(
+                ["rm", "-f", desktop_path],
+                f"Remove {desktop_name} from /{subdir}",
+                progress_callback,
+                timeout=5
+            )
+            if ok:
+                print(f"Removed {desktop_name} from /{subdir}")
+            elif err and "No such file" not in err:
+                print(f"Warning: Could not remove {desktop_path}: {err}")
 
     # --- Plymouth: ensure dracut includes plymouth so initramfs shows splash ---
-    dracut_d = os.path.join(target_root, "etc/dracut.conf.d")
-    try:
-        os.makedirs(dracut_d, exist_ok=True)
-        plymouth_conf = os.path.join(dracut_d, "01-plymouth.conf")
-        with open(plymouth_conf, "w") as f:
-            f.write('# Force Plymouth into initramfs (Centrio installer)\nadd_dracutmodules+=" plymouth "\n')
+    plymouth_conf = os.path.join(target_root, "etc/dracut.conf.d/01-plymouth.conf")
+    if write_file_as_root(plymouth_conf, '# Force Plymouth into initramfs (Centrio installer)\nadd_dracutmodules+=" plymouth "\n', progress_callback):
         print("Added dracut drop-in for Plymouth module")
-    except Exception as e:
-        print(f"Warning: Could not write dracut Plymouth config: {e}")
 
     # --- Plymouth: set default theme and rebuild initramfs for installed system ---
+    # On aarch64, skip -R (initramfs rebuild) here; we run dracut --no-hostonly later to avoid host-only initramfs.
+    _arch = get_host_architecture()
+    plymouth_rebuild = ["plymouth-set-default-theme", "-R"] if _arch["arch"] != "aarch64" else ["plymouth-set-default-theme"]
     for theme in ["spinner", "bgrt", "spin-gdm", "details"]:
         try:
-            ok, _, _ = _run_in_chroot(target_root, ["plymouth-set-default-theme", "-R", theme], "Set Plymouth theme", progress_callback, timeout=120)
+            ok, _, _ = _run_in_chroot(target_root, plymouth_rebuild + [theme], "Set Plymouth theme", progress_callback, timeout=120)
             if ok:
                 print(f"Set Plymouth theme to {theme}")
                 break
@@ -1878,12 +1936,11 @@ WantedBy=multi-user.target
     grub_default_dir = os.path.dirname(grub_default)
     try:
         content = ""
-        if os.path.exists(grub_default):
-            with open(grub_default, "r") as f:
-                content = f.read()
+        ok_cat, _, cat_out = _run_command(["cat", grub_default], "Read etc/default/grub", progress_callback, timeout=5)
+        if ok_cat and cat_out:
+            content = cat_out
         # If file is missing or empty/minimal, write full template (live env may have empty grub)
         if not content.strip() or len(content) < 80:
-            os.makedirs(grub_default_dir, exist_ok=True)
             grub_template = '''GRUB_TIMEOUT=5
 GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
 GRUB_DEFAULT=saved
@@ -1894,9 +1951,8 @@ GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
 GRUB_DISABLE_RECOVERY="true"
 GRUB_ENABLE_BLSCFG=true
 '''
-            with open(grub_default, "w") as f:
-                f.write(grub_template)
-            print("Created /etc/default/grub with full template (was empty or missing)")
+            if write_file_as_root(grub_default, grub_template, progress_callback):
+                print("Created /etc/default/grub with full template (was empty or missing)")
         else:
             # Patch existing content to ensure quiet splash
             modified = False
@@ -1924,16 +1980,16 @@ GRUB_ENABLE_BLSCFG=true
                 content = content.rstrip() + '\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash"\n'
                 modified = True
             if modified:
-                with open(grub_default, "w") as f:
-                    f.write(content)
-                print("Ensured quiet splash in /etc/default/grub")
+                if write_file_as_root(grub_default, content, progress_callback):
+                    print("Ensured quiet splash in /etc/default/grub")
     except Exception as e:
         print(f"Warning: Could not write /etc/default/grub: {e}")
 
     # --- Fix BLS boot entries: live env uses LVM (rd.lvm.lv=oreon/root); centrio uses plain partitions ---
     # Replace root= and remove rd.lvm.lv params so the installed system boots from its actual root (UUID)
     bls_dir = os.path.join(target_root, "boot", "loader", "entries")
-    if os.path.isdir(bls_dir):
+    ok_dir, _, _ = _run_command(["test", "-d", bls_dir], "Check BLS dir", progress_callback, timeout=5)
+    if ok_dir:
         try:
             r = subprocess.run(
                 ["findmnt", "-n", "-o", "UUID", "--target", target_root],
@@ -1941,39 +1997,76 @@ GRUB_ENABLE_BLSCFG=true
             )
             target_root_uuid = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
             if target_root_uuid:
-                rd_lvm_re = re.compile(r'\brd\.lvm\.lv=[^\s]+\s*')
-                root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
-                resume_re = re.compile(r'\bresume=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
-                for name in os.listdir(bls_dir):
-                    if not name.endswith(".conf"):
-                        continue
-                    path = os.path.join(bls_dir, name)
-                    if not os.path.isfile(path):
-                        continue
-                    try:
-                        with open(path, "r") as f:
-                            content = f.read()
-                        new_lines = []
-                        for line in content.splitlines():
-                            if line.startswith("options "):
-                                opts = line[8:]  # strip "options "
-                                opts = rd_lvm_re.sub("", opts)  # remove rd.lvm.lv=oreon/root etc
-                                opts = root_uuid_re.sub("", opts)  # remove old root=
-                                opts = resume_re.sub("", opts)  # remove resume= (live's swap UUID; installed system differs)
-                                opts = opts.strip()
-                                add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
-                                for p in add:
-                                    if p not in opts.split():
-                                        opts = (opts + " " + p).strip()
-                                line = "options " + opts
-                            new_lines.append(line)
-                        with open(path, "w") as f:
-                            f.write("\n".join(new_lines) + "\n")
-                        print(f"Fixed BLS entry {name} (root=UUID=..., removed rd.lvm.lv)")
-                    except Exception as e:
-                        print(f"Warning: Could not patch BLS entry {path}: {e}")
+                ok_ls, _, ls_out = _run_command(["ls", "-1", bls_dir], "List BLS entries", progress_callback, timeout=5)
+                if ok_ls and ls_out:
+                    rd_lvm_re = re.compile(r'\brd\.lvm\.lv=[^\s]+\s*')
+                    root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
+                    resume_re = re.compile(r'\bresume=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
+                    # Live uses BTRFS subvol=root; our plain mkfs.btrfs has no subvolumes - strip rootflags
+                    rootflags_subvol_re = re.compile(r'\brootflags=[^\s]*subvol=[^\s]+\s*|\brootflags=[^\s]+\s*')
+                    for name in [n.strip() for n in ls_out.splitlines() if n.strip()]:
+                        if not name.endswith(".conf"):
+                            continue
+                        path = os.path.join(bls_dir, name)
+                        ok_cat, _, content = _run_command(["cat", path], f"Read BLS {name}", progress_callback, timeout=5)
+                        if not ok_cat or not content:
+                            continue
+                        try:
+                            new_lines = []
+                            for line in content.splitlines():
+                                if line.startswith("options "):
+                                    opts = line[8:]  # strip "options "
+                                    opts = rd_lvm_re.sub("", opts)  # remove rd.lvm.lv=oreon/root etc
+                                    opts = root_uuid_re.sub("", opts)  # remove old root=
+                                    opts = resume_re.sub("", opts)  # remove resume= (live's swap UUID; installed system differs)
+                                    opts = rootflags_subvol_re.sub("", opts)  # remove rootflags=subvol=root (live BTRFS; we use plain btrfs)
+                                    opts = opts.strip()
+                                    add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
+                                    for p in add:
+                                        if p not in opts.split():
+                                            opts = (opts + " " + p).strip()
+                                    line = "options " + opts
+                                new_lines.append(line)
+                            new_content = "\n".join(new_lines) + "\n"
+                            if write_file_as_root(path, new_content, progress_callback):
+                                print(f"Fixed BLS entry {name} (root=UUID=..., removed rd.lvm.lv)")
+                        except Exception as e:
+                            print(f"Warning: Could not patch BLS entry {path}: {e}")
         except Exception as e:
             print(f"Warning: Could not fix BLS boot entries: {e}")
+
+    # --- aarch64: regenerate initramfs (Bug 1686326 - host-only initramfs can lack drivers) ---
+    arch = get_host_architecture()
+    if arch["arch"] == "aarch64":
+        if progress_callback:
+            progress_callback("Regenerating initramfs for aarch64...", None)
+        kver = None
+        modules_dir = os.path.join(target_root, "lib", "modules")
+        if os.path.isdir(modules_dir):
+            for name in sorted(os.listdir(modules_dir), reverse=True):
+                if not name.startswith(".") and os.path.isdir(os.path.join(modules_dir, name)):
+                    kver = name
+                    break
+        dracut_cmd = ["dracut", "--force", "--no-hostonly", "-v"]
+        if kver:
+            dracut_cmd.extend(["--kver", kver])
+            print(f"Using kernel version for dracut: {kver}")
+        try:
+            ok, err, _ = _run_in_chroot(
+                target_root,
+                dracut_cmd,
+                "Regenerate initramfs (aarch64)",
+                progress_callback,
+                timeout=240
+            )
+            if ok:
+                print("Regenerated initramfs for aarch64.")
+            else:
+                print(f"ERROR: aarch64 dracut regeneration failed: {err}")
+                return False, f"aarch64 initramfs regeneration failed (required for boot): {err}"
+        except Exception as e:
+            print(f"ERROR: aarch64 dracut regeneration failed: {e}")
+            return False, f"aarch64 initramfs regeneration failed: {e}"
 
     # --- Server install: remove GNOME/desktop packages ---
     if server_install:
@@ -1990,31 +2083,20 @@ GRUB_ENABLE_BLSCFG=true
         os.path.join(target_root, "etc/dconf/db/local.d/livesys"),
     ]
     for d in live_dconf_dirs:
-        if os.path.exists(d) and os.path.isfile(d):
-            try:
-                os.remove(d)
-                print(f"Removed live config: {d}")
-            except Exception as e:
-                print(f"Warning: Could not remove {d}: {e}")
+        ok, _, _ = _run_command(["test", "-f", d], "Check live config", progress_callback, timeout=5)
+        if ok:
+            _run_command(["rm", "-f", d], f"Remove live config {d}", progress_callback, timeout=5)
+            print(f"Removed live config: {d}")
 
     # --- Re-enable GNOME Software updates tab (livesys-scripts disables it on live boot) ---
     # Livesys appends allow-updates=false, download-updates=false to this override; remove it so installed system has updates.
     gs_override = os.path.join(target_root, "usr/share/glib-2.0/schemas/org.gnome.software.gschema.override")
-    if os.path.exists(gs_override):
-        try:
-            os.remove(gs_override)
-            print("Removed org.gnome.software.gschema.override so updates tab is enabled")
-        except Exception as e:
-            print(f"Warning: Could not remove GNOME Software schema override: {e}")
-    # Replace with an override that explicitly enables updates (in case distro default is false)
-    try:
-        schemas_dir = os.path.join(target_root, "usr/share/glib-2.0/schemas")
-        os.makedirs(schemas_dir, exist_ok=True)
-        with open(gs_override, "w") as f:
-            f.write("[org.gnome.software]\nallow-updates=true\ndownload-updates=true\n")
+    ok, _, _ = _run_command(["test", "-f", gs_override], "Check gs override", progress_callback, timeout=5)
+    if ok:
+        _run_command(["rm", "-f", gs_override], "Remove GNOME Software schema override", progress_callback, timeout=5)
+        print("Removed org.gnome.software.gschema.override so updates tab is enabled")
+    if write_file_as_root(gs_override, "[org.gnome.software]\nallow-updates=true\ndownload-updates=true\n", progress_callback):
         print("Wrote org.gnome.software.gschema.override with updates enabled")
-    except Exception as e:
-        print(f"Warning: Could not write GNOME Software schema override: {e}")
     # Rebuild schema cache
     try:
         _run_in_chroot(target_root, ["glib-compile-schemas", "/usr/share/glib-2.0/schemas"], "Compile GLib schemas", progress_callback)
@@ -2023,18 +2105,13 @@ GRUB_ENABLE_BLSCFG=true
 
     # --- Re-enable GNOME Software search provider (livesys sets DefaultDisabled=true) ---
     search_ini = os.path.join(target_root, "usr/share/gnome-shell/search-providers/org.gnome.Software-search-provider.ini")
-    if os.path.exists(search_ini):
-        try:
-            with open(search_ini, "r") as f:
-                content = f.read()
-            content = content.replace("DefaultDisabled=true", "DefaultDisabled=false")
-            if "DefaultDisabled=" not in content:
-                content = content.rstrip() + "\nDefaultDisabled=false\n"
-            with open(search_ini, "w") as f:
-                f.write(content)
+    ok_cat, _, content = _run_command(["cat", search_ini], "Read search provider ini", progress_callback, timeout=5)
+    if ok_cat and content:
+        content = content.replace("DefaultDisabled=true", "DefaultDisabled=false")
+        if "DefaultDisabled=" not in content:
+            content = content.rstrip() + "\nDefaultDisabled=false\n"
+        if write_file_as_root(search_ini, content, progress_callback):
             print("Re-enabled GNOME Software search provider")
-        except Exception as e:
-            print(f"Warning: Could not fix search provider ini: {e}")
 
     # --- Ensure essential directories exist ---
     essential_dirs = [
@@ -2060,7 +2137,7 @@ GRUB_ENABLE_BLSCFG=true
     
     return True, ""
 
-def generate_fstab_for_target(target_root):
+def generate_fstab_for_target(target_root, progress_callback=None):
     """Generate a basic /etc/fstab inside the target based on currently mounted target filesystems.
     Uses UUIDs for reliability and includes entries for /, /boot, and /boot/efi if present.
     """
@@ -2128,12 +2205,12 @@ def generate_fstab_for_target(target_root):
         if not entries:
             return False, "No eligible mounts found to generate fstab"
 
-        # Ensure containing directory exists
-        os.makedirs(os.path.dirname(fstab_path), exist_ok=True)
-        with open(fstab_path, "w") as f:
-            f.write("# Generated by Centrio Installer\n")
-            for e in sorted(entries, key=lambda s: 0 if s.split()[1] == "/" else 1):
-                f.write(e + "\n")
+        ensure_directory(os.path.dirname(fstab_path), progress_callback)
+        fstab_content = "# Generated by Centrio Installer\n" + "".join(
+            e + "\n" for e in sorted(entries, key=lambda s: 0 if s.split()[1] == "/" else 1)
+        )
+        if not write_file_as_root(fstab_path, fstab_content, progress_callback):
+            return False, "Failed to write fstab"
 
         print(f"fstab generated with {len(entries)} entries")
         return True, ""
@@ -2179,12 +2256,6 @@ def install_packages_on_live_copy(target_root, package_config, progress_callback
     This function is similar to install_packages_enhanced but optimized for
     a live environment copy where the base system is already present.
     """
-    
-    # --- Root Check --- 
-    if os.geteuid() != 0:
-        err = "install_packages_on_live_copy must be run as root."
-        print(f"ERROR: {err}")
-        return False, err
     
     print("Installing additional packages on live environment copy...")
     
