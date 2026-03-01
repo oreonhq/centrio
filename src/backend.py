@@ -816,6 +816,9 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
     
     dnf_cmd.extend(packages)
 
+    # DNF requires root; use sudo when not already root (same as _run_command)
+    if os.geteuid() != 0:
+        dnf_cmd = ["sudo"] + dnf_cmd
     print(f"Executing DNF installation: {' '.join(shlex.quote(c) for c in dnf_cmd[:10])}... ({len(packages)} packages)")
     if progress_callback:
         progress_callback("Starting DNF package installation...", 0.0)
