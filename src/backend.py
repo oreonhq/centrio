@@ -802,7 +802,6 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         "--exclude=almalinux-*",
         "--exclude=steam",
         "--exclude=lutris",
-        "--exclude=wine",
         "--exclude=libreoffice*",
         "--exclude=oreon-*",
         "--exclude=centrio-installer",

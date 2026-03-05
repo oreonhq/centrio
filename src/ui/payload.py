@@ -78,6 +78,13 @@ DEFAULT_PACKAGE_GROUPS = {
         "flatpak_packages": ["com.valvesoftware.Steam", "net.lutris.Lutris", "org.winehq.Wine"],
         "required": False,
         "selected": False
+    },
+    "wine": {
+        "name": "Windows App Support",
+        "description": "Run Windows applications using Wine",
+        "packages": ["wine"],
+        "required": False,
+        "selected": True
     }
 }
 
