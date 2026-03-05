@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Italian\n"
+"Language: it_IT\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Welcome to {}"
+msgstr "Benvenuto in {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "Configura il tuo nuovo sistema operativo in pochi semplici passaggi."
+
+msgid "Language"
+msgstr "Lingua"
+
+msgid "Installer Language"
+msgstr "Lingua dell'installer"
+
+msgid "Installation Overview"
+msgstr "Panoramica installazione"
+
+msgid "Operating System"
+msgstr "Sistema operativo"
+
+msgid "Installation Type"
+msgstr "Tipo di installazione"
+
+msgid "Full desktop with applications"
+msgstr "Desktop completo con applicazioni"
+
+msgid "Estimated Time"
+msgstr "Tempo stimato"
+
+msgid "15-30 minutes"
+msgstr "15-30 minuti"
+
+msgid "Click Next to begin configuration."
+msgstr "Clicca Avanti per iniziare la configurazione."
+
+msgid "Language Changed"
+msgstr "Lingua modificata"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "La lingua è stata modificata. Riavvia l'installer per vedere le modifiche."
+
+msgid "Language Selected"
+msgstr "Lingua selezionata"
+
+msgid "The installer will restart to apply the new language."
+msgstr "L'installer si riavvierà per applicare la nuova lingua."

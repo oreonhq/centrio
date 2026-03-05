@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Romanian\n"
+"Language: ro_RO\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Welcome to {}"
+msgstr "Bine ați venit la {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "Configurați noul sistem de operare în câțiva pași simpli."
+
+msgid "Language"
+msgstr "Limbă"
+
+msgid "Installer Language"
+msgstr "Limba instalatorului"
+
+msgid "Installation Overview"
+msgstr "Prezentare generală instalare"
+
+msgid "Operating System"
+msgstr "Sistem de operare"
+
+msgid "Installation Type"
+msgstr "Tip instalare"
+
+msgid "Full desktop with applications"
+msgstr "Desktop complet cu aplicații"
+
+msgid "Estimated Time"
+msgstr "Timp estimat"
+
+msgid "15-30 minutes"
+msgstr "15-30 minute"
+
+msgid "Click Next to begin configuration."
+msgstr "Faceți clic pe Next pentru a începe configurarea."
+
+msgid "Language Changed"
+msgstr "Limba a fost schimbată"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "Limba a fost schimbată. Reporniți instalatorul."
+
+msgid "Language Selected"
+msgstr "Limba selectată"
+
+msgid "The installer will restart to apply the new language."
+msgstr "Instalatorul se va reporni pentru a aplica noua limbă."

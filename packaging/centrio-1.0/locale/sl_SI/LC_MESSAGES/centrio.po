@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Slovenian\n"
+"Language: sl_SI\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Welcome to {}"
+msgstr "Dobrodošli v {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "Nastavite novi operacijski sistem v nekaj preprostih korakih."
+
+msgid "Language"
+msgstr "Jezik"
+
+msgid "Installer Language"
+msgstr "Jezik namestitvenega programa"
+
+msgid "Installation Overview"
+msgstr "Pregled namestitve"
+
+msgid "Operating System"
+msgstr "Operacijski sistem"
+
+msgid "Installation Type"
+msgstr "Vrsta namestitve"
+
+msgid "Full desktop with applications"
+msgstr "Polna namizje z aplikacijami"
+
+msgid "Estimated Time"
+msgstr "Ocenjeni čas"
+
+msgid "15-30 minutes"
+msgstr "15-30 minut"
+
+msgid "Click Next to begin configuration."
+msgstr "Kliknite Naprej za začetek konfiguracije."
+
+msgid "Language Changed"
+msgstr "Jezik spremenjen"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "Jezik je bil spremenjen. Znova zaženite namestitveni program."
+
+msgid "Language Selected"
+msgstr "Jezik izbran"
+
+msgid "The installer will restart to apply the new language."
+msgstr "Namestitveni program se bo znova zagnal za uporabo novega jezika."

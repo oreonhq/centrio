@@ -1,0 +1,6 @@
+# Required for GTK4 and Libadwaita
+PyGObject>=3.40
+# Required for D-Bus communication
+dasbus>=1.0
+# Required for timezone list data
+pytz

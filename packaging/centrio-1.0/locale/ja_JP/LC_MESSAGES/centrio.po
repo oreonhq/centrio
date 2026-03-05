@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Japanese\n"
+"Language: ja_JP\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Welcome to {}"
+msgstr "{} へようこそ"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "簡単な手順で新しいオペレーティングシステムをセットアップします。"
+
+msgid "Language"
+msgstr "言語"
+
+msgid "Installer Language"
+msgstr "インストーラの言語"
+
+msgid "Installation Overview"
+msgstr "インストール概要"
+
+msgid "Operating System"
+msgstr "オペレーティングシステム"
+
+msgid "Installation Type"
+msgstr "インストールタイプ"
+
+msgid "Full desktop with applications"
+msgstr "アプリケーション付きフルデスクトップ"
+
+msgid "Estimated Time"
+msgstr "所要時間の目安"
+
+msgid "15-30 minutes"
+msgstr "15〜30 分"
+
+msgid "Click Next to begin configuration."
+msgstr "「次へ」をクリックして設定を開始します。"
+
+msgid "Language Changed"
+msgstr "言語を変更しました"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "言語が変更されました。変更を反映するにはインストーラを再起動してください。"
+
+msgid "Language Selected"
+msgstr "言語を選択しました"
+
+msgid "The installer will restart to apply the new language."
+msgstr "新しい言語を適用するため、インストーラを再起動します。"

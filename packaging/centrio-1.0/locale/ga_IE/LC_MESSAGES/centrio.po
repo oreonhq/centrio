@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Irish\n"
+"Language: ga_IE\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Welcome to {}"
+msgstr "Fáilte go {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "Socraigh do chóras oibriúcháin nua i gcéad céimeanna simplí."
+
+msgid "Language"
+msgstr "Teanga"
+
+msgid "Installer Language"
+msgstr "Teanga an suiteálaí"
+
+msgid "Installation Overview"
+msgstr "Forléargas ar an suiteáil"
+
+msgid "Operating System"
+msgstr "Córas oibriúcháin"
+
+msgid "Installation Type"
+msgstr "Cineál suiteála"
+
+msgid "Full desktop with applications"
+msgstr "Deasc iomlán le feidhmchláir"
+
+msgid "Estimated Time"
+msgstr "Am measta"
+
+msgid "15-30 minutes"
+msgstr "15-30 nóiméad"
+
+msgid "Click Next to begin configuration."
+msgstr "Cliceáil Ar Aghaidh chun an chumraíocht a thosú."
+
+msgid "Language Changed"
+msgstr "Teanga athraithe"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "Tá an teanga athraithe. Atosaigh an suiteálaí."
+
+msgid "Language Selected"
+msgstr "Teanga roghnaithe"
+
+msgid "The installer will restart to apply the new language."
+msgstr "Atosóidh an suiteálaí chun an teanga nua a chur i bhfeidhm."

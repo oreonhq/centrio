@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Welcome to {}"
+msgstr "欢迎使用 {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "通过几个简单步骤设置您的新操作系统。"
+
+msgid "Language"
+msgstr "语言"
+
+msgid "Installer Language"
+msgstr "安装程序语言"
+
+msgid "Installation Overview"
+msgstr "安装概览"
+
+msgid "Operating System"
+msgstr "操作系统"
+
+msgid "Installation Type"
+msgstr "安装类型"
+
+msgid "Full desktop with applications"
+msgstr "带应用程序的完整桌面"
+
+msgid "Estimated Time"
+msgstr "预计时间"
+
+msgid "15-30 minutes"
+msgstr "15-30 分钟"
+
+msgid "Click Next to begin configuration."
+msgstr "点击“下一步”开始配置。"
+
+msgid "Language Changed"
+msgstr "语言已更改"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "语言已更改。请重新启动安装程序以查看更改。"
+
+msgid "Language Selected"
+msgstr "已选择语言"
+
+msgid "The installer will restart to apply the new language."
+msgstr "安装程序将重新启动以应用新语言。"

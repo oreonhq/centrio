@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Lithuanian\n"
+"Language: lt_LT\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Welcome to {}"
+msgstr "Sveiki atvykę į {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "Nustatykite naują operacinę sistemą keliais paprastais žingsniais."
+
+msgid "Language"
+msgstr "Kalba"
+
+msgid "Installer Language"
+msgstr "Diegiklio kalba"
+
+msgid "Installation Overview"
+msgstr "Diegimo apžvalga"
+
+msgid "Operating System"
+msgstr "Operacinė sistema"
+
+msgid "Installation Type"
+msgstr "Diegimo tipas"
+
+msgid "Full desktop with applications"
+msgstr "Pilna darbalaukis su programomis"
+
+msgid "Estimated Time"
+msgstr "Numatytas laikas"
+
+msgid "15-30 minutes"
+msgstr "15-30 minučių"
+
+msgid "Click Next to begin configuration."
+msgstr "Spustelėkite Toliau, kad pradėtumėte konfigūraciją."
+
+msgid "Language Changed"
+msgstr "Kalba pakeista"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "Kalba pakeista. Perleiskite diegiklį."
+
+msgid "Language Selected"
+msgstr "Kalba pasirinkta"
+
+msgid "The installer will restart to apply the new language."
+msgstr "Diegiklis bus perleistas, kad pritaikytų naują kalbą."

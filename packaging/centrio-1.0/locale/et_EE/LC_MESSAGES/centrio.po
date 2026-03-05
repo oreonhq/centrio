@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Centrio Installer\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-08-05 14:30+0000\n"
+"PO-Revision-Date: 2026-02-17+0000\n"
+"Last-Translator: \n"
+"Language-Team: Estonian\n"
+"Language: et_EE\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Welcome to {}"
+msgstr "Tere tulemast {}"
+
+msgid "Set up your new operating system in a few simple steps."
+msgstr "Seadista oma uus operatsioonisüsteem mõne lihtsa sammuga."
+
+msgid "Language"
+msgstr "Keel"
+
+msgid "Installer Language"
+msgstr "Installeerija keel"
+
+msgid "Installation Overview"
+msgstr "Paigalduse ülevaade"
+
+msgid "Operating System"
+msgstr "Operatsioonisüsteem"
+
+msgid "Installation Type"
+msgstr "Paigalduse tüüp"
+
+msgid "Full desktop with applications"
+msgstr "Täielik töölaud rakendustega"
+
+msgid "Estimated Time"
+msgstr "Hinnanguline aeg"
+
+msgid "15-30 minutes"
+msgstr "15-30 minutit"
+
+msgid "Click Next to begin configuration."
+msgstr "Konfiguratsiooni alustamiseks klõpsake Edasi."
+
+msgid "Language Changed"
+msgstr "Keel muudetud"
+
+msgid "The language has been changed. Please restart the installer to see the changes."
+msgstr "Keel on muudetud. Taaskäivitage installeerija."
+
+msgid "Language Selected"
+msgstr "Keel valitud"
+
+msgid "The installer will restart to apply the new language."
+msgstr "Installeerija taaskäivitatakse uue keele rakendamiseks."
