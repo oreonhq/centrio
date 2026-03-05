@@ -786,6 +786,10 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         raise RuntimeError("Could not detect OS VERSION_ID for DNF. Set releasever or fix /etc/os-release.")
     print(f"Using release version: {releasever}")
     
+    # WINE and some desktop integrations rely on post-install scriptlets
+    # only do this when Wine is requested, otherwise keep old behavior.
+    enable_scriptlets = any(p == "wine" or p.startswith("wine-") for p in packages)
+
     # Build DNF command with package exclusions and speed optimizations
     dnf_cmd = [
         "dnf", 
@@ -805,10 +809,13 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         "--exclude=libreoffice*",
         "--exclude=oreon-*",
         "--exclude=centrio-installer",
-        "--setopt=tsflags=noscripts",  # Skip problematic scriptlets
         "--setopt=installonly_limit=0",  # Don't limit kernel installations
         "--setopt=keepcache=1" if keep_cache else "--setopt=keepcache=0"
     ]
+    if not enable_scriptlets:
+        dnf_cmd.append("--setopt=tsflags=noscripts")  # Skip problematic scriptlets
+    else:
+        print("Wine detected in package set: running DNF with scriptlets enabled.")
     
     if not keep_cache:
         dnf_cmd.append("--setopt=keepcache=0")
