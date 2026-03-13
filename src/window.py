@@ -184,6 +184,8 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         name = self.view_stack.get_visible_child_name()
         if name == "network" and hasattr(self, "network_page"):
             self.network_page.refresh_status()
+        if name == "disk" and hasattr(self, "disk_page"):
+            self.disk_page.refresh_for_network()
         if name == "payload" and hasattr(self, "payload_page"):
             self.payload_page.refresh_for_network(self.final_config.get("network", {}))
 

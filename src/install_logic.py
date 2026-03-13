@@ -189,7 +189,23 @@ def _find_shim_grub_on_host():
     return None, None, None
 
 
-def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
+def _get_device_uuid(device_path):
+    """Return UUID of a block device (e.g. /dev/sda2)."""
+    if not device_path or not os.path.exists(device_path):
+        return None
+    try:
+        r = subprocess.run(
+            ["blkid", "-o", "value", "-s", "UUID", device_path],
+            capture_output=True, text=True, check=False, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
     """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
     signed shim+grub from host, stub grub.cfg on ESP.
     Mounts the target ESP to a private temp dir so we always write to the correct partition."""
@@ -251,14 +267,20 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
             return False, err or "Failed to copy shim to EFI/BOOT", None
 
-        root_uuid = _get_root_uuid(target_root)
-        if not root_uuid:
+        # When boot_partition_device given (separate /boot), use its UUID so GRUB reads from /boot partition
+        if boot_partition_device:
+            uuid = _get_device_uuid(boot_partition_device)
+            prefix_path = "/grub2"  # /boot partition root has grub2/
+        else:
+            uuid = _get_root_uuid(target_root)
+            prefix_path = "/boot/grub2"
+        if not uuid:
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
-            return False, "Could not determine root filesystem UUID for GRUB stub.", None
+            return False, "Could not determine UUID for GRUB stub (root or boot partition).", None
 
         stub_cfg = (
-            "search.fs_uuid %s root\nset prefix=($root)/boot/grub2\nconfigfile $prefix/grub.cfg\n"
-            % root_uuid
+            "search.fs_uuid %s root\nset prefix=($root)%s\nconfigfile $prefix/grub.cfg\n"
+            % (uuid, prefix_path)
         )
         efi_grub_cfg = os.path.join(efi_dir, "grub.cfg")
         if not _write_file_as_root(efi_grub_cfg, stub_cfg, progress_callback):
@@ -430,7 +452,7 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
     return False, "GRUB config missing or too small after grub2-mkconfig; fallback failed: %s" % err2
 
 
-def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None):
+def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
     """
     Install bootloader for target: UEFI (with Secure Boot support) or legacy BIOS.
     Works with dnf-based systems. Returns (success, error_msg, verification_dict or None).
@@ -444,7 +466,10 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
 
     efi_install_id = BOOTLOADER_ID
     if uefi:
-        ok, err, efi_install_id = _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback)
+        ok, err, efi_install_id = _install_uefi_bootloader(
+            target_root, primary_disk, efi_partition_device, progress_callback,
+            boot_partition_device=boot_partition_device
+        )
         if efi_install_id is None:
             efi_install_id = BOOTLOADER_ID
     else:

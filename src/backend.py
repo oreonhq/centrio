@@ -124,6 +124,63 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         return False, err, stdout_output.strip()
 
 
+def create_btrfs_subvolumes(root_device, progress_callback=None):
+    """Create a single root subvolume on a BTRFS device for snapper rollback.
+    /home is a directory on root (no second mount) so systemd never creates
+    dev-sda3[home].device, which would hang boot.
+    """
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="centrio_btrfs_")
+    try:
+        ok, err, _ = _run_command(["mount", root_device, tmp], "Mount BTRFS for subvolume creation", progress_callback, timeout=30)
+        if not ok:
+            return False, err or "Failed to mount BTRFS device"
+        ok, err, _ = _run_command(["btrfs", "subvolume", "create", os.path.join(tmp, "root")], "Create BTRFS subvolume root", progress_callback, timeout=30)
+        if not ok:
+            _run_command(["umount", tmp], "Unmount BTRFS", progress_callback, timeout=15)
+            return False, err or "Failed to create subvolume root"
+        # Get subvolid of root for set-default (kernel uses default when root mounted without subvol=)
+        root_path = os.path.join(tmp, "root")
+        ok_show, _, stdout_show = _run_command(["btrfs", "subvolume", "show", root_path], "Get root subvolid", progress_callback, timeout=15)
+        subvolid = None
+        if ok_show and stdout_show:
+            for line in stdout_show.strip().splitlines():
+                if "ubvol" in line.lower() and "ID" in line:
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        subvolid = parts[-1].strip()
+                        break
+        if not subvolid:
+            ok_list, _, stdout_list = _run_command(["btrfs", "subvolume", "list", tmp], "List BTRFS subvolumes (fallback)", progress_callback, timeout=15)
+            if ok_list and stdout_list:
+                for line in stdout_list.strip().splitlines():
+                    if " path root" in line or line.rstrip().endswith(" root"):
+                        parts = line.split()
+                        for i, p in enumerate(parts):
+                            if p == "ID" and i + 1 < len(parts):
+                                subvolid = parts[i + 1]
+                                break
+                        if subvolid:
+                            break
+        if subvolid:
+            ok, err, _ = _run_command(["btrfs", "subvolume", "set-default", subvolid, tmp], "Set default subvolume to root", progress_callback, timeout=15)
+            if not ok:
+                _run_command(["umount", tmp], "Unmount BTRFS", progress_callback, timeout=15)
+                return False, err or "btrfs subvolume set-default failed (required for GRUB to find /boot)"
+        else:
+            _run_command(["umount", tmp], "Unmount BTRFS", progress_callback, timeout=15)
+            return False, "Could not determine root subvolid for set-default"
+        _run_command(["umount", tmp], "Unmount BTRFS", progress_callback, timeout=15)
+        return True, ""
+    finally:
+        if os.path.ismount(tmp):
+            _run_command(["umount", tmp], "Unmount BTRFS (cleanup)", progress_callback, timeout=15)
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
 def ensure_directory(path, progress_callback=None):
     """Create directory, using sudo if not root. Use for paths under target_root etc."""
     if os.geteuid() == 0:
@@ -172,11 +229,13 @@ def write_file_as_root(path, content, progress_callback=None):
 
 
 # --- New _run_in_chroot function ---
-def _run_in_chroot(target_root, command_list, description, progress_callback=None, timeout=None, pipe_input=None):
+def _run_in_chroot(target_root, command_list, description, progress_callback=None, timeout=None, pipe_input=None, env_unset=None):
     """Runs a command inside the target root using chroot, managing bind mounts.
     
     Requires manual mounting/unmounting of /proc, /sys, /dev, /dev/pts, and /etc/resolv.conf.
     Assumes the caller (_run_command) handles root privileges.
+    env_unset: optional list of env var names to unset (e.g. ["DBUS_SESSION_BUS_ADDRESS","DBUS_SYSTEM_BUS_ADDRESS"])
+    to avoid D-Bus ServiceUnknown errors when running CLI tools in chroot.
     """
     host_dbus_socket = "/run/dbus/system_bus_socket"
     target_dbus_socket = os.path.join(target_root, host_dbus_socket.lstrip('/'))
@@ -253,20 +312,20 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
         # Refactored structure: (name, source, target, fstype, options_list)
         # resolv.conf: bind host's DNS config so chroot (Flatpak, dnf in chroot) can reach network
         # /tmp: bind host's /tmp so DNF/librepo can create temp files (avoids "mkstemp ... No such file or directory")
+        # /dev must be a bind mount of the host tree so tools like grub2-probe can
+        # see the real block-device nodes inside the chroot.
         host_resolv = "/etc/resolv.conf"
         target_tmp = os.path.join(target_root, "tmp")
         mount_commands = [
             ("proc",    "proc",                mount_points["proc"],        "proc",    ["nodev","noexec","nosuid"]), 
             ("sysfs",   "sys",                 mount_points["sys"],         "sysfs",   ["nodev","noexec","nosuid"]), 
-            ("devtmpfs","udev",               mount_points["dev"],         "devtmpfs",["mode=0755","nosuid"]), 
-            ("devpts",  "devpts",              mount_points["dev/pts"],     "devpts",  ["mode=0620","gid=5","nosuid","noexec"]), 
+            ("dev",     "/dev",                mount_points["dev"],         None,      ["--bind"]),
+            ("devpts",  "/dev/pts",            mount_points["dev/pts"],     None,      ["--bind"]),
             ("resolv",  host_resolv,           mount_points["resolv.conf"],  None,     ["--bind"]),
             ("tmp",     "/tmp",                target_tmp,                  None,     ["--bind"]),
             ("bind",    host_dbus_socket,      mount_points["dbus"],        None,      ["--bind"]),
             # Conditionally add efivars mount
             ("efivars", "efivarfs",            mount_points.get("efivars"), "efivarfs",["nosuid","noexec","nodev"]), # Source is the fstype
-            ("boot",    target_boot_path,      mount_points.get("boot"),      None,      ["--bind"]),
-            ("boot_efi", target_boot_efi_path, mount_points.get("boot_efi"),  None,      ["--bind"])
         ]
 
         for name, source, target, fstype, options_list in mount_commands:
@@ -282,16 +341,6 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
             # Skip efivars mount if target wasn't added (host doesn't have it)
             if name == "efivars" and not target:
                  print(f"  Skipping efivars mount (host path {host_efi_vars_path} not found).")
-                 continue
-                 
-            # Skip boot mount if target wasn't added
-            if name == "boot" and not target:
-                 print(f"  Skipping boot mount (directory {target_boot_path} not found).")
-                 continue
-                 
-            # Skip boot_efi mount if target wasn't added (not mounted)
-            if name == "boot_efi" and not target:
-                 print(f"  Skipping boot_efi mount (EFI partition not mounted or directory not found).")
                  continue
                  
             try:
@@ -352,6 +401,9 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
 
         # --- Execute command in chroot --- 
         chroot_cmd = ["chroot", target_root] + command_list
+        if env_unset:
+            # Wrap with env -u VAR to avoid D-Bus ServiceUnknown (snapper, etc.)
+            chroot_cmd = ["env"] + [x for v in env_unset for x in ("-u", v)] + chroot_cmd
         # Use _run_command to handle execution (it checks root/pkexec itself)
         success, err, stdout = _run_command(chroot_cmd, description, progress_callback, timeout, pipe_input)
         return success, err, stdout
@@ -528,7 +580,7 @@ def create_user_in_container(target_root, user_config, progress_callback=None):
 LIVE_USERNAMES = ["liveuser", "live", "fedora", "gnome"]
 
 
-def remove_live_users_and_configure_oobe(target_root, install_user_created=False, install_username=None, progress_callback=None):
+def remove_live_users_and_configure_oobe(target_root, install_user_created=False, install_username=None, progress_callback=None, btrfs_subvolumes=False):
     """Remove live-environment users from the target and configure first-boot behavior.
 
     - Removes users in LIVE_USERNAMES (e.g. liveuser) so the system does not boot to them.
@@ -786,9 +838,12 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         raise RuntimeError("Could not detect OS VERSION_ID for DNF. Set releasever or fix /etc/os-release.")
     print(f"Using release version: {releasever}")
     
-    # WINE and some desktop integrations rely on post-install scriptlets
-    # only do this when Wine is requested, otherwise keep old behavior.
-    enable_scriptlets = any(p == "wine" or p.startswith("wine-") for p in packages)
+    # WINE and NVIDIA rely on post-install scriptlets for desktop integration
+    enable_scriptlets = any(
+        p == "wine" or p.startswith("wine-")
+        or p.startswith("nvidia-") or p.startswith("kmod-nvidia")
+        for p in packages
+    )
 
     # Build DNF command with package exclusions and speed optimizations
     dnf_cmd = [
@@ -815,7 +870,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
     if not enable_scriptlets:
         dnf_cmd.append("--setopt=tsflags=noscripts")  # Skip problematic scriptlets
     else:
-        print("Wine detected in package set: running DNF with scriptlets enabled.")
+        print("Wine/NVIDIA detected in package set: running DNF with scriptlets enabled.")
     
     if not keep_cache:
         dnf_cmd.append("--setopt=keepcache=0")
@@ -1108,10 +1163,25 @@ def install_packages_dnf(target_root, progress_callback=None):
 # --- Bootloader Installation ---
 # Installation logic is in install_logic.py
 
-def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None):
-    """Installs GRUB2 for UEFI (with Secure Boot) or legacy BIOS. Delegates to install_logic."""
+def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+    """Installs GRUB2 for UEFI (with Secure Boot) or legacy BIOS. Delegates to install_logic.
+    When boot_partition_device is set (separate /boot), GRUB uses that partition for config/kernel."""
     from install_logic import install_bootloader
-    return install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback)
+    return install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback, boot_partition_device)
+
+
+def regenerate_grub_cfg_in_chroot(target_root, progress_callback=None):
+    """Run grub2-mkconfig in chroot so grub-btrfs snapshot entries are in the menu. Call after bootloader install when BTRFS+snapper is used."""
+    _DBUS_UNSET = ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"]
+    ok, err, _ = _run_in_chroot(
+        target_root,
+        ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"],
+        "Regenerate GRUB config (grub-btrfs snapshot entries)",
+        progress_callback,
+        timeout=60,
+        env_unset=_DBUS_UNSET,
+    )
+    return ok, err or "grub2-mkconfig failed"
 
 
 
@@ -1614,8 +1684,8 @@ def copy_live_environment(target_root, progress_callback=None):
     ]
     
     # Live image files to never copy (squashfs/erofs/rootfs.img etc.)
+    # Do NOT use "*.img" - it would exclude initramfs-*.img from /boot
     exclude_patterns = [
-        "*.img",
         "squashfs*.img",
         "erofs*.img",
         "squash-root.img",
@@ -1698,8 +1768,9 @@ def copy_live_environment(target_root, progress_callback=None):
             # Use find to copy all files and directories from source to destination
             # This avoids the "copy into itself" issue
             # Use rsync when available for robust copying with symlink handling and filesystem boundary constraints.
-            # --no-xattrs: avoid copying extended attributes (e.g. security.selinux); target may be vfat (EFI) or
-            #              other fs that don't support xattrs, which causes "operation not supported" and transfer errors.
+            # Keep xattrs/ACLs so SELinux labels survive the copy.
+            # /boot/efi is a separate filesystem and excluded by --one-file-system,
+            # so unsupported xattrs on vfat are not part of this transfer.
             rsync_path = shutil.which("rsync")
             if not rsync_path:
                 return False, "rsync is required for live environment copy. Install rsync."
@@ -1707,8 +1778,6 @@ def copy_live_environment(target_root, progress_callback=None):
                 rsync_path,
                 "-aHAXS",
                 "--one-file-system",
-                "--no-xattrs",
-                "--no-acls",
                 "--inplace",       # Write in-place, avoid temp files
                 "-W",              # Whole-file transfer (skip delta calc for local)
                 "--omit-dir-times", # Skip mtime on dirs (minor speedup)
@@ -1748,7 +1817,7 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False):
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -1799,63 +1868,56 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
         except Exception as e2:
             print(f"Warning: Fallback machine-id also failed: {e2}")
     
-    # SELinux: copy uses --no-xattrs so target has no labels. Relabel during install so we can use enforcing.
+    # SELinux strict handling (Anaconda-like):
+    # 1) Full offline relabel of target root must succeed.
+    # 2) Persist SELINUX=enforcing.
     try:
-        ok, _, _ = _run_in_chroot(
-            target_root,
-            ["restorecon", "-Rv", "-e", "/tmp", "-e", "/var/tmp", "-e", "/var/cache", "-e", "/var/log", "/"],
-            "SELinux relabel", progress_callback, timeout=600
+        file_contexts = os.path.join(target_root, "etc/selinux/targeted/contexts/files/file_contexts")
+        if not os.path.exists(file_contexts):
+            file_contexts = os.path.join(target_root, "etc/selinux/contexts/files/file_contexts")
+        if not os.path.exists(file_contexts):
+            return False, "SELinux file_contexts not found in target root"
+        ok, err, _ = _run_command(
+            ["setfiles", "-F", "-r", target_root, file_contexts, target_root],
+            "SELinux full relabel (setfiles)", progress_callback, timeout=3600
         )
-        if ok:
-            print("SELinux relabel completed")
-        else:
-            print("Warning: restorecon may have failed; creating /.autorelabel for first boot fallback")
-            write_file_as_root(os.path.join(target_root, ".autorelabel"), "", progress_callback)
+        if not ok:
+            return False, err or "SELinux full relabel failed"
+        print("SELinux full relabel completed")
     except Exception as e:
-        print(f"Warning: SELinux relabel failed: {e}; creating /.autorelabel")
-        write_file_as_root(os.path.join(target_root, ".autorelabel"), "", progress_callback)
-    # First boot in permissive so systemd can complete (/dev and /run get correct labels at runtime).
-    # A first-boot oneshot will relabel, set enforcing, then reboot; second boot is enforcing.
+        return False, f"SELinux full relabel failed: {e}"
+
+    # SELinux config handling
     selinux_config = os.path.join(target_root, "etc/selinux/config")
     ok_cat, _, content = _run_command(["cat", selinux_config], "Read SELinux config", progress_callback, timeout=5)
     if ok_cat:
         content = content or ""
     else:
         content = ""
-    content = re.sub(r"^SELINUX=.*", "SELINUX=permissive", content, flags=re.MULTILINE)
+    content = re.sub(r"^SELINUX=.*", "SELINUX=enforcing", content, flags=re.MULTILINE)
     if "SELINUX=" not in content:
-        content = "SELINUX=permissive\n" + content
+        content = "SELINUX=enforcing\n" + content
     if write_file_as_root(selinux_config, content, progress_callback):
-        print("Set SELINUX=permissive for first boot in /etc/selinux/config")
+        print("Set SELINUX=enforcing in /etc/selinux/config")
 
-    # First-boot oneshot: run when marker exists; relabel, switch to enforcing, remove marker, reboot.
-    # Marker file ensures the service runs (ConditionFirstBoot can be unreliable); removing it before reboot means one-shot.
-    firstboot_unit = os.path.join(target_root, "etc/systemd/system/centrio-selinux-firstboot.service")
-    firstboot_marker = os.path.join(target_root, "etc/centrio-selinux-firstboot")
-    firstboot_marker_chroot = "/etc/centrio-selinux-firstboot"
-    unit_content = """[Unit]
-Description=Centrio first boot: relabel SELinux and switch to enforcing
-ConditionPathExists=""" + firstboot_marker_chroot + """
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/restorecon -Rv /
-ExecStart=/bin/sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
-ExecStart=/bin/rm -f /.autorelabel
-ExecStart=/bin/rm -f """ + firstboot_marker_chroot + """
-ExecStart=/usr/bin/systemctl reboot
-
-[Install]
-WantedBy=multi-user.target
-"""
-    if write_file_as_root(firstboot_marker, "", progress_callback) and write_file_as_root(firstboot_unit, unit_content, progress_callback):
-        wants_dir = os.path.join(target_root, "etc/systemd/system/multi-user.target.wants")
-        want_link = os.path.join(wants_dir, "centrio-selinux-firstboot.service")
-        ensure_directory(wants_dir, progress_callback)
-        _run_command(["rm", "-f", want_link], "Remove old firstboot link", progress_callback, timeout=5)
-        ok_ln, _, _ = _run_command(["ln", "-sf", "../centrio-selinux-firstboot.service", want_link], "Enable firstboot service", progress_callback, timeout=5)
-        if ok_ln:
-            print("Installed and enabled centrio-selinux-firstboot.service (marker: %s)" % firstboot_marker_chroot)
+    # Cleanup legacy runtime SELinux transition artifacts from older installer behavior.
+    legacy_paths = [
+        os.path.join(target_root, "etc/centrio-selinux-firstboot"),
+        os.path.join(target_root, "etc/systemd/system/centrio-selinux-firstboot.service"),
+        os.path.join(target_root, "etc/systemd/system/multi-user.target.wants/centrio-selinux-firstboot.service"),
+        os.path.join(target_root, "etc/centrio-selinux-enforce-now"),
+        os.path.join(target_root, "etc/systemd/system/centrio-selinux-enforce-now.service"),
+        os.path.join(target_root, "etc/systemd/system/centrio-selinux-enforce-now.timer"),
+        os.path.join(target_root, "etc/systemd/system/timers.target.wants/centrio-selinux-enforce-now.timer"),
+        os.path.join(target_root, "etc/systemd/system/graphical.target.wants/centrio-selinux-enforce-now.service"),
+    ]
+    for p in legacy_paths:
+        try:
+            if os.path.lexists(p):
+                os.remove(p)
+                print(f"Removed legacy SELinux transition artifact: {p}")
+        except Exception as e:
+            print(f"Warning: Could not remove legacy SELinux transition artifact {p}: {e}")
 
     # Clear systemd random seed
     random_seed_path = os.path.join(target_root, "var/lib/systemd/random-seed")
@@ -2023,12 +2085,25 @@ GRUB_ENABLE_BLSCFG=true
                         try:
                             new_lines = []
                             for line in content.splitlines():
+                                if btrfs_subvolumes and (line.startswith("linux ") or line.startswith("initrd ")):
+                                    # Separate /boot: GRUB root is /boot partition; paths need leading /
+                                    # /boot/vmlinuz-xxx -> /vmlinuz-xxx (partition root = /boot)
+                                    idx = 6 if line.startswith("linux ") else 7
+                                    rest = line[idx:].lstrip()
+                                    if rest.startswith("/boot/"):
+                                        line = line[:idx] + "/" + rest[6:]
                                 if line.startswith("options "):
                                     opts = line[8:]  # strip "options "
                                     opts = rd_lvm_re.sub("", opts)  # remove rd.lvm.lv=oreon/root etc
                                     opts = root_uuid_re.sub("", opts)  # remove old root=
                                     opts = resume_re.sub("", opts)  # remove resume= (live's swap UUID; installed system differs)
-                                    opts = rootflags_subvol_re.sub("", opts)  # remove rootflags=subvol=root (live BTRFS; we use plain btrfs)
+                                    if not btrfs_subvolumes:
+                                        opts = rootflags_subvol_re.sub("", opts)  # remove rootflags (live BTRFS; plain install has no subvols)
+                                    else:
+                                        opts = rootflags_subvol_re.sub("", opts)  # remove live's rootflags first
+                                        opts = opts.strip()
+                                        if "rootflags=" not in opts:
+                                            opts = (opts + " rootflags=subvol=root").strip()  # Fedora-style root subvolume
                                     opts = opts.strip()
                                     add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
                                     for p in add:
@@ -2044,38 +2119,30 @@ GRUB_ENABLE_BLSCFG=true
         except Exception as e:
             print(f"Warning: Could not fix BLS boot entries: {e}")
 
-    # --- aarch64: regenerate initramfs (Bug 1686326 - host-only initramfs can lack drivers) ---
+    # --- Regenerate initramfs for all architectures (required for SELinux+boot correctness) ---
+    if progress_callback:
+        progress_callback("Regenerating initramfs...", None)
     arch = get_host_architecture()
     if arch["arch"] == "aarch64":
-        if progress_callback:
-            progress_callback("Regenerating initramfs for aarch64...", None)
-        kver = None
-        modules_dir = os.path.join(target_root, "lib", "modules")
-        if os.path.isdir(modules_dir):
-            for name in sorted(os.listdir(modules_dir), reverse=True):
-                if not name.startswith(".") and os.path.isdir(os.path.join(modules_dir, name)):
-                    kver = name
-                    break
-        dracut_cmd = ["dracut", "--force", "--no-hostonly", "-v"]
-        if kver:
-            dracut_cmd.extend(["--kver", kver])
-            print(f"Using kernel version for dracut: {kver}")
-        try:
-            ok, err, _ = _run_in_chroot(
-                target_root,
-                dracut_cmd,
-                "Regenerate initramfs (aarch64)",
-                progress_callback,
-                timeout=240
-            )
-            if ok:
-                print("Regenerated initramfs for aarch64.")
-            else:
-                print(f"ERROR: aarch64 dracut regeneration failed: {err}")
-                return False, f"aarch64 initramfs regeneration failed (required for boot): {err}"
-        except Exception as e:
-            print(f"ERROR: aarch64 dracut regeneration failed: {e}")
-            return False, f"aarch64 initramfs regeneration failed: {e}"
+        dracut_cmd = ["dracut", "--regenerate-all", "--force", "--no-hostonly", "-v"]
+    else:
+        dracut_cmd = ["dracut", "--regenerate-all", "--force", "-v"]
+    try:
+        ok, err, _ = _run_in_chroot(
+            target_root,
+            dracut_cmd,
+            "Regenerate initramfs",
+            progress_callback,
+            timeout=600
+        )
+        if ok:
+            print("Regenerated initramfs.")
+        else:
+            print(f"ERROR: initramfs regeneration failed: {err}")
+            return False, f"initramfs regeneration failed (required for boot): {err}"
+    except Exception as e:
+        print(f"ERROR: initramfs regeneration failed: {e}")
+        return False, f"initramfs regeneration failed (required for boot): {e}"
 
     # --- Server install: remove GNOME/desktop packages ---
     if server_install:
@@ -2154,9 +2221,9 @@ def generate_fstab_for_target(target_root, progress_callback=None):
         fstab_path = os.path.join(target_root, "etc/fstab")
         print(f"Generating fstab at {fstab_path} ...")
 
-        # Query all mounts under target_root
+        # Query all mounts under target_root (include submounts for /boot, /boot/efi)
         findmnt_cmd = [
-            "findmnt", "-rn", "-o", "SOURCE,TARGET,FSTYPE,OPTIONS", f"--target={target_root}"
+            "findmnt", "-rn", "--submounts", "-o", "SOURCE,TARGET,FSTYPE,OPTIONS", f"--target={target_root}"
         ]
         result = subprocess.run(findmnt_cmd, capture_output=True, text=True, check=False, timeout=10)
         if result.returncode != 0 or not result.stdout.strip():
@@ -2167,7 +2234,6 @@ def generate_fstab_for_target(target_root, progress_callback=None):
             try:
                 source, target, fstype, options = (field.strip() for field in line.split())
             except ValueError:
-                # Some fields might contain spaces; use a more robust split
                 parts = line.split()
                 if len(parts) < 3:
                     continue
@@ -2176,16 +2242,10 @@ def generate_fstab_for_target(target_root, progress_callback=None):
 
             if not target.startswith(target_root.rstrip("/")):
                 continue
-
-            # Translate host mount path to target path (strip target_root prefix)
             rel_mount = target[len(target_root):] or "/"
-
-            # Skip pseudo filesystems
             if fstype in {"proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "efivarfs"}:
                 continue
 
-            # Resolve UUID for block devices only
-            mount_device = source
             uuid = None
             if source.startswith("/dev/"):
                 try:
@@ -2195,16 +2255,15 @@ def generate_fstab_for_target(target_root, progress_callback=None):
                         uuid = uuid_res.stdout.strip()
                 except Exception as e:
                     print(f"Warning: blkid failed for {source}: {e}")
+            device_field = f"UUID={uuid}" if uuid else source
 
-            if uuid:
-                device_field = f"UUID={uuid}"
-            else:
-                device_field = mount_device
-
-            # Choose safe default options
             if fstype == "vfat":
                 opts = "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro"
                 dump_pass = "0 2"
+            elif fstype == "btrfs" and options and "subvol=" in options:
+                opts = options
+                opts = re.sub(r"\bsubvol=/root\b", "subvol=root", opts)
+                dump_pass = "0 1" if rel_mount == "/" else "0 2"
             else:
                 opts = "rw,relatime"
                 dump_pass = "0 1" if rel_mount == "/" else "0 2"
@@ -2279,7 +2338,7 @@ def install_packages_on_live_copy(target_root, package_config, progress_callback
     print(f"Flatpak enabled: {flatpak_enabled}")
     print(f"Flatpak packages to install: {len(flatpak_packages)}")
     
-    # --- Setup Additional Repositories First ---
+    btrfs_subvolumes = package_config.get("btrfs_subvolumes", False)
     if repositories:
         if progress_callback:
             progress_callback("Setting up additional repositories...", 0.1)
@@ -2297,6 +2356,168 @@ def install_packages_on_live_copy(target_root, package_config, progress_callback
         success, err = _install_packages_dnf_impl(target_root, packages, progress_callback, keep_cache=True)
         if not success:
             return False, err
+
+    # --- BTRFS Snapper setup (when root subvolume used) ---
+    if btrfs_subvolumes:
+        if progress_callback:
+            progress_callback("Configuring snapper for BTRFS rollback...", 0.35)
+        ok_rpm, _, _ = _run_command(
+            ["rpm", "-q", "snapper", f"--root={target_root}"],
+            "Check if snapper installed", progress_callback, timeout=5
+        )
+        if not ok_rpm:
+            return False, "BTRFS snapshots selected but snapper is not installed. Enable network so snapper can be installed."
+        _DBUS_UNSET = ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"]
+        ok, err, _ = _run_in_chroot(target_root, ["snapper", "--no-dbus", "-c", "root", "create-config", "/"],
+                                    "Create snapper config for root", progress_callback, timeout=30,
+                                    env_unset=_DBUS_UNSET)
+        if not ok:
+            return False, err or "snapper create-config failed (required for BTRFS rollback)."
+        print("Snapper config 'root' created successfully.")
+        # Auto-configure: timeline snapshots + cleanup
+        snapper_settings = [
+            ("TIMELINE_CREATE", "yes"),
+            ("TIMELINE_CLEANUP", "yes"),
+            ("TIMELINE_LIMIT_HOURLY", "10"),
+            ("TIMELINE_LIMIT_DAILY", "10"),
+            ("TIMELINE_LIMIT_MONTHLY", "10"),
+            ("TIMELINE_LIMIT_YEARLY", "10"),
+            ("NUMBER_CLEANUP", "yes"),
+            ("NUMBER_LIMIT", "50"),
+        ]
+        for key, val in snapper_settings:
+            _run_in_chroot(target_root, ["snapper", "--no-dbus", "-c", "root", "set-config", key, val],
+                           f"Snapper set-config {key}", progress_callback, timeout=10, env_unset=_DBUS_UNSET)
+        # Enable timeline (hourly) and cleanup (daily) timers for the installed system
+        for timer in ["snapper-timeline.timer", "snapper-cleanup.timer"]:
+            _run_in_chroot(target_root, ["systemctl", "enable", timer],
+                           f"Enable {timer}", progress_callback, timeout=10, env_unset=_DBUS_UNSET)
+        # Fedora/RHEL-compatible grub-btrfs config.
+        # Upstream defaults assume /boot/grub, but Fedora uses /boot/grub2.
+        grub_btrfs_cfg_dir = os.path.join(target_root, "etc/default/grub-btrfs")
+        grub_btrfs_cfg = os.path.join(grub_btrfs_cfg_dir, "config")
+        grub_btrfs_cfg_content = """GRUB_BTRFS_DISABLE=false
+GRUB_BTRFS_GRUB_DIRNAME=\"/boot/grub2\"
+GRUB_BTRFS_GBTRFS_DIRNAME=\"/boot/grub2\"
+GRUB_BTRFS_MKCONFIG=/sbin/grub2-mkconfig
+GRUB_BTRFS_SCRIPT_CHECK=grub2-script-check
+GRUB_BTRFS_SNAPSHOT_KERNEL_PARAMETERS=\"systemd.volatile=state\"
+"""
+        ensure_directory(grub_btrfs_cfg_dir, progress_callback)
+        write_file_as_root(grub_btrfs_cfg, grub_btrfs_cfg_content, progress_callback)
+
+        # Remove our old custom 09_centrio_snapshots script if it exists from a previous install
+        # attempt. It causes a duplicate submenu alongside the one 41_snapshots-btrfs generates.
+        for stale_menu in [
+            os.path.join(target_root, "etc/grub.d/09_centrio_snapshots"),
+        ]:
+            try:
+                if os.path.lexists(stale_menu):
+                    os.remove(stale_menu)
+                    print(f"Removed stale custom GRUB menu script: {stale_menu}")
+            except Exception as e:
+                print(f"Warning: Could not remove stale custom GRUB menu script {stale_menu}: {e}")
+
+        # Enable grub-btrfsd so GRUB menu is updated when new snapshots are created.
+        ok_41, _, _ = _run_in_chroot(target_root, ["test", "-x", "/etc/grub.d/41_snapshots-btrfs"],
+                                     "Check grub-btrfs script", progress_callback, timeout=5, env_unset=_DBUS_UNSET)
+        if not ok_41:
+            return False, "grub-btrfs integration missing: /etc/grub.d/41_snapshots-btrfs not found/executable."
+        ok_inotify, _, _ = _run_in_chroot(target_root, ["test", "-x", "/usr/bin/inotifywait"],
+                                          "Check inotify-tools for grub-btrfsd", progress_callback, timeout=5, env_unset=_DBUS_UNSET)
+        if not ok_inotify:
+            return False, "inotify-tools (inotifywait) missing; grub-btrfsd cannot watch snapshot changes."
+
+        ok_d, err_d, _ = _run_in_chroot(target_root, ["systemctl", "enable", "grub-btrfsd.service"],
+                                        "Enable grub-btrfsd for snapshot menu updates", progress_callback, timeout=10,
+                                        env_unset=_DBUS_UNSET)
+        if not ok_d:
+            return False, err_d or "grub-btrfsd.service not available; automatic GRUB snapshot updates cannot be enabled."
+
+        # Create a clean post-install snapshot BEFORE running grub2-mkconfig.
+        # grub2-mkconfig runs 41_snapshots-btrfs; that script only writes the submenu to grub.cfg
+        # when at least one snapshot exists. Without this, the submenu is absent on first boot and
+        # grub-btrfsd has nothing to load entries into until grub2-mkconfig is run again manually.
+        ok_snap, err_snap, _ = _run_in_chroot(
+            target_root,
+            ["snapper", "--no-dbus", "-c", "root", "create", "-t", "single",
+             "-d", "Centrio post-install"],
+            "Create post-install snapshot",
+            progress_callback,
+            timeout=30,
+            env_unset=_DBUS_UNSET,
+        )
+        if not ok_snap:
+            return False, err_snap or "Failed to create post-install snapshot required for initial GRUB snapshots menu."
+
+        # Initial grub2-mkconfig: now that a snapshot exists, 41_snapshots-btrfs will write
+        # the submenu stanza AND grub-btrfs.cfg so the menu is present on first boot.
+        ok_g, err_g, _ = _run_in_chroot(
+            target_root,
+            ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"],
+            "Initial GRUB refresh for snapshot submenu",
+            progress_callback,
+            timeout=120,
+            env_unset=_DBUS_UNSET
+        )
+        if not ok_g:
+            return False, err_g or "Initial GRUB refresh failed after grub-btrfs setup."
+        ok_menu_ref, _, _ = _run_in_chroot(
+            target_root,
+            ["grep", "-q", "grub-btrfs.cfg", "/boot/grub2/grub.cfg"],
+            "Verify snapshots submenu reference in grub.cfg",
+            progress_callback,
+            timeout=10,
+            env_unset=_DBUS_UNSET,
+        )
+        if not ok_menu_ref:
+            return False, "GRUB was generated without a grub-btrfs submenu reference; snapshots would not appear in the boot menu."
+
+        # Remove custom snapshot refresh units from older installer revisions.
+        for stale in [
+            os.path.join(target_root, "etc/systemd/system/centrio-grub-snapshots-refresh.service"),
+            os.path.join(target_root, "etc/systemd/system/centrio-grub-snapshots-refresh.path"),
+            os.path.join(target_root, "etc/systemd/system/multi-user.target.wants/centrio-grub-snapshots-refresh.path"),
+        ]:
+            try:
+                if os.path.lexists(stale):
+                    os.remove(stale)
+                    print(f"Removed stale custom GRUB snapshot refresh unit: {stale}")
+            except Exception as e:
+                print(f"Warning: Could not remove stale custom GRUB snapshot refresh unit {stale}: {e}")
+    # --- NVIDIA Drivers (x86_64 only; uses official NVIDIA repo, scriptlets enabled) ---
+    nvidia_drivers = package_config.get("nvidia_drivers", False)
+    arch = get_host_architecture()
+    if nvidia_drivers and arch["arch"] == "x86_64":
+        if progress_callback:
+            progress_callback("Setting up NVIDIA driver repository...", 0.5)
+        nvidia_repo_url = "https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64"
+        nvidia_repo_path = os.path.join(target_root, "etc/yum.repos.d/cuda-x86_64.repo")
+        try:
+            os.makedirs(os.path.dirname(nvidia_repo_path), exist_ok=True)
+            repo_content = f"""[cuda-x86_64]
+name=NVIDIA CUDA
+baseurl={nvidia_repo_url}
+enabled=1
+gpgcheck=0
+"""
+            if not write_file_as_root(nvidia_repo_path, repo_content, progress_callback):
+                print(f"Warning: Failed to write NVIDIA repo file {nvidia_repo_path}")
+            else:
+                print(f"Added NVIDIA CUDA repository: {nvidia_repo_url}")
+        except Exception as e:
+            print(f"Warning: Failed to add NVIDIA repo: {e}")
+        nvidia_pkgs = [
+            "nvidia-driver", "kmod-nvidia-latest-dkms", "nvidia-driver-libs",
+            "nvidia-driver-cuda-libs", "nvidia-modprobe", "nvidia-persistenced",
+            "nvidia-kmod-common"
+        ]
+        if progress_callback:
+            progress_callback("Installing NVIDIA drivers (scriptlets enabled)...", 0.55)
+        success, err = _install_packages_dnf_impl(target_root, nvidia_pkgs, progress_callback, keep_cache=True)
+        if not success:
+            print(f"Warning: NVIDIA driver installation failed: {err}")
+            # Non-fatal; base system is already installed
     
     # --- Setup Flatpak if enabled ---
     if flatpak_enabled:

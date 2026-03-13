@@ -425,6 +425,21 @@ class ProgressPage(Gtk.Box):
                 print(f"  Partition {device} verified successfully")
             
             print("All partitions verified successfully")
+
+            # --- BTRFS subvolumes (for snapper rollback) ---
+            btrfs_subvolumes = disk_config.get("btrfs_subvolumes", False)
+            filesystem = disk_config.get("filesystem", "ext4")
+            if btrfs_subvolumes and filesystem == "btrfs" and partitions:
+                root_part = next((p for p in partitions if p.get("mountpoint") == "/"), None)
+                if root_part:
+                    root_device = root_part.get("device")
+                    if root_device and os.path.exists(root_device):
+                        self._update_progress_text("Creating BTRFS root subvolume...", 0.315)
+                        success, err = backend.create_btrfs_subvolumes(root_device, self._update_progress_text)
+                        if not success:
+                            self.installation_error = err or "Failed to create BTRFS subvolume"
+                            return False
+                        print("BTRFS root subvolume created (/home on root, no second mount).")
             
         elif not automatic_mode:
             print("Manual partitioning selected. Skipping wipefs/parted/mkfs commands.")
@@ -462,9 +477,14 @@ class ProgressPage(Gtk.Box):
         mount_progress_start = 0.3
         mount_progress_end = 0.35
         
-        # Corrected sort order: Mount / first, then others like /boot/efi
-        # Assign lower number to / mountpoint for sorting
-        sorted_partitions = sorted(partitions, key=lambda p: 0 if p.get("mountpoint") == "/" else (1 if p.get("mountpoint") == "/boot/efi" else 2))
+        # Mount order: / first, then /boot (so target_root/boot exists), then /boot/efi
+        def _mount_order(p):
+            mp = p.get("mountpoint", "")
+            if mp == "/": return 0
+            if mp == "/boot": return 1
+            if mp == "/boot/efi": return 2
+            return 3
+        sorted_partitions = sorted(partitions, key=_mount_order)
         
         print(f"Mount order determined: {[p.get('mountpoint') for p in sorted_partitions]}")
         
@@ -497,6 +517,8 @@ class ProgressPage(Gtk.Box):
             if fstype == "vfat":
                  # Add common options for FAT filesystems like EFI
                  mount_cmd = ["mount", "-o", "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro", device, full_mount_path]
+            elif fstype == "btrfs" and mountpoint == "/" and disk_config.get("btrfs_subvolumes", False):
+                 mount_cmd = ["mount", "-o", "subvol=root", device, full_mount_path]
             else:
                  mount_cmd = ["mount", device, full_mount_path]
                  
@@ -612,6 +634,14 @@ class ProgressPage(Gtk.Box):
                  self._attempt_unmount()
                  return False
 
+        # BTRFS with single root subvolume: /home is a directory on root (no second mount → no dev-sda3[home].device hang)
+        if disk_config.get("btrfs_subvolumes", False):
+            home_dir = os.path.join(self.target_root, "home")
+            if not backend.ensure_directory(home_dir):
+                self.installation_error = f"Failed to create {home_dir}"
+                self._attempt_unmount()
+                return False
+
         self._update_progress_text("Filesystems mounted successfully.", mount_progress_end)
         return True
 
@@ -641,6 +671,8 @@ class ProgressPage(Gtk.Box):
         
         payload_config = config_data.get('payload', {})
         network_config = config_data.get('network', {})
+        disk_config = config_data.get('disk', {})
+        btrfs_subvolumes = disk_config.get('btrfs_subvolumes', False)
         
         print("Using live environment copy method...")
         self._update_progress_text("Starting live environment copy (This is much faster than package installation)...", 0.35)
@@ -663,7 +695,8 @@ class ProgressPage(Gtk.Box):
         success, err = backend.setup_live_environment_post_copy(
             self.target_root,
             progress_callback=setup_cb,
-            server_install=server_install
+            server_install=server_install,
+            btrfs_subvolumes=btrfs_subvolumes,
         )
         
         if not success:
@@ -693,7 +726,8 @@ class ProgressPage(Gtk.Box):
             "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "centrio-installer"
         ])
         extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
-        has_extra_work = bool(extra_packages or repositories or flatpak_enabled or flatpak_packages)
+        # BTRFS snapper packages need DNF when subvolumes enabled
+        has_extra_work = bool(extra_packages or repositories or flatpak_enabled or flatpak_packages or btrfs_subvolumes)
         
         print(f"Additional packages check:")
         print(f"  packages (extra only): {extra_packages}")
@@ -736,15 +770,17 @@ class ProgressPage(Gtk.Box):
                 print("ERROR: Connectivity unavailable while additional software was selected.")
                 return False
             self._update_progress_text("Installing additional packages on live environment...", 0.68)
+            snapper_packages = ["snapper", "python3-dnf-plugin-snapper", "grub-btrfs", "inotify-tools"] if btrfs_subvolumes else []
             package_config = {
-                "packages": extra_packages,
+                "packages": extra_packages + snapper_packages,
                 "repositories": repositories,
                 "flatpak_enabled": flatpak_enabled,
                 "flatpak_packages": flatpak_packages,
                 "nvidia_drivers": payload_config.get("nvidia_drivers", False),
                 "server_install": payload_config.get("server_install", False),
                 "minimal_install": False,
-                "keep_cache": True
+                "keep_cache": True,
+                "btrfs_subvolumes": btrfs_subvolumes,
             }
             # Map backend 0-1 to step band 0.68-0.75
             pkg_cb = self._scaled_progress_callback(0.68, 0.75)
@@ -821,12 +857,15 @@ class ProgressPage(Gtk.Box):
             return False
         install_user_created = False  # OOBE handles user creation
         username = None
+        disk_config = config_data.get("disk", {})
+        btrfs_subvolumes = disk_config.get("btrfs_subvolumes", False)
         self._update_progress_text("Removing live users and configuring first boot...", 0.85)
         success, err = backend.remove_live_users_and_configure_oobe(
             self.target_root,
             install_user_created=install_user_created,
             install_username=username,
             progress_callback=self._update_progress_text,
+            btrfs_subvolumes=btrfs_subvolumes,
         )
         if not success:
             self.installation_error = err or "Failed to remove live users / configure OOBE"
@@ -860,15 +899,18 @@ class ProgressPage(Gtk.Box):
             self._update_progress_text("Bootloader installation skipped.", 0.97)
             return True
 
-        # Determine primary disk and EFI partition (if exists)
+        # Determine primary disk, EFI partition, and boot partition (when separate /boot)
         primary_disk = disk_config.get('target_disks', [None])[0]
         efi_partition_device = None
+        boot_partition_device = None
         partitions = disk_config.get('partitions', [])
         for part in partitions:
             if part.get('mountpoint') == '/boot/efi':
                 efi_partition_device = part.get('device')
                 print(f"Found EFI partition device: {efi_partition_device}")
-                break
+            elif part.get('mountpoint') == '/boot':
+                boot_partition_device = part.get('device')
+                print(f"Found separate /boot partition: {boot_partition_device}")
         
         if not primary_disk:
              self.installation_error = "Cannot determine target disk for bootloader installation."
@@ -882,7 +924,8 @@ class ProgressPage(Gtk.Box):
             self.target_root,
             primary_disk,
             efi_partition_device,
-            progress_callback=boot_cb
+            progress_callback=boot_cb,
+            boot_partition_device=boot_partition_device,
         )
         if success:
             self._update_progress_text("Bootloader installed.", 0.97)

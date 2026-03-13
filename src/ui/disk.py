@@ -33,81 +33,110 @@ def generate_wipefs_command(disk_path):
     """Generates the wipefs command for a disk."""
     return ["wipefs", "-a", disk_path]
 
-def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="btrfs", dual_boot=False, preserve_efi=False, bios_mode=False):
+def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="btrfs", dual_boot=False, preserve_efi=False, bios_mode=False, btrfs_subvolumes=False):
     """Generates parted commands for GPT layout.
-    - UEFI (bios_mode=False): creates EFI System Partition + root
-    - BIOS (bios_mode=True): creates BIOS Boot Partition + root
+    - UEFI (bios_mode=False): creates EFI System Partition + [optional /boot] + root
+    - BIOS (bios_mode=True): creates BIOS Boot Partition + [optional /boot] + root
+    - When btrfs_subvolumes: add separate ext4 /boot so GRUB can read kernel (GRUB can't read BTRFS subvols)
     """
     commands = []
     if not disk_path:
         print("ERROR: generate_gpt_commands called without disk_path")
         return []
 
-    # Define partition start and end points
     first_start = "1MiB"
+    boot_size_mb = 1024  # 1GB for /boot when separate
     if bios_mode:
-        bios_end = "3MiB"  # ~2MiB bios_grub region is sufficient
+        bios_end = "3MiB"
+        boot_start = "4MiB"
+        boot_end = f"{4 + boot_size_mb}MiB"
+        root_start = boot_end
+        root_end = "100%"
     else:
         efi_end = f"{efi_size_mb + 1}MiB"
-    
-    # Layout decisions
-    if bios_mode:
-        # BIOS on GPT requires a bios_grub partition for core.img embedding
-        # Make it 4 MiB to satisfy alignment and tool thresholds
-        root_start = "4MiB"
+        boot_start = efi_end
+        boot_end = f"{efi_size_mb + 1 + boot_size_mb}MiB"
+        root_start = boot_end
         root_end = "100%"
+
+    if dual_boot and preserve_efi and not bios_mode:
+        region = get_free_space_region(disk_path)
+        if not region:
+            print("ERROR: Dual boot requires free space but none found on disk.")
+            return []
+        root_start, root_end = region
+        commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
+        return commands
+
+    if bios_mode:
         commands.append(["parted", "-s", disk_path, "mklabel", "gpt"])
         commands.append(["parted", "-s", disk_path, "mkpart", "\"BIOS boot\"", "", first_start, bios_end])
         commands.append(["parted", "-s", disk_path, "set", "1", "bios_grub", "on"])
-        commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
-    else:
-        if dual_boot and preserve_efi:
-            # Create partition in actual free space (user must have unallocated space)
-            region = get_free_space_region(disk_path)
-            if not region:
-                print("ERROR: Dual boot requires free space but none found on disk.")
-                return []
-            root_start, root_end = region
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
+        if btrfs_subvolumes and filesystem == "btrfs":
+            commands.append(["parted", "-s", disk_path, "mkpart", "\"Boot\"", "ext4", boot_start, boot_end])
+            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", "btrfs", root_start, root_end])
         else:
-            # Normal UEFI installation - create full layout
-            root_start = efi_end
-            root_end = "100%"
-            commands.append(["parted", "-s", disk_path, "mklabel", "gpt"])
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"EFI System Partition\"", "fat32", first_start, efi_end])
-            commands.append(["parted", "-s", disk_path, "set", "1", "boot", "on"])
-            commands.append(["parted", "-s", disk_path, "set", "1", "esp", "on"])
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
-    
+            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, boot_start, root_end])
+    else:
+        commands.append(["parted", "-s", disk_path, "mklabel", "gpt"])
+        commands.append(["parted", "-s", disk_path, "mkpart", "\"EFI System Partition\"", "fat32", first_start, efi_end])
+        commands.append(["parted", "-s", disk_path, "set", "1", "boot", "on"])
+        commands.append(["parted", "-s", disk_path, "set", "1", "esp", "on"])
+        if btrfs_subvolumes and filesystem == "btrfs":
+            commands.append(["parted", "-s", disk_path, "mkpart", "\"Boot\"", "ext4", boot_start, boot_end])
+            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", "btrfs", root_start, root_end])
+        else:
+            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, boot_start, root_end])
     return commands
 
-def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False, root_part_override=None):
+def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False, root_part_override=None, btrfs_subvolumes=False):
     """Generates mkfs commands for partitions.
-    - include_efi=True: partition 1 is EFI (vfat), partition 2 is root
-    - dual_boot+preserve_efi: use root_part_override for the new partition (part N+1)
+    - When btrfs_subvolumes: part2=/boot (ext4), part3=root (btrfs); else part2=root
     """
     commands = []
     if root_part_override:
         root_part = root_part_override
+        if filesystem == "ext4":
+            commands.append(["mkfs.ext4", "-F", root_part])
+        elif filesystem == "btrfs":
+            commands.append(["mkfs.btrfs", "-f", root_part])
+        elif filesystem == "xfs":
+            commands.append(["mkfs.xfs", "-f", root_part])
+        return commands
+    if btrfs_subvolumes and filesystem == "btrfs":
+        boot_part = f"{disk_path}{partition_prefix}2"
+        root_part = f"{disk_path}{partition_prefix}3"
+        if include_efi and not (dual_boot and preserve_efi):
+            commands.append(["mkfs.vfat", "-F32", f"{disk_path}{partition_prefix}1"])
+        commands.append(["mkfs.ext4", "-F", boot_part])
+        commands.append(["mkfs.btrfs", "-f", root_part])
     elif bios_mode:
         root_part = f"{disk_path}{partition_prefix}2"
+        if filesystem == "ext4":
+            commands.append(["mkfs.ext4", "-F", root_part])
+        elif filesystem == "btrfs":
+            commands.append(["mkfs.btrfs", "-f", root_part])
+        elif filesystem == "xfs":
+            commands.append(["mkfs.xfs", "-f", root_part])
     elif include_efi:
         efi_part = f"{disk_path}{partition_prefix}1"
         root_part = f"{disk_path}{partition_prefix}2"
         if not (dual_boot and preserve_efi):
             commands.append(["mkfs.vfat", "-F32", efi_part])
+        if filesystem == "ext4":
+            commands.append(["mkfs.ext4", "-F", root_part])
+        elif filesystem == "btrfs":
+            commands.append(["mkfs.btrfs", "-f", root_part])
+        elif filesystem == "xfs":
+            commands.append(["mkfs.xfs", "-f", root_part])
     else:
         root_part = f"{disk_path}{partition_prefix}1"
-
-    # Format root partition with selected filesystem
-    if filesystem == "ext4":
-        commands.append(["mkfs.ext4", "-F", root_part])
-    elif filesystem == "btrfs":
-        commands.append(["mkfs.btrfs", "-f", root_part])
-    elif filesystem == "xfs":
-        commands.append(["mkfs.xfs", "-f", root_part])
-    else:
-        raise ValueError(f"Unsupported filesystem: {filesystem}. Use ext4, btrfs, or xfs.")
+        if filesystem == "ext4":
+            commands.append(["mkfs.ext4", "-F", root_part])
+        elif filesystem == "btrfs":
+            commands.append(["mkfs.btrfs", "-f", root_part])
+        elif filesystem == "xfs":
+            commands.append(["mkfs.xfs", "-f", root_part])
     return commands
 
 # --- Helper Functions to Check Host Usage ---
@@ -380,6 +409,17 @@ class DiskPage(BaseConfigurationPage):
         fs_row.set_selected(1)  # Default to btrfs
         fs_row.connect("notify::selected", self.on_filesystem_changed)
         self.fs_group.add(fs_row)
+
+        # BTRFS snapshots (subvolumes + snapper) - only visible when btrfs selected
+        self.btrfs_snapshots_row = Adw.SwitchRow(
+            title="BTRFS Snapshots (Rollback)",
+            subtitle="BTRFS root subvolume + snapper rollback; /home on root (reliable boot)"
+        )
+        self.btrfs_snapshots_row.set_active(True)
+        self.btrfs_snapshots_row.connect("notify::active", self._on_btrfs_snapshots_toggled)
+        self.fs_group.add(self.btrfs_snapshots_row)
+        self.btrfs_snapshots_enabled = True
+        self._btrfs_snapshots_subtitle = "BTRFS root subvolume + snapper rollback; /home on root (reliable boot)"
         
         # Custom formatting toggle
         self.custom_format_row = Adw.SwitchRow(
@@ -461,6 +501,7 @@ class DiskPage(BaseConfigurationPage):
             self.dual_boot_enabled = False
             self.preserve_efi = False
             self.efi_group.set_visible(False)
+            self._update_btrfs_snapshots_for_mode()
             for disk_path, widget_info in self.disk_widgets.items():
                 disk = next((d for d in self.detected_disks if d["path"] == disk_path), None)
                 if disk and not disk.get("is_live_os_disk"):
@@ -477,6 +518,10 @@ class DiskPage(BaseConfigurationPage):
                     self.selected_efi_partition = self.efi_partitions[0].get("path")
                     self.preserve_efi = True
                 print(f"Installation mode: Dual boot (found {len(self.efi_partitions)} EFI partitions)")
+                self.btrfs_snapshots_row.set_sensitive(False)
+                self.btrfs_snapshots_row.set_subtitle("Requires clean installation (separate /boot)")
+                self.btrfs_snapshots_row.set_active(False)
+                self.btrfs_snapshots_enabled = False
             else:
                 self.normal_radio.set_active(True)
                 return
@@ -489,8 +534,37 @@ class DiskPage(BaseConfigurationPage):
         selected = combo_row.get_selected()
         fs_types = ["ext4", "btrfs", "xfs"]
         self.filesystem_type = fs_types[selected] if selected < len(fs_types) else "ext4"
+        self.btrfs_snapshots_row.set_visible(self.filesystem_type == "btrfs")
         print(f"Selected filesystem: {self.filesystem_type}")
         self.update_complete_button_state()
+
+    def _on_btrfs_snapshots_toggled(self, switch_row, pspec):
+        """Handle BTRFS snapshots toggle."""
+        self.btrfs_snapshots_enabled = switch_row.get_active()
+        print(f"BTRFS snapshots (rollback): {'enabled' if self.btrfs_snapshots_enabled else 'disabled'}")
+
+    def _update_btrfs_snapshots_for_mode(self):
+        """Restore BTRFS snapshots row when switching to normal (dual boot disables it)."""
+        if self.filesystem_type == "btrfs" and not self.dual_boot_enabled:
+            self.refresh_for_network()
+        elif self.filesystem_type != "btrfs":
+            self.btrfs_snapshots_row.set_visible(False)
+
+    def refresh_for_network(self):
+        """Gray out BTRFS snapshots option when no network (requires DNF for snapper packages)."""
+        has_network = backend.check_network_connectivity()
+        net = self.main_window.final_config.get("network", {}) if self.main_window else {}
+        if net.get("skip_network", False):
+            has_network = False
+        elif net.get("network_status") == "connected":
+            has_network = True
+        self.btrfs_snapshots_row.set_sensitive(has_network)
+        if has_network:
+            self.btrfs_snapshots_row.set_subtitle(self._btrfs_snapshots_subtitle)
+        else:
+            self.btrfs_snapshots_row.set_subtitle("Requires network connection (snapper packages)")
+            self.btrfs_snapshots_row.set_active(False)
+            self.btrfs_snapshots_enabled = False
     
     def on_custom_format_toggled(self, switch_row, pspec):
         """Handle custom formatting toggle."""
@@ -958,10 +1032,16 @@ class DiskPage(BaseConfigurationPage):
         primary_disk = sorted(list(self.selected_disks))[0]
         
         # Initialize config_values
+        btrfs_subvolumes = (
+            self.filesystem_type == "btrfs"
+            and self.btrfs_snapshots_row.get_sensitive()
+            and getattr(self, "btrfs_snapshots_enabled", False)
+        )
         config_values = {
             "method": self.partitioning_method,
             "target_disks": sorted(list(self.selected_disks)), 
             "filesystem": self.filesystem_type,
+            "btrfs_subvolumes": btrfs_subvolumes,
             "dual_boot": self.dual_boot_enabled,
             "preserve_efi": self.preserve_efi,
             "selected_efi_partition": self.selected_efi_partition,
@@ -972,7 +1052,11 @@ class DiskPage(BaseConfigurationPage):
 
         if self.partitioning_method in ["normal", "dual_boot"]:
             print(f"  Generating partitioning commands for: {primary_disk}")
-            
+            btrfs_subvolumes = (
+                self.filesystem_type == "btrfs"
+                and self.btrfs_snapshots_row.get_sensitive()
+                and getattr(self, "btrfs_snapshots_enabled", False)
+            )
             # Detect firmware type to decide partition layout
             is_uefi = os.path.exists("/sys/firmware/efi")
 
@@ -1002,7 +1086,8 @@ class DiskPage(BaseConfigurationPage):
                 filesystem=self.filesystem_type,
                 dual_boot=self.dual_boot_enabled,
                 preserve_efi=self.preserve_efi if is_uefi else False,
-                bios_mode=not is_uefi
+                bios_mode=not is_uefi,
+                btrfs_subvolumes=btrfs_subvolumes,
             )
             config_values["commands"].extend(parted_cmds)
             print(f"Parted commands: {parted_cmds}")
@@ -1022,7 +1107,8 @@ class DiskPage(BaseConfigurationPage):
                 preserve_efi=self.preserve_efi if is_uefi else False,
                 include_efi=include_efi,
                 bios_mode=not is_uefi,
-                root_part_override=root_part_override
+                root_part_override=root_part_override,
+                btrfs_subvolumes=btrfs_subvolumes,
             )
             config_values["commands"].extend(mkfs_cmds)
             print(f"Mkfs commands: {mkfs_cmds}")
@@ -1030,6 +1116,7 @@ class DiskPage(BaseConfigurationPage):
             # Define partition layout
             part1_suffix = f"{partition_prefix}1"
             part2_suffix = f"{partition_prefix}2"
+            part3_suffix = f"{partition_prefix}3"
             
             print(f"=== PARTITION LAYOUT ===")
             print(f"Part1 suffix: '{part1_suffix}'")
@@ -1045,7 +1132,13 @@ class DiskPage(BaseConfigurationPage):
                         "fstype": "vfat"
                     })
                     print(f"EFI partition: device={efi_device}, mountpoint=/boot/efi, fstype=vfat")
-                    root_device = f"{primary_disk}{part2_suffix}"
+                    if btrfs_subvolumes:
+                        boot_device = f"{primary_disk}{part2_suffix}"
+                        root_device = f"{primary_disk}{part3_suffix}"
+                        partitions.append({"device": boot_device, "mountpoint": "/boot", "fstype": "ext4"})
+                        print(f"Boot partition: device={boot_device}, mountpoint=/boot, fstype=ext4")
+                    else:
+                        root_device = f"{primary_disk}{part2_suffix}"
                 elif self.selected_efi_partition:
                     partitions.append({
                         "device": self.selected_efi_partition,
@@ -1057,8 +1150,13 @@ class DiskPage(BaseConfigurationPage):
                 else:
                     root_device = root_part_override or f"{primary_disk}{part2_suffix}"
             else:
-                # BIOS (GPT): partition 1 is bios_grub, partition 2 is root
-                root_device = f"{primary_disk}{part2_suffix}"
+                if btrfs_subvolumes:
+                    boot_device = f"{primary_disk}{part2_suffix}"
+                    root_device = f"{primary_disk}{part3_suffix}"
+                    partitions.append({"device": boot_device, "mountpoint": "/boot", "fstype": "ext4"})
+                    print(f"Boot partition: device={boot_device}, mountpoint=/boot, fstype=ext4")
+                else:
+                    root_device = f"{primary_disk}{part2_suffix}"
             partitions.append({
                 "device": root_device, 
                 "mountpoint": "/", 

@@ -313,14 +313,18 @@ class PayloadPage(BaseConfigurationPage):
         )
         self.add(self.advanced_section)
         
-        # NVIDIA Drivers (Oreon ships NVIDIA repo)
+        # NVIDIA Drivers (x86_64 only; ARM has no NVIDIA desktop driver support)
+        arch = get_host_architecture()
         self.nvidia_row = Adw.SwitchRow(
             title="NVIDIA Drivers",
-            subtitle="Install dkms-nvidia, nvidia-driver, nvidia-driver-cuda"
+            subtitle="Install NVIDIA driver, DKMS kernel module, CUDA libs (official NVIDIA repo)"
         )
         self.nvidia_row.set_active(self.nvidia_drivers)
         self.nvidia_row.connect("notify::active", self._on_nvidia_toggled)
         self.advanced_section.add(self.nvidia_row)
+        if arch["arch"] == "aarch64":
+            self.nvidia_row.set_visible(False)
+            self.nvidia_drivers = False
 
         # Package cache option
         self.cache_row = Adw.SwitchRow(
@@ -571,10 +575,7 @@ class PayloadPage(BaseConfigurationPage):
         print(f"  Flatpak packages ({len(flatpak_packages)}): {flatpak_packages}")
         print(f"  Enabled repositories: {[r['id'] for r in enabled_repos]}")
         print(f"  Flatpak enabled: {self.flatpak_enabled}")
-        
-        # Add NVIDIA driver packages if enabled
-        if self.nvidia_drivers:
-            selected_packages = list(selected_packages) + ["dkms-nvidia", "nvidia-driver", "nvidia-driver-cuda"]
+        # NVIDIA drivers are installed separately via official repo (payload flag only)
 
         # Build configuration data
         config_values = {
@@ -599,6 +600,8 @@ class PayloadPage(BaseConfigurationPage):
         
         if flatpak_enabled_effective:
             features.append("Flatpak")
+        if self.nvidia_drivers:
+            features.append("NVIDIA drivers")
         if self.custom_packages:
             features.append(f"{len(self.custom_packages)} custom packages")
             
