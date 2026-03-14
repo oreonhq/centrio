@@ -99,18 +99,53 @@ def _efi_partition_ensure_mounted(target_root, efi_partition_device, progress_ca
     return False, "UEFI system but EFI partition not mounted and no device provided.", None
 
 
-def _get_root_uuid(target_root):
-    """Return UUID of the filesystem mounted at target_root (root partition)."""
+def _normalize_findmnt_source(source):
+    """Normalize findmnt SOURCE like /dev/sda3[/root] -> /dev/sda3."""
+    if not source:
+        return source
+    s = source.strip()
+    if s.startswith("/dev/") and "[" in s:
+        s = s.split("[", 1)[0]
+    return s
+
+
+def _get_uuid_for_mount_target(target):
+    """Return UUID for mounted target by UUID first, then SOURCE->blkid fallback."""
     try:
         r = subprocess.run(
-            ["findmnt", "-n", "-o", "UUID", "--target", target_root],
+            ["findmnt", "-n", "-o", "UUID", "--target", target],
             capture_output=True, text=True, check=False, timeout=10
         )
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     except Exception:
         pass
+
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", target],
+            capture_output=True, text=True, check=False, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            src = _normalize_findmnt_source(r.stdout.strip())
+            if src.startswith("UUID="):
+                return src.split("=", 1)[1].strip()
+            if src.startswith("/dev/"):
+                return _get_device_uuid(src)
+    except Exception:
+        pass
+
     return None
+
+
+def _get_root_uuid(target_root):
+    """Return UUID of the filesystem mounted at target_root (root partition)."""
+    return _get_uuid_for_mount_target(target_root)
+
+
+def _get_boot_uuid(target_root):
+    """Return UUID for /boot mounted under target_root, when present."""
+    return _get_uuid_for_mount_target(os.path.join(target_root, "boot"))
 
 
 def _efi_file_readable(path):
@@ -191,11 +226,12 @@ def _find_shim_grub_on_host():
 
 def _get_device_uuid(device_path):
     """Return UUID of a block device (e.g. /dev/sda2)."""
-    if not device_path or not os.path.exists(device_path):
+    if not device_path:
         return None
+    device = _normalize_findmnt_source(device_path)
     try:
         r = subprocess.run(
-            ["blkid", "-o", "value", "-s", "UUID", device_path],
+            ["blkid", "-o", "value", "-s", "UUID", device],
             capture_output=True, text=True, check=False, timeout=10
         )
         if r.returncode == 0 and r.stdout.strip():
@@ -266,22 +302,41 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
         if not ok:
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
             return False, err or "Failed to copy shim to EFI/BOOT", None
+        # Some firmware/shim fallback paths expect GRUB at EFI/BOOT/<efi_grub>
+        # (e.g. \EFI\Boot\grubx64.efi). Keep a copy there as well.
+        ok, err, _ = _run_command(["cp", grub_src, os.path.join(efi_boot, arch["efi_grub"])], "Copy grub to EFI/BOOT", progress_callback)
+        if not ok:
+            _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
+            return False, err or "Failed to copy grub to EFI/BOOT", None
 
         # When boot_partition_device given (separate /boot), use its UUID so GRUB reads from /boot partition
         if boot_partition_device:
             uuid = _get_device_uuid(boot_partition_device)
+            if not uuid:
+                uuid = _get_boot_uuid(target_root)
             prefix_path = "/grub2"  # /boot partition root has grub2/
         else:
             uuid = _get_root_uuid(target_root)
             prefix_path = "/boot/grub2"
-        if not uuid:
-            _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
-            return False, "Could not determine UUID for GRUB stub (root or boot partition).", None
-
-        stub_cfg = (
-            "search.fs_uuid %s root\nset prefix=($root)%s\nconfigfile $prefix/grub.cfg\n"
-            % (uuid, prefix_path)
-        )
+        cfg_hint = "/grub2/grub.cfg" if prefix_path == "/grub2" else "/boot/grub2/grub.cfg"
+        # Robust stub: prefer fs_uuid when available, but always include a file-based
+        # fallback so installation remains bootable even when UUID detection is flaky in
+        # installer mount states.
+        if uuid:
+            stub_cfg = (
+                "search --no-floppy --fs-uuid --set=root %s\n"
+                "if [ -z \"$root\" ]; then\n"
+                "  search --no-floppy --file --set=root %s\n"
+                "fi\n"
+                "set prefix=($root)%s\n"
+                "configfile $prefix/grub.cfg\n"
+            ) % (uuid, cfg_hint, prefix_path)
+        else:
+            stub_cfg = (
+                "search --no-floppy --file --set=root %s\n"
+                "set prefix=($root)%s\n"
+                "configfile $prefix/grub.cfg\n"
+            ) % (cfg_hint, prefix_path)
         efi_grub_cfg = os.path.join(efi_dir, "grub.cfg")
         if not _write_file_as_root(efi_grub_cfg, stub_cfg, progress_callback):
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)

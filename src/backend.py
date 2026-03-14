@@ -1769,8 +1769,8 @@ def copy_live_environment(target_root, progress_callback=None):
             # This avoids the "copy into itself" issue
             # Use rsync when available for robust copying with symlink handling and filesystem boundary constraints.
             # Keep xattrs/ACLs so SELinux labels survive the copy.
-            # /boot/efi is a separate filesystem and excluded by --one-file-system,
-            # so unsupported xattrs on vfat are not part of this transfer.
+            # Explicitly exclude /boot/efi from the /boot payload copy: ESP is vfat and
+            # does not support security.selinux xattrs, and bootloader install populates ESP separately.
             rsync_path = shutil.which("rsync")
             if not rsync_path:
                 return False, "rsync is required for live environment copy. Install rsync."
@@ -1786,6 +1786,8 @@ def copy_live_environment(target_root, progress_callback=None):
             ]
             for pat in exclude_patterns:
                 rsync_cmd.extend(["--exclude", pat])
+            if directory == "/boot":
+                rsync_cmd.extend(["--exclude", "efi/***", "--exclude", "efi/"])
             rsync_cmd.extend([f"{source}/", destination])
             ok, err, _ = _run_command(rsync_cmd, f"Copy {directory}", progress_callback, timeout=1800)
             if not ok:
