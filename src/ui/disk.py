@@ -1,3 +1,19 @@
+# Centrio Installer
+# Copyright (C) 2026 Oreon HQ
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
 # centrio_installer/ui/disk.py
 
 import gi
@@ -33,7 +49,7 @@ def generate_wipefs_command(disk_path):
     """Generates the wipefs command for a disk."""
     return ["wipefs", "-a", disk_path]
 
-def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="btrfs", dual_boot=False, preserve_efi=False, bios_mode=False, btrfs_subvolumes=False):
+def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="ext4", dual_boot=False, preserve_efi=False, bios_mode=False, btrfs_subvolumes=False):
     """Generates parted commands for GPT layout.
     - UEFI (bios_mode=False): creates EFI System Partition + [optional /boot] + root
     - BIOS (bios_mode=True): creates BIOS Boot Partition + [optional /boot] + root
@@ -89,7 +105,7 @@ def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="btrfs", dual_b
             commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, boot_start, root_end])
     return commands
 
-def generate_mkfs_commands(disk_path, filesystem="btrfs", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False, root_part_override=None, btrfs_subvolumes=False):
+def generate_mkfs_commands(disk_path, filesystem="ext4", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False, root_part_override=None, btrfs_subvolumes=False):
     """Generates mkfs commands for partitions.
     - When btrfs_subvolumes: part2=/boot (ext4), part3=root (btrfs); else part2=root
     """
@@ -319,7 +335,7 @@ class DiskPage(BaseConfigurationPage):
         self.selected_disks = set()
         self.scan_completed = False
         self.partitioning_method = None
-        self.filesystem_type = "btrfs"
+        self.filesystem_type = "ext4"
         self.dual_boot_enabled = False
         self.preserve_efi = False
         self.selected_efi_partition = None
@@ -402,11 +418,11 @@ class DiskPage(BaseConfigurationPage):
         fs_row = Adw.ComboRow(title="Root Filesystem Type")
         fs_row.set_subtitle("Choose the filesystem for the root partition")
         fs_model = Gtk.StringList()
-        fs_model.append("ext4")
-        fs_model.append("btrfs (default)")
+        fs_model.append("ext4 (default)")
+        fs_model.append("btrfs")
         fs_model.append("xfs")
         fs_row.set_model(fs_model)
-        fs_row.set_selected(1)  # Default to btrfs
+        fs_row.set_selected(0)  # Default to ext4
         fs_row.connect("notify::selected", self.on_filesystem_changed)
         self.fs_group.add(fs_row)
 
