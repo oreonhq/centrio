@@ -1,6 +1,6 @@
 # Centrio Installer
 
-A modernized GTK installer for Oreon and other Linux distributions.
+A Qt6 installer for Oreon and other Linux distributions.
 
 ## Running locally (carefully)
 NOTE: do NOT proceed through Centrio on an already installed system due to risks of your system being destroyed, so running it on a VM that uses a live ISO is the most recommended testing method.

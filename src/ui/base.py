@@ -16,67 +16,72 @@
 #
 # centrio_installer/ui/base.py
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
 
-# Fixed import - use absolute import
-import backend
 
-class BaseConfigurationPage(Adw.PreferencesPage):
-    """Base class for configuration ui with common functionality."""
-    
-    def __init__(self, title, subtitle="", main_window=None, overlay_widget=None, **kwargs):
-        super().__init__(title=title, **kwargs)
+class BaseConfigurationPage(QWidget):
+    """Base class for configuration pages with common behavior."""
+
+    def __init__(self, title, subtitle="", main_window=None, overlay_widget=None, use_card=True, **kwargs):
+        super().__init__(**kwargs)
         self.main_window = main_window
-        self.overlay_widget = overlay_widget # For toasts
-        
-        # Optional subtitle if provided
+        self.overlay_widget = overlay_widget
+        self._toast_label = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 24, 24, 16)
+        outer.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("pageTitle")
+        outer.addWidget(title_label)
+
         if subtitle:
-            self.set_description(subtitle)
-            
-        # Control expansion to prevent window from being too tall
-        self.set_vexpand(False)  # Don't expand vertically
-        self.set_hexpand(True)
+            subtitle_label = QLabel(subtitle)
+            subtitle_label.setWordWrap(True)
+            subtitle_label.setObjectName("pageSubtitle")
+            outer.addWidget(subtitle_label)
+
+        outer.addSpacing(6)
+
+        if use_card:
+            card = QFrame()
+            card.setObjectName("card")
+            card.setFrameShape(QFrame.Shape.StyledPanel)
+            self.page_layout = QVBoxLayout(card)
+            self.page_layout.setContentsMargins(16, 14, 16, 14)
+            self.page_layout.setSpacing(10)
+            outer.addWidget(card, 1)
+        else:
+            # no card wrapper - page manages its own layout structure
+            self.page_layout = outer
 
     def show_toast(self, message, timeout=3):
-        """Show a toast notification if overlay is available."""
-        if self.overlay_widget and hasattr(self.overlay_widget, 'add_toast'):
-            toast = Adw.Toast.new(message)
-            toast.set_timeout(timeout)
-            self.overlay_widget.add_toast(toast)
-        else:
-            print(f"Toast: {message}")
+        if self.main_window and hasattr(self.main_window, "show_status_message"):
+            self.main_window.show_status_message(message, timeout * 1000)
+            return
+        print(f"Toast: {message}")
 
-    def mark_complete_and_return(self, button, config_values=None):
-        """Mark this configuration as complete and return to summary."""
-        if self.main_window:
-            # Extract page name from class name or use a provided key
-            page_key = self._get_page_key()
-            if page_key:
-                # Mark as complete and pass config values
-                self.main_window.mark_config_complete(page_key, True, config_values)
-                # Navigate back to summary
-                self.main_window.return_to_summary()
-            else:
-                print("Warning: Could not determine page key for completion marking.")
-        else:
+    def mark_complete_and_return(self, _button=None, config_values=None):
+        if not self.main_window:
             print("Warning: No main_window reference available for marking completion.")
+            return
+        page_key = self._get_page_key()
+        if not page_key:
+            print("Warning: Could not determine page key for completion marking.")
+            return
+        self.main_window.mark_config_complete(page_key, True, config_values)
+        QTimer.singleShot(0, self.main_window.return_to_summary)
 
     def _get_page_key(self):
-        """Extract the page key from the class name."""
         class_name = self.__class__.__name__
-        if class_name.endswith('Page'):
-            # Convert CamelCase to lowercase (e.g., KeyboardPage -> keyboard)
-            key = class_name[:-4].lower()  # Remove 'Page' suffix
-            return key
+        if class_name.endswith("Page"):
+            return class_name[:-4].lower()
         return None
 
     def connect_and_fetch_data(self):
-        """Override in subclasses to fetch/initialize data."""
         pass
 
-    def apply_settings_and_return(self, button):
-        """Override in subclasses to apply settings."""
-        pass 
+    def apply_settings_and_return(self, _button=None):
+        pass

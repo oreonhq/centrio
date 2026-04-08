@@ -1,198 +1,98 @@
-# Centrio Installer
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-# centrio_installer/ui/network.py
-
-import gi
 import subprocess
-import threading
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GLib
+
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout
 
 from .base import BaseConfigurationPage
 
 
 def _detect_connection_type():
-    """Returns ('wired'|'wifi'|'none', connected: bool). Uses nmcli networking connectivity
-    for reliable connectivity; dev status alone can report 'connected' incorrectly."""
     try:
         r_conn = subprocess.run(
             ["nmcli", "networking", "connectivity", "check"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        actually_connected = False
-        if r_conn.returncode == 0 and r_conn.stdout:
-            out = r_conn.stdout.strip().lower()
-            actually_connected = out in ("full", "limited")
-
-        conn_type = "none"
+        connected = r_conn.returncode == 0 and (r_conn.stdout or "").strip().lower() in ("full", "limited")
         r_active = subprocess.run(
             ["nmcli", "-t", "-f", "TYPE,DEVICE", "connection", "show", "--active"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        if r_active.returncode == 0 and r_active.stdout.strip():
-            for line in r_active.stdout.strip().split("\n"):
-                parts = line.split(":", 1)
-                t = (parts[0] or "").lower()
-                if t == "loopback":
-                    continue
+        conn_type = "none"
+        if r_active.returncode == 0:
+            for line in (r_active.stdout or "").splitlines():
+                t = (line.split(":", 1)[0] or "").lower()
                 if t in ("802-3-ethernet", "ethernet"):
                     conn_type = "wired"
                     break
                 if t in ("wifi", "802-11-wireless", "wireless"):
                     conn_type = "wifi"
                     break
-
-        if conn_type == "none":
-            r_wifi = subprocess.run(
-                ["nmcli", "-t", "-f", "TYPE", "dev", "status"],
-                capture_output=True, text=True, timeout=3
-            )
-            if r_wifi.returncode == 0 and "wifi" in (r_wifi.stdout or "").lower():
-                conn_type = "wifi"
-
-        return conn_type, actually_connected
+        return conn_type, connected
     except Exception:
         return "none", False
 
 
 class NetworkConnectivityPage(BaseConfigurationPage):
-    """Page for network connectivity. Status and instructions to use control center for Wi‑Fi."""
-
     def __init__(self, main_window, overlay_widget, **kwargs):
         super().__init__(
             title="Network Connectivity",
             subtitle="Connect to a network for additional software, or continue without network",
             main_window=main_window,
             overlay_widget=overlay_widget,
-            **kwargs
+            **kwargs,
         )
-        self.network_enabled = False
-        self.skip_network = False
         self.network_status = "unknown"
         self.connection_type = "none"
-        self._build_ui()
-        self._check_network_status()
-        self._start_status_polling()
+        self.network_enabled = False
 
-    def _build_ui(self):
-        self.status_section = Adw.PreferencesGroup(title="Network Status", description="Current connectivity")
-        self.add(self.status_section)
-        self.status_row = Adw.ActionRow(title="Status", subtitle="Checking...")
-        self.status_icon = Gtk.Image.new_from_icon_name("network-wireless-symbolic")
-        self.status_row.add_prefix(self.status_icon)
-        self.status_section.add(self.status_row)
+        self.status_label = QLabel("Checking...")
+        self.page_layout.addWidget(self.status_label)
 
-        self.help_section = Adw.PreferencesGroup(
-            title="Connecting to Wi‑Fi",
-            description="To connect to Wi‑Fi, use the control center in the bottom panel below this installer."
-        )
-        self.add(self.help_section)
+        self.apply_btn = QPushButton("Use network for additional software")
+        self.apply_btn.clicked.connect(self._on_apply)
+        self.page_layout.addWidget(self.apply_btn)
 
-        self.buttons_section = Adw.PreferencesGroup(title="Continue", description="")
-        self.buttons_section.set_margin_top(6)
-        self.add(self.buttons_section)
-        self.apply_row = Adw.ActionRow(
-            title="Use network for additional software",
-            subtitle="Proceed with network connection"
-        )
-        self.apply_btn = Gtk.Button(label="Apply")
-        self.apply_btn.add_css_class("suggested-action")
-        self.apply_btn.add_css_class("compact")
-        self.apply_btn.connect("clicked", self._on_apply)
-        self.apply_row.add_suffix(self.apply_btn)
-        self.buttons_section.add(self.apply_row)
+        self.skip_btn = QPushButton("Continue without network")
+        self.skip_btn.clicked.connect(self._on_skip)
+        self.page_layout.addWidget(self.skip_btn)
 
-        self.skip_row = Adw.ActionRow(
-            title="Continue without network",
-            subtitle="Install only the base system"
-        )
-        self.skip_btn = Gtk.Button(label="Continue without network")
-        self.skip_btn.add_css_class("compact")
-        self.skip_btn.connect("clicked", self._on_skip)
-        self.skip_row.add_suffix(self.skip_btn)
-        self.buttons_section.add(self.skip_row)
-
-    def _check_network_status(self):
-        def check():
-            conn_type, connected = _detect_connection_type()
-            self.connection_type = conn_type
-            self.network_status = "connected" if connected else "disconnected"
-            self.network_enabled = connected
-            GLib.idle_add(self._update_ui)
-
-        threading.Thread(target=check, daemon=True).start()
-
-    def _start_status_polling(self):
-        """Continuously refresh network state so users don't need to restart installer."""
-        def poll():
-            self._check_network_status()
-            return True
-        GLib.timeout_add_seconds(3, poll)
+        self.page_layout.addStretch(1)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_status)
+        self.refresh_timer.start(3000)
+        self.refresh_status()
 
     def refresh_status(self):
-        """Manual refresh hook used when page becomes visible."""
-        self._check_network_status()
-
-    def _update_ui(self):
-        self.status_icon.remove_css_class("success")
-        self.status_icon.remove_css_class("error")
-        if self.network_status == "connected":
-            if self.connection_type == "wired":
-                self.status_row.set_subtitle("Connected via wired network")
-                self.status_icon.set_from_icon_name("network-wired-symbolic")
-            else:
-                self.status_row.set_subtitle("Connected via Wi‑Fi")
-                self.status_icon.set_from_icon_name("network-wireless-symbolic")
-            self.status_icon.add_css_class("success")
-            self.apply_btn.set_sensitive(True)
-        else:
-            self.status_row.set_subtitle("No network connection")
-            self.status_icon.set_from_icon_name("network-offline-symbolic")
-            self.status_icon.add_css_class("error")
-            self.apply_btn.set_sensitive(False)
-        self.skip_btn.set_sensitive(True)
-
-    def _on_apply(self, btn):
-        self.skip_network = False
-        # Re-check right before applying to avoid stale status.
         conn_type, connected = _detect_connection_type()
         self.connection_type = conn_type
         self.network_status = "connected" if connected else "disconnected"
         self.network_enabled = connected
-        self._update_ui()
+        if connected:
+            self.status_label.setText(f"Connected via {conn_type}.")
+            self.apply_btn.setEnabled(True)
+        else:
+            self.status_label.setText("No network connection.")
+            self.apply_btn.setEnabled(False)
+
+    def _on_apply(self):
         config = {
             "network_enabled": self.network_enabled,
             "skip_network": False,
             "network_status": self.network_status,
         }
-        self.show_toast("Network settings applied.")
-        super().mark_complete_and_return(btn, config_values=config)
+        self.mark_complete_and_return(config_values=config)
 
-    def _on_skip(self, btn):
-        self.skip_network = True
-        self.network_enabled = False
+    def _on_skip(self):
         config = {
             "network_enabled": False,
             "skip_network": True,
             "network_status": self.network_status,
         }
-        self.show_toast("Continuing without network. Only base system will be installed.")
-        super().mark_complete_and_return(btn, config_values=config)
+        self.mark_complete_and_return(config_values=config)
 
     def _get_page_key(self):
         return "network"

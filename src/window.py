@@ -17,14 +17,16 @@
 # centrio_installer/window.py
 import sys
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-try:
-    from gi.repository import Gtk, Adw, GLib, Gdk  # type: ignore
-except ImportError:
-    print("Warning: gi.repository could not be imported")
-    raise
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 # Import Page classes (Fixed to absolute imports)
 from ui.welcome import WelcomePage
@@ -37,7 +39,7 @@ from ui.timedate import TimeDatePage
 from ui.disk import DiskPage
 from ui.network import NetworkConnectivityPage
 from ui.payload import PayloadPage
-class CentrioInstallerWindow(Adw.ApplicationWindow):
+class CentrioInstallerWindow(QMainWindow):
     def __init__(self, installer_script=None, **kwargs):
         super().__init__(**kwargs)
         self.installer_script = installer_script or sys.argv[0]
@@ -49,55 +51,64 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         self.config_page_keys = ["keyboard", "language", "timedate", "disk", "network", "payload"]
         self.final_config = {} # Stores final selected values passed back from ui
 
-        self.set_title("Centrio Installer")
-        self.set_default_size(700, 350)  # Much smaller default height
-        self.set_resizable(True)
-        self.connect("realize", lambda w: self._inject_compact_button_css())
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_content(main_box)
-        
-        # --- Create the single Toast Overlay --- 
-        self.toast_overlay = Adw.ToastOverlay()
-        self.toast_overlay.set_vexpand(True)
-        main_box.append(self.toast_overlay)
-
-        # --- View Stack (directly in the overlay) --- 
-        self.view_stack = Adw.ViewStack()
-        self.toast_overlay.set_child(self.view_stack)
+        self.setWindowTitle("Centrio Installer")
+        self.resize(900, 560)
+        self.setMinimumSize(820, 520)
+        central = QWidget(self)
+        central.setObjectName("centralWidget")
+        self.setCentralWidget(central)
+        main_box = QVBoxLayout(central)
+        main_box.setContentsMargins(0, 0, 0, 0)
+        main_box.setSpacing(0)
+        self.view_stack = QStackedWidget()
+        main_box.addWidget(self.view_stack, 1)
 
         # --- Add ui to the stack ---
         # Main flow ui (pass main_window so welcome can restart for language change)
         self.welcome_page = WelcomePage(main_window=self)
-        self.view_stack.add_titled(self.welcome_page, self.main_page_order[0], "Welcome")
+        self.view_stack.addWidget(self.welcome_page)
 
         # Create Summary Page - this will also populate config_state and required_configs
         self.summary_page = SummaryPage(main_window=self)
-        self.view_stack.add_titled(self.summary_page, self.main_page_order[1], "Installation Summary")
+        self.view_stack.addWidget(self.summary_page)
 
         self.progress_page = ProgressPage()
-        self.view_stack.add_titled(self.progress_page, self.main_page_order[2], "Installation Progress")
+        self.view_stack.addWidget(self.progress_page)
 
-        self.finished_page = FinishedPage(app=self.get_application())
-        self.view_stack.add_titled(self.finished_page, self.main_page_order[3], "Finished")
+        self.finished_page = FinishedPage(app=None)
+        self.view_stack.addWidget(self.finished_page)
 
         # Configuration ui - Pass main_window and the overlay
-        self.keyboard_page = KeyboardPage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.keyboard_page, "keyboard", "Keyboard Settings")
+        self.keyboard_page = KeyboardPage(main_window=self, overlay_widget=None)
+        self.view_stack.addWidget(self.keyboard_page)
         
-        self.language_page = LanguagePage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.language_page, "language", "Language Settings")
+        self.language_page = LanguagePage(main_window=self, overlay_widget=None)
+        self.view_stack.addWidget(self.language_page)
         
-        self.timedate_page = TimeDatePage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.timedate_page, "timedate", "Time & Date Settings")
+        self.timedate_page = TimeDatePage(main_window=self, overlay_widget=None)
+        self.view_stack.addWidget(self.timedate_page)
         
-        self.disk_page = DiskPage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.disk_page, "disk", "Disk Settings")
+        self.disk_page = DiskPage(main_window=self, overlay_widget=None)
+        self.view_stack.addWidget(self.disk_page)
         
-        self.network_page = NetworkConnectivityPage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.network_page, "network", "Network Settings")
+        self.network_page = NetworkConnectivityPage(main_window=self, overlay_widget=None)
+        self.view_stack.addWidget(self.network_page)
         
-        self.payload_page = PayloadPage(main_window=self, overlay_widget=self.toast_overlay)
-        self.view_stack.add_titled(self.payload_page, "payload", "Payload Settings")
+        self.payload_page = PayloadPage(main_window=self, overlay_widget=None)
+        self.view_stack.addWidget(self.payload_page)
+
+        self.page_widgets = {
+            "welcome": self.welcome_page,
+            "summary": self.summary_page,
+            "progress": self.progress_page,
+            "finished": self.finished_page,
+            "keyboard": self.keyboard_page,
+            "language": self.language_page,
+            "timedate": self.timedate_page,
+            "disk": self.disk_page,
+            "network": self.network_page,
+            "payload": self.payload_page,
+        }
         
         # Ensure required_configs is populated based on SummaryPage rows
         # (Should be done within SummaryPage._add_config_row now)
@@ -108,96 +119,40 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
             if key not in self.config_state:
                 self.config_state[key] = False 
 
-        # --- Navigation Buttons (below the overlay) --- 
-        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        nav_box.set_halign(Gtk.Align.END)
-        nav_box.set_margin_top(6)
-        nav_box.set_margin_bottom(6)
-        nav_box.set_margin_start(12)
-        nav_box.set_margin_end(12)
-        main_box.append(nav_box)
+        # --- Navigation bar ---
+        nav_widget = QWidget()
+        nav_widget.setObjectName("navBar")
+        nav_box = QHBoxLayout(nav_widget)
+        nav_box.setContentsMargins(16, 10, 16, 10)
+        nav_box.addStretch()
+        main_box.addWidget(nav_widget)
 
-        self.abort_button = Gtk.Button(label="Abort")
-        self.abort_button.add_css_class("destructive-action")
-        self.abort_button.connect("clicked", self.exit_window)
-        nav_box.append(self.abort_button)
+        self.abort_button = QPushButton("Abort")
+        self.abort_button.setObjectName("dangerButton")
+        self.abort_button.clicked.connect(self.exit_window)
+        nav_box.addWidget(self.abort_button)
 
-        self.back_button = Gtk.Button(label="Back")
-        self.back_button.connect("clicked", self.go_back)
-        nav_box.append(self.back_button)
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self.go_back)
+        nav_box.addWidget(self.back_button)
 
-        self.next_button = Gtk.Button(label="Next")
-        self.next_button.add_css_class("suggested-action")
-        self.next_button.connect("clicked", self.go_next)
-        nav_box.append(self.next_button)
+        self.next_button = QPushButton("Next")
+        self.next_button.setObjectName("primaryButton")
+        self.next_button.clicked.connect(self.go_next)
+        nav_box.addWidget(self.next_button)
 
-        # Update navigation state when the visible child changes
-        self.view_stack.connect("notify::visible-child-name", self._on_visible_child_changed)
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
         # Set initial navigation state
+        self.navigate_to_page("welcome")
         self.update_navigation()
 
-    def _inject_compact_button_css(self):
-        """Inject CSS for comfortable button/entry sizing and padding."""
-        try:
-            provider = Gtk.CssProvider()
-            provider.load_from_data(
-                b"""
-                button.compact,
-                button {
-                    min-height: 32px;
-                    padding: 6px 14px;
-                    margin: 0;
-                }
-                entry {
-                    min-height: 40px;
-                    padding: 12px 16px;
-                }
-                entry.centrio-padded-entry {
-                    min-height: 44px;
-                    padding: 14px 18px;
-                }
-                entry.centrio-compact-entry {
-                    min-height: 28px;
-                    padding: 4px 10px;
-                }
-                adwpreferencesgroup {
-                    margin-top: 16px;
-                    margin-bottom: 16px;
-                    padding: 12px 0;
-                }
-                adwpreferencesgroup + adwpreferencesgroup {
-                    margin-top: 20px;
-                }
-                adwactionrow {
-                    min-height: 52px;
-                    padding-top: 10px;
-                    padding-bottom: 10px;
-                    margin: 6px 0;
-                }
-                adwactionrow.centrio-compact-row {
-                    min-height: 36px;
-                    padding-top: 4px;
-                    padding-bottom: 4px;
-                    margin: 2px 0;
-                }
-                row.entry {
-                    min-height: 52px;
-                    padding: 10px 0;
-                }
-                """
-            )
-            disp = self.get_display() if hasattr(self, "get_display") and self.get_display() else Gdk.Display.get_default()
-            if disp:
-                Gtk.StyleContext.add_provider_for_display(
-                    disp, provider,
-                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-                )
-        except Exception as e:
-            print(f"Warning: Could not load compact button CSS: {e}")
+    def show_status_message(self, message, timeout_ms=3000):
+        self.status_bar.showMessage(message, timeout_ms)
 
-    def _on_visible_child_changed(self, stack, pspec):
+    def _on_visible_child_changed(self, *args):
         self.update_navigation()
-        name = self.view_stack.get_visible_child_name()
+        name = self.get_current_page_info()[0]
         if name == "network" and hasattr(self, "network_page"):
             self.network_page.refresh_status()
         if name == "disk" and hasattr(self, "disk_page"):
@@ -207,7 +162,12 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
 
     def get_current_page_info(self):
         """Helper to get information about the currently visible page."""
-        current_page_name = self.view_stack.get_visible_child_name()
+        current_widget = self.view_stack.currentWidget()
+        current_page_name = None
+        for key, widget in self.page_widgets.items():
+            if widget is current_widget:
+                current_page_name = key
+                break
         is_main_page = current_page_name in self.main_page_order
         is_config_page = current_page_name in self.config_page_keys
         try:
@@ -219,7 +179,10 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
     def navigate_to_page(self, page_name):
         """Sets the visible page in the view stack."""
         # Ensure this runs in the main GTK thread
-        GLib.idle_add(self.view_stack.set_visible_child_name, page_name)
+        page = self.page_widgets.get(page_name)
+        if page:
+            self.view_stack.setCurrentWidget(page)
+            self._on_visible_child_changed()
 
     def navigate_to_config(self, config_key):
         """Navigates to a specific configuration page by its key."""
@@ -275,16 +238,15 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
                 print("Configuration complete, starting installation progress...")
                 # Navigate first, then start installation with collected data
                 self.navigate_to_page("progress")
-                # Pass final config to installation using idle_add for safety
-                GLib.idle_add(self.progress_page.start_installation, self, self.final_config) 
+                self.progress_page.start_installation(self, self.final_config)
             elif main_index < len(self.main_page_order) - 1:
                 # --- Navigate to Next Main Page --- 
                 next_page_name = self.main_page_order[main_index + 1]
                 print(f"Navigating from '{current_page_name}' to '{next_page_name}'")
                 self.navigate_to_page(next_page_name)
-            elif current_page_name == "finished": # Should be handled by finished page button
+            elif current_page_name == "finished":
                  print("'Next' clicked on finished page - Quitting.")
-                 self.get_application().quit()
+                 self.close()
             else:
                  print(f"Warning: 'Next' clicked on unexpected main page: {current_page_name}")
 
@@ -312,65 +274,63 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         """Handles the action for the Abort/Exit button."""
         print("Installation aborted by user.")
         print("Exiting Centrio Installer...")
-        sys.exit(0)
+        self.close()
 
     def update_navigation(self, stack=None, param=None):
         """Update the state of back/next buttons based on the current page."""
         # Use idle_add to prevent issues if called during stack transitions
-        GLib.idle_add(self._update_navigation_idle)
+        self._update_navigation_idle()
 
     def _update_navigation_idle(self):
-        """Actual navigation update logic, called via GLib.idle_add."""
+        """Actual navigation update logic."""
         current_page_name, is_main_page, is_config_page, main_index = self.get_current_page_info()
 
         if not current_page_name:
              # Should not happen, but handle defensively
-             self.back_button.set_sensitive(False)
-             self.next_button.set_sensitive(False)
+             self.back_button.setEnabled(False)
+             self.next_button.setEnabled(False)
              return
 
         # --- Back Button Logic --- 
         if is_config_page:
-            self.back_button.set_sensitive(True)
-            self.back_button.set_label("Cancel")
-            self.back_button.set_visible(True)
+            self.back_button.setEnabled(True)
+            self.back_button.setText("Cancel")
+            self.back_button.setVisible(True)
         elif is_main_page:
-            self.back_button.set_label("Back")
+            self.back_button.setText("Back")
             # Can go back if not on welcome or progress page
             can_go_back = main_index > 0 and current_page_name != "progress" and current_page_name != "finished"
-            self.back_button.set_sensitive(can_go_back)
-            self.back_button.set_visible(current_page_name != "finished") # Hide on finished
+            self.back_button.setEnabled(can_go_back)
+            self.back_button.setVisible(current_page_name != "finished")
         else:
             # Should be unreachable if ui are named correctly
-            self.back_button.set_sensitive(False)
-            self.back_button.set_visible(True)
+            self.back_button.setEnabled(False)
+            self.back_button.setVisible(True)
 
         # --- Next Button Logic --- 
-        self.next_button.remove_css_class("destructive-action") # Ensure default style
-        self.next_button.add_css_class("suggested-action")
-        self.next_button.set_visible(True) # Assume visible unless on finished page
+        self.next_button.setVisible(True)
         
         if is_config_page:
             # Config ui handle their own primary action via their own buttons.
             # The main 'Next' button should ideally just return to summary.
-            self.next_button.set_label("Return to Summary")
-            self.next_button.set_sensitive(True)
+            self.next_button.setText("Return to Summary")
+            self.next_button.setEnabled(True)
             # We could hide this button and rely only on the page's button + Cancel?
             # self.next_button.set_visible(False) 
         elif current_page_name == "welcome":
-            self.next_button.set_label("Next")
-            self.next_button.set_sensitive(True)
+            self.next_button.setText("Next")
+            self.next_button.setEnabled(True)
         elif current_page_name == "summary":
-            self.next_button.set_label("Begin Installation")
+            self.next_button.setText("Begin Installation")
             # Enable only if all required configurations are marked complete
             all_required_complete = all(self.config_state.get(key, False) for key in self.required_configs)
-            self.next_button.set_sensitive(all_required_complete)
+            self.next_button.setEnabled(all_required_complete)
         elif current_page_name == "progress":
-            self.next_button.set_label("Installing...")
-            self.next_button.set_sensitive(False) # Cannot navigate next from progress
+            self.next_button.setText("Installing...")
+            self.next_button.setEnabled(False)
         elif current_page_name == "finished":
-            self.next_button.set_visible(False) # No next button on finished page
+            self.next_button.setVisible(False)
         else:
              # Should be unreachable
-             self.next_button.set_label("Next")
-             self.next_button.set_sensitive(False) 
+             self.next_button.setText("Next")
+             self.next_button.setEnabled(False)

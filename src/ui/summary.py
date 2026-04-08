@@ -1,189 +1,131 @@
-# Centrio Installer
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-# centrio_installer/ui/summary.py
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw
+ICONS = {True: "✓", "required": "!", "optional": "○"}
 
 
-class SummaryPage(Adw.PreferencesPage):
+class SummaryPage(QWidget):
     def __init__(self, main_window, **kwargs):
-        super().__init__(title="Installation Summary", **kwargs)
+        super().__init__(**kwargs)
         self.main_window = main_window
         self.config_rows = {}
-        
-        # Fix scrolling conflicts with main window
-        self.set_vexpand(False)
-        self.set_hexpand(True)
 
-        # --- Header Section ---
-        header_group = Adw.PreferencesGroup()
-        self.add(header_group)
-        
-        status_row = Adw.ActionRow(
-            title="Installation Configuration",
-            subtitle="Review and complete all required settings before proceeding"
-        )
-        status_icon = Gtk.Image.new_from_icon_name("emblem-system-symbolic")
-        status_row.add_prefix(status_icon)
-        header_group.add(status_row)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 24, 24, 16)
+        outer.setSpacing(14)
 
-        # --- Localization Group ---
-        loc_group = Adw.PreferencesGroup(
-            title="Localization &amp; Input",
-            description="Language, keyboard, and regional settings"
-        )
-        self.add(loc_group)
-        self._add_config_row(loc_group, "keyboard", "Keyboard Layout", "Configure keyboard input method", True)
-        self._add_config_row(loc_group, "language", "System Language", "Set the default system locale", False)
+        title = QLabel("Installation Summary")
+        title.setObjectName("pageTitle")
+        outer.addWidget(title)
 
-        # --- System Configuration Group ---
-        sys_group = Adw.PreferencesGroup(
-            title="System Configuration", 
-            description="Core system and hardware settings"
-        )
-        self.add(sys_group)
-        self._add_config_row(sys_group, "timedate", "Time &amp; Date", "Timezone and time synchronization", True)
-        self._add_config_row(sys_group, "network", "Network Connectivity", "Network configuration for additional software", True)
+        subtitle = QLabel("Review and complete all required settings before proceeding.")
+        subtitle.setObjectName("pageSubtitle")
+        outer.addWidget(subtitle)
 
-        # --- Storage Group ---
-        storage_group = Adw.PreferencesGroup(
-            title="Storage &amp; Installation Target",
-            description="Disk partitioning and filesystem configuration"
-        )
-        self.add(storage_group)
-        self._add_config_row(storage_group, "disk", "Installation Destination", "Disk selection and partitioning method", True)
+        # scrollable rows area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        # --- Software Group ---
-        # user creation is handled by gnome-initial-setup on first boot
-        software_group = Adw.PreferencesGroup(
-            title="Software Selection",
-            description="Package groups and application configuration"
-        )
-        self.add(software_group)
-        self._add_config_row(software_group, "payload", "Software Packages", "Package selection and repositories", True)
+        rows_container = QWidget()
+        rows_container.setObjectName("scrollContent")
+        self.rows_layout = QVBoxLayout(rows_container)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(8)
+        self.rows_layout.addStretch(1)
+        scroll.setWidget(rows_container)
+        outer.addWidget(scroll, 1)
 
-        # --- Installation Ready Status ---
-        self.status_group = Adw.PreferencesGroup(
-            title="Installation Status"
-        )
-        self.add(self.status_group)
-        
-        self.ready_status_row = Adw.ActionRow(
-            title="Configuration Status",
-            subtitle="Complete required settings to proceed with installation"
-        )
-        self.status_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
-        self.ready_status_row.add_prefix(self.status_icon)
-        self.status_group.add(self.ready_status_row)
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("pageSubtitle")
+        outer.addWidget(self.status_label)
 
-    def _add_config_row(self, group, key, title, subtitle_base, required):
-        row = Adw.ActionRow(title=title)
-        row.set_activatable(True)
-        row.connect("activated", self.on_row_activated, key)
-        
-        # Initialize config_state in main window if not already present
+        self._add_config_row("keyboard",  "Keyboard Layout",          "Configure keyboard input method",             True)
+        self._add_config_row("language",  "System Language",           "Set the default system locale",               False)
+        self._add_config_row("timedate",  "Time & Date",               "Timezone and time synchronization",           True)
+        self._add_config_row("network",   "Network Connectivity",      "Network for additional software",             True)
+        self._add_config_row("disk",      "Installation Destination",  "Disk selection and partitioning method",      True)
+        self._add_config_row("payload",   "Software Packages",         "Package selection and repositories",          True)
+
+    def _add_config_row(self, key, title, subtitle_base, required):
+        card = QFrame()
+        card.setObjectName("card")
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card.setFixedHeight(70)
+
+        row = QHBoxLayout(card)
+        row.setContentsMargins(16, 0, 16, 0)
+        row.setSpacing(14)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        text_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: 600;")
+
+        status_label = QLabel()
+        status_label.setObjectName("rowSubtitle")
+
+        text_col.addWidget(title_label)
+        text_col.addWidget(status_label)
+        row.addLayout(text_col, 1)
+
+        btn = QPushButton("Configure")
+        btn.setObjectName("primaryButton")
+        btn.setFixedWidth(110)
+        btn.setFixedHeight(36)
+        btn.clicked.connect(lambda _=False, k=key: self.on_row_activated(k))
+        row.addWidget(btn)
+
+        # insert before the trailing stretch
+        self.rows_layout.insertWidget(self.rows_layout.count() - 1, card)
+
         if key not in self.main_window.config_state:
-             self.main_window.config_state[key] = False
-             
+            self.main_window.config_state[key] = False
+
         self.config_rows[key] = {
-            "row": row, 
-            "required": required, 
+            "title_label":  title_label,
+            "status_label": status_label,
+            "required":     required,
             "subtitle_base": subtitle_base,
-            "icon_widget": None 
+            "title":        title,
+            "card":         card,
         }
-        group.add(row)
-        
-        # Update row status based on initial state from main_window
         self.update_row_status(key, self.main_window.config_state.get(key, False))
 
-    def on_row_activated(self, row, key):
+    def on_row_activated(self, key):
         self.main_window.navigate_to_config(key)
 
     def update_row_status(self, key, is_complete):
         if key not in self.config_rows:
-            print(f"Warning: Attempted to update status for unknown row key: {key}")
             return
-            
-        config = self.config_rows[key]
-        row = config["row"]
-        subtitle = config["subtitle_base"]
-        icon_name = None
-        new_icon_widget = None
-
-        # Determine icon and subtitle based on state
+        cfg = self.config_rows[key]
         if is_complete:
-            row.set_subtitle(f"{subtitle} (Configured)")
-            icon_name = "object-select-symbolic"
-            row.add_css_class("success")
-            row.remove_css_class("warning")
-        elif config["required"]:
-            row.set_subtitle(f"{subtitle} (Required)")
-            icon_name = "dialog-warning-symbolic"
-            row.add_css_class("warning")
-            row.remove_css_class("success")
+            cfg["status_label"].setText("Configured")
+            cfg["status_label"].setStyleSheet("font-size: 10pt;")
+        elif cfg["required"]:
+            cfg["status_label"].setText("Required")
+            cfg["status_label"].setStyleSheet("font-size: 10pt;")
         else:
-            row.set_subtitle(f"{subtitle} (Optional)")
-            row.remove_css_class("warning")
-            row.remove_css_class("success")
-
-        # Remove the previous icon widget if it exists
-        if config["icon_widget"]:
-            try:
-                 row.remove(config["icon_widget"])
-            except Exception as e:
-                 print(f"Warning: Failed to remove previous icon for row '{key}': {e}")
-            config["icon_widget"] = None
-        
-        # Add the new icon if one is needed
-        if icon_name:
-            new_icon_widget = Gtk.Image.new_from_icon_name(icon_name)
-            row.add_suffix(new_icon_widget)
-            config["icon_widget"] = new_icon_widget
-            
-        # Update overall installation status
+            cfg["status_label"].setText("Optional")
+            cfg["status_label"].setStyleSheet("font-size: 10pt;")
         self._update_installation_status()
-    
+
     def _update_installation_status(self):
-        """Update the overall installation readiness status."""
-        # Only update if the status row has been created
-        if not hasattr(self, 'ready_status_row') or not self.ready_status_row:
-            return
-            
-        required_keys = [key for key, config in self.config_rows.items() if config["required"]]
-        completed_required = [key for key in required_keys if self.main_window.config_state.get(key, False)]
-        
-        total_required = len(required_keys)
-        completed_count = len(completed_required)
-        
-        if completed_count == total_required:
-            # All required items completed
-            self.ready_status_row.set_title("Ready for Installation")
-            self.ready_status_row.set_subtitle(f"All required settings configured ({completed_count}/{total_required})")
-            self.status_icon.set_from_icon_name("object-select-symbolic")
-            self.ready_status_row.add_css_class("success")
-            self.ready_status_row.remove_css_class("warning")
+        required_keys = [k for k, c in self.config_rows.items() if c["required"]]
+        done = sum(1 for k in required_keys if self.main_window.config_state.get(k, False))
+        total = len(required_keys)
+        if done == total:
+            self.status_label.setText(f"All required settings configured. Ready to install.")
         else:
-            # Still missing required items
-            missing_count = total_required - completed_count
-            self.ready_status_row.set_title("Configuration Incomplete")
-            self.ready_status_row.set_subtitle(f"{missing_count} required setting(s) remaining ({completed_count}/{total_required})")
-            self.status_icon.set_from_icon_name("dialog-warning-symbolic")
-            self.ready_status_row.add_css_class("warning")
-            self.ready_status_row.remove_css_class("success")
+            self.status_label.setText(f"{total - done} required setting(s) remaining.")

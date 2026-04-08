@@ -16,7 +16,7 @@
 #
 # centrio_installer/constants.py
 
-# Application ID (should match Adw.Application application_id)
+# Application ID (used by installer app metadata)
 APP_ID = "org.centrio.installer"
 
 # --- Anaconda D-Bus Constants --- 

@@ -1,93 +1,51 @@
-# Centrio Installer
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-# centrio_installer/ui/welcome.py
-
 import os
 import sys
-import gettext
 from pathlib import Path
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QLabel,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
+from PySide6.QtCore import Qt
 
 from utils import get_os_release_info
 
-# Translation function: always bound so no UnboundLocalError
-_locale_dir = Path(__file__).resolve().parents[2] / "locale"
-try:
-    _t = gettext.translation("centrio", localedir=str(_locale_dir), fallback=False)
-    _ = _t.gettext
-except Exception:
-    _ = lambda s: s
 
-
-class WelcomePage(Gtk.Box):
+class WelcomePage(QWidget):
     def __init__(self, main_window=None, **kwargs):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12, **kwargs)
+        super().__init__(**kwargs)
         self.main_window = main_window
-
+        self.language_codes = []
         self.selected_language = "en_US"
-        
-        # Get OS Name for branding
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
         os_info = get_os_release_info()
         distro_name = os_info.get("NAME", "Oreon")
-        
-        # Set smaller margins for better screen fit
-        self.set_halign(Gtk.Align.FILL)
-        self.set_valign(Gtk.Align.FILL)
-        self.set_margin_top(18)
-        self.set_margin_bottom(18)
-        self.set_margin_start(18)
-        self.set_margin_end(18)
-        
-        # Create more compact content
-        main_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        main_content.set_halign(Gtk.Align.CENTER)
-        main_content.set_valign(Gtk.Align.CENTER)
-        main_content.set_size_request(450, -1)
-        
-        # Package icon (changed to proper package box icon)
-        icon = Gtk.Image.new_from_icon_name("system-software-install-symbolic")
-        icon.set_pixel_size(72)  # Even smaller icon
-        icon.add_css_class("dim-label")
-        main_content.append(icon)
-        
-        # Title
-        title = Gtk.Label(label=_("Welcome to {}").format(distro_name))
-        title.add_css_class("title-1")
-        title.set_halign(Gtk.Align.CENTER)
-        main_content.append(title)
+        version = os_info.get("VERSION", "11").replace("10", "11")
 
-        # Description
-        description = Gtk.Label(label=_("Set up your new operating system in a few simple steps."))
-        description.add_css_class("title-4")
-        description.add_css_class("dim-label")
-        description.set_halign(Gtk.Align.CENTER)
-        description.set_wrap(True)
-        main_content.append(description)
-        
-        # Language selection - more compact
-        lang_group = Adw.PreferencesGroup(title=_("Language"))
-        self.lang_row = Adw.ComboRow(title=_("Installer Language"))
-        
-        # Comprehensive language list with proper codes
-        lang_model = Gtk.StringList()
+        title = QLabel(f"Welcome to {distro_name}")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        desc = QLabel("Set up your new operating system in a few simple steps.")
+        desc.setWordWrap(True)
+        desc.setObjectName("pageSubtitle")
+        layout.addWidget(desc)
+
+        lang_card = QFrame()
+        lang_card.setObjectName("card")
+        lang_layout = QVBoxLayout(lang_card)
+        lang_layout.setContentsMargins(12, 12, 12, 12)
+        lang_layout.addWidget(QLabel("Installer Language"))
+        self.lang_combo = QComboBox()
         languages = [
             ("English (US)", "en_US"),
             ("English (UK)", "en_GB"),
@@ -96,109 +54,31 @@ class WelcomePage(Gtk.Box):
             ("Deutsch", "de_DE"),
             ("Italiano", "it_IT"),
             ("Português (Brasil)", "pt_BR"),
-            ("Português (Portugal)", "pt_PT"),
-            ("Русский", "ru_RU"),
-            ("中文 (简体)", "zh_CN"),
-            ("中文 (繁體)", "zh_TW"),
-            ("日本語", "ja_JP"),
-            ("한국어", "ko_KR"),
-            ("العربية", "ar_SA"),
-            ("हिन्दी", "hi_IN"),
-            ("ไทย", "th_TH"),
-            ("Türkçe", "tr_TR"),
-            ("Polski", "pl_PL"),
-            ("Nederlands", "nl_NL"),
-            ("Svenska", "sv_SE"),
-            ("Norsk", "no_NO"),
-            ("Dansk", "da_DK"),
-            ("Suomi", "fi_FI"),
-            ("Čeština", "cs_CZ"),
-            ("Slovenčina", "sk_SK"),
-            ("Magyar", "hu_HU"),
-            ("Română", "ro_RO"),
-            ("Български", "bg_BG"),
-            ("Hrvatski", "hr_HR"),
-            ("Slovenščina", "sl_SI"),
-            ("Eesti", "et_EE"),
-            ("Latviešu", "lv_LV"),
-            ("Lietuvių", "lt_LT"),
-            ("Ελληνικά", "el_GR"),
-            ("Català", "ca_ES"),
-            ("Galego", "gl_ES"),
-            ("Euskara", "eu_ES"),
-            ("Gaeilge", "ga_IE"),
-            ("Cymraeg", "cy_GB")
         ]
-        
-        self.language_codes = [code for _name, code in languages]
-        for name, _code in languages:
-            lang_model.append(name)
-        
-        self.lang_row.set_model(lang_model)
-        
-        # Try to detect current system language
-        current_lang = self._detect_current_language()
+        for name, code in languages:
+            self.lang_combo.addItem(name)
+            self.language_codes.append(code)
+        lang_layout.addWidget(self.lang_combo)
+        layout.addWidget(lang_card)
+
+        current_lang = self._detect_current_language() or "en_US"
         if current_lang in self.language_codes:
-            try:
-                idx = self.language_codes.index(current_lang)
-                self.lang_row.set_selected(idx)
-            except ValueError:
-                self.lang_row.set_selected(0)  # Default to English
-        else:
-            self.lang_row.set_selected(0)  # Default to English
-            
-        self.lang_row.connect("notify::selected", self.on_language_changed)
-        
-        lang_group.add(self.lang_row)
-        main_content.append(lang_group)
-        
-        # Compact system info
-        system_group = Adw.PreferencesGroup(title=_("Installation Overview"))
-        version = os_info.get("VERSION", "10")
-        version_row = Adw.ActionRow(
-            title=_("Operating System"),
-            subtitle=f"{distro_name} {version}"
-        )
-        version_icon = Gtk.Image.new_from_icon_name("computer-symbolic")
-        version_row.add_prefix(version_icon)
-        system_group.add(version_row)
+            self.lang_combo.setCurrentIndex(self.language_codes.index(current_lang))
+        self.lang_combo.currentIndexChanged.connect(self.on_language_changed)
 
-        install_row = Adw.ActionRow(
-            title=_("Installation Type"),
-            subtitle=_("Full desktop with applications")
-        )
-        install_icon = Gtk.Image.new_from_icon_name("drive-harddisk-symbolic")
-        install_row.add_prefix(install_icon)
-        system_group.add(install_row)
+        info_card = QFrame()
+        info_card.setObjectName("card")
+        info_layout = QVBoxLayout(info_card)
+        info_layout.setContentsMargins(12, 12, 12, 12)
+        info_layout.addWidget(QLabel(f"Operating System: {distro_name} {version}"))
+        layout.addWidget(info_card)
+        layout.addSpacing(6)
 
-        time_row = Adw.ActionRow(
-            title=_("Estimated Time"),
-            subtitle=_("15-30 minutes")
-        )
-        time_icon = Gtk.Image.new_from_icon_name("alarm-symbolic")
-        time_row.add_prefix(time_icon)
-        main_content.append(system_group)
-
-        footer_label = Gtk.Label(
-            label=_("Click Next to begin configuration."),
-            justify=Gtk.Justification.CENTER
-        )
-        footer_label.add_css_class("dim-label")
-        footer_label.set_wrap(True)
-        main_content.append(footer_label)
-        
-        # Add the main content to this box
-        self.append(main_content)
-
-    def on_language_changed(self, combo_row, pspec):
-        """Handle language selection: save locale and restart installer so full UI is translated."""
-        selected = combo_row.get_selected()
-        if selected < 0 or selected >= len(self.language_codes):
+    def on_language_changed(self, index):
+        if index < 0 or index >= len(self.language_codes):
             return
-        lang_code = self.language_codes[selected]
+        lang_code = self.language_codes[index]
         self.selected_language = lang_code
-
-        # Write chosen locale so main.py applies it on next run
         lang_file = getattr(self.main_window, "installer_lang_file", None)
         script = getattr(self.main_window, "installer_script", None)
         if not lang_file or not script:
@@ -211,45 +91,20 @@ class WelcomePage(Gtk.Box):
             print(f"Could not write installer language file: {e}")
             return
 
-        # Restart the installer so gettext/locale apply to the whole UI
-        root = self.get_root()
-        dialog = Gtk.MessageDialog(
-            transient_for=root,
-            message_type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            text=_("Language Selected"),
-            secondary_text=_("The installer will restart to apply the new language.")
+        reply = QMessageBox.information(
+            self,
+            "Language Selected",
+            "The installer will restart to apply the new language.",
+            QMessageBox.StandardButton.Ok,
         )
-        def on_ok(dlg, resp):
-            dlg.destroy()
+        if reply == QMessageBox.StandardButton.Ok:
             try:
                 os.execv(sys.executable, [sys.executable, script] + sys.argv[1:])
             except Exception as e:
                 print(f"Could not restart installer: {e}")
-        dialog.connect("response", on_ok)
-        dialog.present()
-    
+
     def _detect_current_language(self):
-        """Detect the current system language."""
-        try:
-            import subprocess
-            import os
-            
-            # First try to get from environment
-            lang = os.environ.get('LANG', '')
-            if lang:
-                # Extract language code (e.g., "en_US.UTF-8" -> "en_US")
-                lang_code = lang.split('.')[0]
-                return lang_code
-            
-            result = subprocess.run(["localectl", "status"],
-                                    capture_output=True, text=True, check=True)
-            output = result.stdout
-            import re
-            locale_match = re.search(r"System Locale: LANG=(\S+)", output)
-            if locale_match:
-                lang = locale_match.group(1)
-                return lang.split('.')[0]
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-        return None 
+        lang = os.environ.get("LANG", "")
+        if lang:
+            return lang.split(".")[0]
+        return None

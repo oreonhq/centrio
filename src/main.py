@@ -27,13 +27,9 @@ import platform
 # work around MESA "Failed to attach to x11 shm" (common on ARM/Wayland)
 if platform.machine().lower() in ("aarch64", "arm64"):
     for k, v in [
-        ("GDK_BACKEND", "x11"),
         ("LIBGL_ALWAYS_SOFTWARE", "1"),
         ("GALLIUM_DRIVER", "llvmpipe"),
-        # Disable MIT-SHM so Mesa doesn't try to attach to X11 shared memory
         ("QT_X11_NO_MITSHM", "1"),
-        ("_X11_NO_MITSHM", "1"),
-        ("_MITSHM", "0"),
     ]:
         os.environ[k] = v
 import subprocess
@@ -119,27 +115,58 @@ def main():
     if "--frontend=gis" in sys.argv:
         pass  # Run GUI as usual; GIS/kiosk is environment
 
-    import gi
-    gi.require_version('Gtk', '4.0')
-    gi.require_version('Adw', '1')
-    from gi.repository import Gtk, Adw
+    # Point Qt at the system plugin directory so it finds:
+    #   - breeze6.so         (Breeze widget style)
+    #   - KDEPlasmaPlatformTheme6.so  (color scheme, fonts, icons from KDE settings)
+    # PySide6 installed via pip ships its own bundled plugins and ignores /usr/lib64.
+    os.environ.setdefault("QT_PLUGIN_PATH", "/usr/lib64/qt6/plugins")
+
+    # Load the KDE platform theme - this is what gives you the exact colors,
+    # font and icon set from the user's KDE System Settings (Breeze color scheme,
+    # Breeze icons, etc).  Without this you get Breeze widget shapes but default
+    # Qt colors, which is exactly what looked wrong.
+    os.environ.setdefault("QT_QPA_PLATFORMTHEME", "kde")
+
+    from PySide6.QtWidgets import QApplication, QStyleFactory
     from window import CentrioInstallerWindow
 
-    app = Adw.Application(
-        application_id="org.centrio.installer",
-        flags=0
+    app = QApplication(sys.argv)
+
+    # The KDE platform theme sets the style automatically to Breeze when running
+    # on KDE.  If for some reason it didn't (non-KDE live session), force it.
+    styles = {s.lower(): s for s in QStyleFactory.keys()}
+    if app.style().objectName().lower() != "breeze":
+        if "breeze" in styles:
+            app.setStyle(styles["breeze"])
+        else:
+            app.setStyle(styles.get("fusion", app.style().objectName()))
+            logging.warning("Breeze style not available, falling back to Fusion.")
+
+    # Only semantic overrides - Breeze + KDE platform theme handle everything else.
+    app.setStyleSheet(
+        """
+        QLabel#pageTitle {
+            font-size: 22pt;
+            font-weight: 700;
+        }
+        QPushButton#primaryButton {
+            background-color: palette(highlight);
+            color: palette(highlighted-text);
+            font-weight: 600;
+        }
+        QPushButton#dangerButton {
+            background-color: palette(highlight);
+            color: palette(highlighted-text);
+            font-weight: 600;
+        }
+        """
     )
     installer_script = os.path.abspath(sys.argv[0])
-
-    def on_activate(app):
-        logging.info("Centrio Installer starting...")
-        win = CentrioInstallerWindow(application=app, installer_script=installer_script)
-        win.installer_lang_file = INSTALLER_LANG_FILE
-        win.present()
-
-    app.connect("activate", on_activate)
-    exit_status = app.run(sys.argv)
-    return exit_status
+    logging.info("Centrio Installer starting...")
+    win = CentrioInstallerWindow(installer_script=installer_script)
+    win.installer_lang_file = INSTALLER_LANG_FILE
+    win.show()
+    return app.exec()
 
 if __name__ == "__main__":
     sys.exit(main()) 
