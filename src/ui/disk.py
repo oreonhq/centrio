@@ -424,6 +424,7 @@ class DiskPage(BaseConfigurationPage):
         fs_row.set_model(fs_model)
         fs_row.set_selected(0)  # Default to ext4
         fs_row.connect("notify::selected", self.on_filesystem_changed)
+        self.fs_row = fs_row
         self.fs_group.add(fs_row)
 
         # BTRFS snapshots (subvolumes + snapper) - only visible when btrfs selected
@@ -914,6 +915,9 @@ class DiskPage(BaseConfigurationPage):
                 self.fs_group.set_visible(True)
                 self._check_dual_boot_available()
                 self.normal_radio.set_active(True)  # Default to normal install
+                # Default root filesystem to ext4 on each successful scan
+                self.fs_row.set_selected(0)
+                self.on_filesystem_changed(self.fs_row, None)
             else:
                  self.show_toast("No suitable disks found for installation.")
 
