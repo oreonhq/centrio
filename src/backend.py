@@ -1277,6 +1277,128 @@ def remove_centrio_installer():
         print(f"Could not remove centrio-installer (non-fatal): {e}")
 
 
+def swapoff_on_disk(disk_device, progress_callback=None):
+    """Disable swap that is backed by disk_device or its partitions.
+
+    Live environments often turn on swap on a partition of the install target.
+    That use does not show up in findmnt, but wipefs fails with EBUSY until swap
+    is released. DM-backed swap on LVs for this disk is included.
+    """
+    if not disk_device or not os.path.exists(disk_device):
+        return True, ""
+
+    print(f"Checking for active swap on {disk_device}...")
+    if progress_callback:
+        progress_callback(f"Releasing swap on {disk_device}...", None)
+
+    on_disk_paths_norm = set()
+    try:
+        tree_cmd = ["lsblk", "-n", "-o", "PATH", "--paths", disk_device]
+        tr = subprocess.run(tree_cmd, capture_output=True, text=True, check=False, timeout=10)
+        if tr.returncode == 0:
+            for line in tr.stdout.splitlines():
+                p = line.strip()
+                if not p:
+                    continue
+                try:
+                    on_disk_paths_norm.add(os.path.realpath(p))
+                except OSError:
+                    on_disk_paths_norm.add(p)
+        try:
+            on_disk_paths_norm.add(os.path.realpath(disk_device))
+        except OSError:
+            on_disk_paths_norm.add(disk_device)
+    except Exception as e:
+        print(f"  Warning: lsblk for swap scan failed ({e}), using disk path only.")
+        try:
+            on_disk_paths_norm.add(os.path.realpath(disk_device))
+        except OSError:
+            on_disk_paths_norm.add(disk_device)
+
+    swap_names = []
+    try:
+        sp = subprocess.run(
+            ["swapon", "--show=NAME", "--noheadings"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if sp.returncode == 0 and sp.stdout.strip():
+            swap_names = [ln.strip() for ln in sp.stdout.splitlines() if ln.strip()]
+        else:
+            with open("/proc/swaps", encoding="utf-8") as f:
+                lines = f.readlines()
+            for i, ln in enumerate(lines):
+                if i == 0 and ln.lower().startswith("filename"):
+                    continue
+                parts = ln.split()
+                if parts:
+                    swap_names.append(parts[0])
+    except FileNotFoundError:
+        return True, ""
+    except Exception as e:
+        print(f"  Warning: could not list active swap: {e}")
+        return True, ""
+
+    def _backing_paths_norm(dev):
+        try:
+            pr = subprocess.run(
+                ["lsblk", "-s", "-n", "-o", "PATH", "--paths", dev],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            if pr.returncode != 0:
+                return set()
+            out = set()
+            for line in pr.stdout.splitlines():
+                p = line.strip()
+                if not p:
+                    continue
+                try:
+                    out.add(os.path.realpath(p))
+                except OSError:
+                    out.add(p)
+            return out
+        except Exception:
+            return set()
+
+    errors = []
+    seen = set()
+    for sw in swap_names:
+        if not sw or sw in seen:
+            continue
+        seen.add(sw)
+        if "/zram" in sw:
+            continue
+        try:
+            sw_norm = os.path.realpath(sw)
+        except OSError:
+            sw_norm = sw
+
+        on_this_disk = sw_norm in on_disk_paths_norm
+        if not on_this_disk:
+            backs = _backing_paths_norm(sw)
+            if backs & on_disk_paths_norm:
+                on_this_disk = True
+
+        if not on_this_disk:
+            continue
+
+        ok, err, _ = _run_command(["swapoff", sw], f"swapoff {sw}", progress_callback, timeout=120)
+        if ok:
+            print(f"  swapoff {sw} ok")
+            time.sleep(0.5)
+        else:
+            msg = f"swapoff failed for {sw}: {err}"
+            print(f"  ERROR: {msg}")
+            errors.append(msg)
+
+    return (len(errors) == 0, "\n".join(errors))
+
+
 # --- LVM Deactivation Helper --- 
 def _deactivate_lvm_on_disk(disk_device, progress_callback=None):
     """Attempts to find and deactivate LVM VGs associated with a disk and its partitions."""

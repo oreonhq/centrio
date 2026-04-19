@@ -1,5 +1,6 @@
 import threading
 import os
+import subprocess
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QLabel, QProgressBar, QVBoxLayout, QWidget
@@ -68,20 +69,76 @@ class ProgressPage(QWidget):
         t.start()
 
     def _run_installation_steps(self, config_data):
+        udisks_stopped_for_storage = False
         try:
             disk_config = config_data.get("disk", {})
             commands = disk_config.get("commands", [])
             partitions = disk_config.get("partitions", [])
+            primary_disk = (disk_config.get("target_disks") or [None])[0]
+            storage_cb = self._scaled_progress_callback(0.02, 0.2)
+
+            if primary_disk and commands:
+                stop_ok, stop_err = backend._stop_service("udisks2.service")
+                if not stop_ok:
+                    print(f"Warning: could not stop udisks2 (continuing): {stop_err}")
+                else:
+                    print("Stopped udisks2 temporarily for storage setup.")
+                    udisks_stopped_for_storage = True
+                swap_ok, swap_err = backend.swapoff_on_disk(primary_disk, storage_cb)
+                if not swap_ok:
+                    raise RuntimeError(
+                        f"Could not turn off swap on the target disk. Details: {swap_err}"
+                    )
+                lvm_ok, lvm_err = backend._deactivate_lvm_on_disk(primary_disk, storage_cb)
+                if not lvm_ok:
+                    print(f"Warning: LVM deactivation incomplete (continuing): {lvm_err}")
+
             self._update_progress_text("Preparing storage...", 0.02)
             for idx, cmd in enumerate(commands):
+                if (
+                    primary_disk
+                    and cmd
+                    and cmd[0] == "wipefs"
+                    and primary_disk in cmd
+                ):
+                    so2_ok, so2_err = backend.swapoff_on_disk(primary_disk, storage_cb)
+                    if not so2_ok:
+                        raise RuntimeError(
+                            f"Could not turn off swap on the target disk before wiping. Details: {so2_err}"
+                        )
                 ok, err, _ = backend._run_command(
                     cmd,
                     f"Storage step {idx + 1}",
-                    progress_callback=self._scaled_progress_callback(0.02, 0.2),
+                    progress_callback=storage_cb,
                     timeout=120,
                 )
                 if not ok:
                     raise RuntimeError(err or f"Storage command failed: {' '.join(cmd)}")
+                if (
+                    ok
+                    and primary_disk
+                    and cmd
+                    and cmd[0] == "wipefs"
+                    and primary_disk in cmd
+                ):
+                    pp_ok, pp_err, _ = backend._run_command(
+                        ["partprobe", primary_disk],
+                        f"Reread partitions on {primary_disk} after wipefs",
+                        progress_callback=storage_cb,
+                        timeout=30,
+                    )
+                    if not pp_ok:
+                        print(f"Warning: partprobe after wipefs failed: {pp_err}")
+                    try:
+                        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as e:
+                        print(f"Warning: udevadm settle after wipefs: {e}")
+                    try:
+                        subprocess.run(["sync"], check=False, timeout=15)
+                    except Exception:
+                        pass
             if not backend.ensure_directory(self.target_root):
                 raise RuntimeError(f"Could not create {self.target_root}")
             for part in sorted(partitions, key=lambda p: 0 if p.get("mountpoint") == "/" else 1):
@@ -116,7 +173,6 @@ class ProgressPage(QWidget):
             if not cfg_ok:
                 raise RuntimeError(cfg_err or "System configuration failed")
 
-            primary_disk = (disk_config.get("target_disks") or [None])[0]
             efi = None
             for part in disk_config.get("partitions", []):
                 if part.get("mountpoint") == "/boot/efi":
@@ -136,6 +192,9 @@ class ProgressPage(QWidget):
         except Exception as e:
             self.installation_error = str(e)
             self.signals.done.emit(False, self.installation_error)
+        finally:
+            if udisks_stopped_for_storage:
+                backend._start_service("udisks2.service")
 
     def stop_installation(self):
         self.stop_requested = True
