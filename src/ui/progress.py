@@ -183,6 +183,13 @@ class ProgressPage(Gtk.Box):
             else:
                  print("Stopped udisks2 service temporarily.")
                  time.sleep(1) # Give it a moment
+
+            swap_ok, swap_err = backend.swapoff_on_disk(primary_disk, self._update_progress_text)
+            if not swap_ok:
+                self.installation_error = (
+                    f"Could not turn off swap on the target disk. Close anything using it and retry. Details: {swap_err}"
+                )
+                return False
                  
             # --- Deactivate LVM --- 
             lvm_success, lvm_err = backend._deactivate_lvm_on_disk(primary_disk, self._update_progress_text)
@@ -296,15 +303,9 @@ class ProgressPage(Gtk.Box):
             if unmount_failed: # Check result from loop above
                  return False
 
-            # --- Reread Partitions, Remove DM, Settle, Sync --- 
-            print(f"Running partprobe on {primary_disk}...")
-            try:
-                partprobe_cmd = ["partprobe", primary_disk]
-                pp_success, pp_err, _ = backend._run_command(partprobe_cmd, f"Reread partitions on {primary_disk}", timeout=30)
-                if not pp_success: print(f"  Warning: partprobe failed: {pp_err}")
-                time.sleep(2) # Reduced pause after partprobe, rely on settle
-            except Exception as pp_e: print(f"Warning: Error running partprobe: {pp_e}")
-            
+            # Do not partprobe here. partprobe before wipefs makes the kernel reattach
+            # partition nodes and often leaves the whole disk busy on bare metal.
+
             # Add dmsetup remove
             dm_success, dm_warn = backend._remove_dm_mappings(primary_disk, self._update_progress_text)
             if not dm_success: # Should always return True, but check anyway
@@ -345,6 +346,12 @@ class ProgressPage(Gtk.Box):
                 
                 # --- Final LSOF Check + Delay JUST before wipefs --- 
                 if cmd_name == "wipefs" and primary_disk and primary_disk in cmd_list:
+                    so2_ok, so2_err = backend.swapoff_on_disk(primary_disk, self._update_progress_text)
+                    if not so2_ok:
+                        self.installation_error = (
+                            f"Could not turn off swap on the target disk before wiping. Details: {so2_err}"
+                        )
+                        return False
                     print(f"--- Performing FINAL check before {cmd_name} on {primary_disk} ---")
                     lsof_found_processes = False
                     # Get device paths again in case partprobe changed them
@@ -395,6 +402,31 @@ class ProgressPage(Gtk.Box):
                     # Should we restart udisks2 here on failure?
                     # backend._start_service("udisks2.service") # Maybe add this?
                     return False
+
+                if cmd_name == "wipefs" and primary_disk and primary_disk in cmd_list:
+                    print(f"Running partprobe on {primary_disk} after wipefs...")
+                    try:
+                        pp_success, pp_err, _ = backend._run_command(
+                            ["partprobe", primary_disk],
+                            f"Reread partitions on {primary_disk} after wipefs",
+                            self._update_progress_text,
+                            timeout=30,
+                        )
+                        if not pp_success:
+                            print(f"  Warning: partprobe after wipefs failed: {pp_err}")
+                        time.sleep(1)
+                    except Exception as pp_e:
+                        print(f"Warning: Error running partprobe after wipefs: {pp_e}")
+                    try:
+                        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as settle_e:
+                        print(f"Warning: udevadm settle after wipefs: {settle_e}")
+                    try:
+                        subprocess.run(["sync"], check=False, timeout=15)
+                    except Exception:
+                        pass
                     
             self._update_progress_text("Partitioning and formatting complete.", 0.30) # End fraction adjusted
             
