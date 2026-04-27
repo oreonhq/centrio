@@ -173,6 +173,30 @@ class ProgressPage(QWidget):
             if not cfg_ok:
                 raise RuntimeError(cfg_err or "System configuration failed")
 
+            user_cfg = config_data.get("user", {}) if isinstance(config_data, dict) else {}
+            install_username = None
+            install_user_created = False
+            if isinstance(user_cfg, dict) and user_cfg.get("username"):
+                user_ok, user_err, _ = backend.create_user_in_container(
+                    self.target_root,
+                    user_cfg,
+                    progress_callback=self._scaled_progress_callback(0.82, 0.90),
+                )
+                if not user_ok:
+                    raise RuntimeError(user_err or "User creation failed")
+                install_username = user_cfg.get("username")
+                install_user_created = True
+
+            cleanup_ok, cleanup_err = backend.remove_live_users_and_configure_oobe(
+                self.target_root,
+                install_user_created=install_user_created,
+                install_username=install_username,
+                progress_callback=self._scaled_progress_callback(0.90, 0.94),
+                btrfs_subvolumes=bool(disk_config.get("btrfs_subvolumes", False)),
+            )
+            if not cleanup_ok:
+                raise RuntimeError(cleanup_err or "Failed to remove live users")
+
             efi = None
             for part in disk_config.get("partitions", []):
                 if part.get("mountpoint") == "/boot/efi":
@@ -186,6 +210,26 @@ class ProgressPage(QWidget):
             )
             if not boot_ok:
                 raise RuntimeError(boot_err or "Bootloader install failed")
+
+            # v2 originally skipped post-copy finalization; that leaves live-boot
+            # artifacts and can produce non-bootable installs.
+            payload_cfg = config_data.get("payload", {}) if isinstance(config_data, dict) else {}
+            disk_cfg = config_data.get("disk", {}) if isinstance(config_data, dict) else {}
+            post_ok, post_err = backend.setup_live_environment_post_copy(
+                self.target_root,
+                progress_callback=self._scaled_progress_callback(0.94, 0.995),
+                server_install=bool(payload_cfg.get("server_install", False)),
+                btrfs_subvolumes=bool(disk_cfg.get("btrfs_subvolumes", False)),
+            )
+            if not post_ok:
+                raise RuntimeError(post_err or "Post-copy system finalization failed")
+
+            fstab_ok, fstab_err = backend.generate_fstab_for_target(
+                self.target_root,
+                progress_callback=self._scaled_progress_callback(0.995, 0.998),
+            )
+            if not fstab_ok:
+                raise RuntimeError(fstab_err or "Failed to generate fstab")
 
             backend.remove_centrio_installer()
             self.signals.done.emit(True, "")

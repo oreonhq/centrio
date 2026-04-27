@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 
 from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QPushButton
@@ -40,17 +41,32 @@ class DiskPage(BaseConfigurationPage):
     def _list_disks(self):
         try:
             r = subprocess.run(
-                ["lsblk", "-dn", "-o", "PATH,TYPE"],
+                ["lsblk", "-J", "-b", "-d", "-o", "PATH,NAME,TYPE,SIZE,RM,RO"],
                 capture_output=True,
                 text=True,
                 timeout=8,
                 check=True,
             )
+            payload = json.loads(r.stdout) if r.stdout else {}
             disks = []
-            for line in r.stdout.splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[1] == "disk":
-                    disks.append(parts[0])
+            min_size_bytes = 8 * 1024 * 1024 * 1024
+            skip_prefixes = ("loop", "zram", "ram", "dm-", "sr", "fd", "md")
+            for dev in payload.get("blockdevices", []):
+                if str(dev.get("type", "")).strip() != "disk":
+                    continue
+                if int(dev.get("ro", 0) or 0) != 0:
+                    continue
+                if int(dev.get("rm", 0) or 0) != 0:
+                    continue
+                name = str(dev.get("name", "")).strip()
+                if not name or name.startswith(skip_prefixes):
+                    continue
+                size = int(dev.get("size", 0) or 0)
+                if size < min_size_bytes:
+                    continue
+                path = str(dev.get("path", "")).strip()
+                if path and path.startswith("/dev/"):
+                    disks.append(path)
             return disks or ["/dev/sda"]
         except Exception:
             return ["/dev/sda"]

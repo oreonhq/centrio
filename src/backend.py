@@ -2211,10 +2211,39 @@ GRUB_ENABLE_BLSCFG=true
                 ok_ls, _, ls_out = _run_command(["ls", "-1", bls_dir], "List BLS entries", progress_callback, timeout=5)
                 if ok_ls and ls_out:
                     rd_lvm_re = re.compile(r'\brd\.lvm\.lv=[^\s]+\s*')
-                    root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
+                    root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+|live:[^\s]+)\s*')
                     resume_re = re.compile(r'\bresume=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
                     # Live uses BTRFS subvol=root; our plain mkfs.btrfs has no subvolumes - strip rootflags
                     rootflags_subvol_re = re.compile(r'\brootflags=[^\s]*subvol=[^\s]+\s*|\brootflags=[^\s]+\s*')
+                    # Live-ISO arguments break installed boots if preserved in BLS entries.
+                    live_arg_prefixes = (
+                        "rd.live.",
+                        "live.",
+                        "boot=live",
+                        "boot=casper",
+                        "root=live:",
+                        "iso-scan/filename=",
+                        "rd.writable.fsimg=",
+                        "rd.live.overlay=",
+                    )
+
+                    def _strip_live_kernel_args(opts):
+                        kept = []
+                        for tok in opts.split():
+                            if any(tok.startswith(p) for p in live_arg_prefixes):
+                                continue
+                            if tok in ("liveimg", "overlay", "rd.live.image"):
+                                continue
+                            kept.append(tok)
+                        # Deduplicate while preserving order
+                        out = []
+                        seen = set()
+                        for tok in kept:
+                            if tok in seen:
+                                continue
+                            seen.add(tok)
+                            out.append(tok)
+                        return " ".join(out).strip()
                     for name in [n.strip() for n in ls_out.splitlines() if n.strip()]:
                         if not name.endswith(".conf"):
                             continue
@@ -2244,6 +2273,7 @@ GRUB_ENABLE_BLSCFG=true
                                         opts = opts.strip()
                                         if "rootflags=" not in opts:
                                             opts = (opts + " rootflags=subvol=root").strip()  # Fedora-style root subvolume
+                                    opts = _strip_live_kernel_args(opts)
                                     opts = opts.strip()
                                     add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
                                     for p in add:
@@ -2253,7 +2283,7 @@ GRUB_ENABLE_BLSCFG=true
                                 new_lines.append(line)
                             new_content = "\n".join(new_lines) + "\n"
                             if write_file_as_root(path, new_content, progress_callback):
-                                print(f"Fixed BLS entry {name} (root=UUID=..., removed rd.lvm.lv)")
+                                print(f"Fixed BLS entry {name} (root=UUID, removed live/LVM args)")
                         except Exception as e:
                             print(f"Warning: Could not patch BLS entry {path}: {e}")
         except Exception as e:
