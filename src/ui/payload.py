@@ -66,7 +66,7 @@ class PayloadPage(BaseConfigurationPage):
         self.group_checks = {}
         for idx, (group_id, group_info) in enumerate(self.package_groups.items()):
             cb = QCheckBox(group_info["label"])
-            cb.setChecked(group_id in ("core", "desktop"))
+            cb.setChecked(group_id == "core")
             if group_id == "core":
                 cb.setEnabled(False)
             groups_layout.addWidget(cb, idx // 2, idx % 2)
@@ -101,7 +101,7 @@ class PayloadPage(BaseConfigurationPage):
         ]
         for app_id, label in browser_options:
             cb = QCheckBox(label)
-            if app_id == "org.mozilla.firefox":
+            if app_id == "none":
                 cb.setChecked(True)
             browser_layout.addWidget(cb)
             self.browser_group.addButton(cb)
@@ -115,7 +115,7 @@ class PayloadPage(BaseConfigurationPage):
         flatpak_layout.setContentsMargins(14, 10, 14, 12)
         flatpak_layout.setSpacing(6)
         self.flatpak_enabled = QCheckBox("Enable Flatpak support")
-        self.flatpak_enabled.setChecked(True)
+        self.flatpak_enabled.setChecked(False)
         flatpak_layout.addWidget(self.flatpak_enabled)
         self.flatpak_checks = {}
         for app_id, app_name in self.flatpak_catalog.items():
@@ -181,10 +181,12 @@ class PayloadPage(BaseConfigurationPage):
         btn.clicked.connect(self.apply_settings_and_return)
         self.page_layout.addWidget(btn)
 
+        self._apply_desktop_sensitivity(desktop_active=True)
+
     def _enforce_single_browser(self, browser_key, checked):
         if not checked:
             if not any(cb.isChecked() for cb in self.browser_checks.values()):
-                self.browser_checks["firefox"].setChecked(True)
+                self.browser_checks["none"].setChecked(True)
             return
         for key, cb in self.browser_checks.items():
             if key != browser_key:

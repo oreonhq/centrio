@@ -15,11 +15,10 @@ class LanguagePage(BaseConfigurationPage):
             overlay_widget=overlay_widget,
             **kwargs,
         )
-        locales = ana_get_available_locales()
-        self.locale_codes = list(locales.keys())
+        self.locale_codes = ana_get_available_locales()
         self.locale_combo = QComboBox()
         for code in self.locale_codes:
-            self.locale_combo.addItem(f"{locales[code]} ({code})")
+            self.locale_combo.addItem(code)
         self.page_layout.addWidget(QLabel("System Locale"))
         self.page_layout.addWidget(self.locale_combo)
         btn = QPushButton("Apply System Locale")

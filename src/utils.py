@@ -80,62 +80,129 @@ def _parse_xkb_layout_descriptions():
     return desc
 
 
+def _console_keymap_display_name(code, descriptions):
+    """Map a localectl keymap name to a readable label using XKB layout names.
+
+    list-keymaps mixes hundreds of hardware-specific and variant names. Showing
+    raw codes looks like gibberish. We only attach a friendly name when we can
+    derive it from an evdev ! layout entry, optionally with a variant suffix.
+    """
+    if not code or not descriptions:
+        return None
+    if code in descriptions:
+        return descriptions[code]
+    parts = code.split("-")
+    for i in range(len(parts), 0, -1):
+        prefix = "-".join(parts[:i])
+        if prefix in descriptions:
+            if i == len(parts):
+                return descriptions[prefix]
+            suffix = "-".join(parts[i:])
+            return f"{descriptions[prefix]} ({suffix})"
+    return None
+
+
 def ana_get_keyboard_layouts():
-    """Fetches console keymaps and returns list of (display_name, keymap_code) for UI.
-    Display names come from XKB evdev.lst where available; otherwise the code is shown.
+    """Return (display_name, keymap_code) for layouts usable with localectl.
+
+    Entries are limited to names we can label from XKB evdev.lst, intersected
+    with localectl list-keymaps, plus common compound maps that share an evdev
+    layout prefix (de-latin1-nodeadkeys -> German (...)).
     """
     print("Fetching keyboard layouts using localectl...")
     descriptions = _parse_xkb_layout_descriptions()
     try:
-        result = subprocess.run(["localectl", "list-keymaps"],
-                                capture_output=True, text=True, check=True, timeout=15)
-        keymaps = sorted([line.strip() for line in result.stdout.split("\n") if line.strip()])
-        if not keymaps:
-            keymaps = ["us"]
-        # Build (display_name, code) list; sort by display name
+        env = os.environ.copy()
+        env.setdefault("LC_ALL", "C.UTF-8")
+        env.setdefault("LANG", "C.UTF-8")
+        result = subprocess.run(
+            ["localectl", "list-keymaps"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        keymaps_set = {line.strip() for line in result.stdout.split("\n") if line.strip()}
+        if not keymaps_set:
+            keymaps_set = {"us"}
+
         pairs = []
-        for code in keymaps:
-            display = descriptions.get(code, code)
-            pairs.append((display, code))
-        pairs.sort(key=lambda x: x[0].lower())
-        print(f"  Found {len(pairs)} keyboard layouts.")
-        return pairs  # List of (display_name, keymap_code)
+        if descriptions:
+            for code in sorted(keymaps_set, key=str.lower):
+                label = _console_keymap_display_name(code, descriptions)
+                if label is None:
+                    continue
+                pairs.append((label, code))
+            pairs.sort(key=lambda x: (x[0].lower(), x[1].lower()))
+        if not pairs:
+            # No evdev.lst (or no overlap): keep a minimal safe list
+            for fallback in ("us", "uk", "de", "fr"):
+                if fallback in keymaps_set:
+                    pairs.append((fallback, fallback))
+            if not pairs and keymaps_set:
+                fb = sorted(keymaps_set, key=str.lower)[0]
+                pairs.append((fb, fb))
+        print(f"  Found {len(pairs)} keyboard layouts (filtered for readable names).")
+        return pairs
     except FileNotFoundError:
         raise RuntimeError("localectl is required for keyboard layouts. Install systemd or ensure localectl is in PATH.")
     except (subprocess.CalledProcessError, Exception) as e:
         raise RuntimeError(f"localectl list-keymaps failed: {e}") from e
 
+# One codeset segment (may contain hyphens, e.g. UTF-8, ISO-8859-15); optional @modifier.
+_LOCALE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}\.[A-Za-z0-9_.@-]+$")
+
+
 def ana_get_available_locales():
-    """Fetches available locales using localectl."""
+    """Fetch locale identifiers from localectl as a sorted list.
+
+    We show the raw identifier in the UI. Guessing \"English (US)\" from codes
+    breaks on modifiers and non-ASCII output, and wrong subprocess decoding
+    turns lines into gibberish. Forcing UTF-8 in the child and accepting only
+    sane ASCII-looking lines avoids that.
+    """
     print("Fetching available locales using localectl...")
-    locales = {}
     try:
-        result = subprocess.run(["localectl", "list-locales"], 
-                                capture_output=True, text=True, check=True)
-        raw_locales = [line.strip() for line in result.stdout.split('\n') if line and '.' in line]
-        # Attempt to generate a display name (basic)
-        for locale_code in raw_locales:
-             # Simple conversion for display: en_US.UTF-8 -> English (US) UTF-8
-             parts = locale_code.split('.')[0].split('_')
-             lang = parts[0]
-             country = f"({parts[1]})" if len(parts) > 1 else ""
-             # This name generation is very basic, ideally use a locale library
-             display_name = f"{lang.capitalize()} {country}".strip()
-             # Use code as key, display name as value (or vice-versa if needed by UI)
-             locales[locale_code] = display_name 
-             
-        print(f"  Found {len(locales)} locales.")
-        sorted_locales = dict(sorted(locales.items(), key=lambda item: item[1]))
-        if not sorted_locales:
-            raise RuntimeError("localectl list-locales returned no locales.")
-        return sorted_locales
+        env = os.environ.copy()
+        env.setdefault("LC_ALL", "C.UTF-8")
+        env.setdefault("LANG", "C.UTF-8")
+        result = subprocess.run(
+            ["localectl", "list-locales"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        seen = set()
+        codes = []
+        for line in result.stdout.splitlines():
+            s = line.strip()
+            if not s or "." not in s:
+                continue
+            if not _LOCALE_ID_RE.fullmatch(s):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            codes.append(s)
+        codes.sort(key=str.lower)
+        print(f"  Found {len(codes)} locales.")
+        if not codes:
+            raise RuntimeError("localectl list-locales returned no usable locale lines.")
+        return codes
 
     except FileNotFoundError:
         raise RuntimeError("localectl is required for locales. Install systemd or ensure localectl is in PATH.") from None
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"localectl list-locales failed: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"Unexpected error fetching locales: {e}") from e 
+        raise RuntimeError(f"Unexpected error fetching locales: {e}") from e
 
 # Note: Avoid importing GUI or app-specific constants here to keep utils lightweight.
 
