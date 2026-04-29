@@ -173,25 +173,11 @@ class ProgressPage(QWidget):
             if not cfg_ok:
                 raise RuntimeError(cfg_err or "System configuration failed")
 
-            user_cfg = config_data.get("user", {}) if isinstance(config_data, dict) else {}
-            install_username = None
-            install_user_created = False
-            if isinstance(user_cfg, dict) and user_cfg.get("username"):
-                user_ok, user_err, _ = backend.create_user_in_container(
-                    self.target_root,
-                    user_cfg,
-                    progress_callback=self._scaled_progress_callback(0.82, 0.90),
-                )
-                if not user_ok:
-                    raise RuntimeError(user_err or "User creation failed")
-                install_username = user_cfg.get("username")
-                install_user_created = True
-
             cleanup_ok, cleanup_err = backend.remove_live_users_and_configure_oobe(
                 self.target_root,
-                install_user_created=install_user_created,
-                install_username=install_username,
-                progress_callback=self._scaled_progress_callback(0.90, 0.94),
+                install_user_created=False,
+                install_username=None,
+                progress_callback=self._scaled_progress_callback(0.82, 0.90),
                 btrfs_subvolumes=bool(disk_config.get("btrfs_subvolumes", False)),
             )
             if not cleanup_ok:
@@ -230,6 +216,14 @@ class ProgressPage(QWidget):
             )
             if not fstab_ok:
                 raise RuntimeError(fstab_err or "Failed to generate fstab")
+
+            # Run OOBE setup LAST so no later stage can overwrite markers/units.
+            ps_ok, ps_err = backend.configure_plasma_setup_oobe(
+                self.target_root,
+                progress_callback=self._scaled_progress_callback(0.997, 0.999),
+            )
+            if not ps_ok:
+                raise RuntimeError(ps_err or "Plasma Setup OOBE configuration failed")
 
             backend.remove_centrio_installer()
             self.signals.done.emit(True, "")

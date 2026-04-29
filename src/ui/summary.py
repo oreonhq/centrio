@@ -55,7 +55,6 @@ class SummaryPage(QWidget):
         self._add_config_row("network",   "Network Connectivity",      "Network for additional software",             True)
         self._add_config_row("disk",      "Installation Destination",  "Disk selection and partitioning method",      True)
         self._add_config_row("payload",   "Software Packages",         "Package selection and repositories",          True)
-
     def _add_config_row(self, key, title, subtitle_base, required):
         card = QFrame()
         card.setObjectName("card")

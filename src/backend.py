@@ -455,81 +455,96 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
 # --- Configuration Functions ---
 
 def configure_system_in_container(target_root, config_data, progress_callback=None):
-    """Configures timezone, locale, keyboard, hostname in target via chroot.
-    Modified to write directly to config files instead of using systemd tools.
+    """Configures timezone, locale, keyboard, hostname on the target root.
+
+    For Plasma installs, timezone, /etc/locale.conf, and console keymap are not
+    written here. Fedora KDE and Anaconda hide those spokes so Plasma Setup can
+    own language, keyboard, and time on first boot without fighting a pre-seeded
+    system state copied from the live image.
     """
     all_success = True
     errors = []
-    
-    # --- Timezone --- 
-    tz = config_data.get('timedate', {}).get('timezone')
-    if tz:
-        print(f"Configuring Timezone to {tz}...")
-        tz_file_path = os.path.join(target_root, "etc/timezone")
-        localtime_path = os.path.join(target_root, "etc/localtime")
-        zoneinfo_path = os.path.join(target_root, f"usr/share/zoneinfo/{tz}")
-        
-        try:
-            # Write timezone name to /etc/timezone
-            print(f"  Writing timezone name to {tz_file_path}...")
-            if not write_file_as_root(tz_file_path, f"{tz}\n", progress_callback):
-                raise OSError(f"Failed to write {tz_file_path}")
-            
-            # Link /etc/localtime to zoneinfo file
-            if os.path.exists(zoneinfo_path):
-                print(f"  Linking {localtime_path} -> {zoneinfo_path}...")
-                if os.path.lexists(localtime_path):
-                    _run_command(["rm", "-f", localtime_path], "Remove existing localtime", progress_callback)
-                ok, _, _ = _run_command(["ln", "-sf", f"/usr/share/zoneinfo/{tz}", localtime_path], "Create localtime symlink", progress_callback)
-                if not ok:
-                    raise OSError("Failed to create localtime symlink")
-            else:
-                print(f"  Warning: Zoneinfo file not found at {zoneinfo_path}. Cannot link /etc/localtime.")
-                # Don't mark as failure, system might cope or use /etc/timezone
-                
-        except Exception as e:
-            err_msg = f"Failed to configure timezone {tz}: {e}"
-            print(f"  ERROR: {err_msg}")
-            errors.append(err_msg)
-            all_success = False
-    else:
-        print("Skipping timezone configuration (not provided).")
 
-    # --- Locale --- 
-    locale = config_data.get('language', {}).get('locale')
-    if locale:
-        print(f"Configuring Locale to {locale}...")
-        locale_conf_path = os.path.join(target_root, "etc/locale.conf")
-        try:
-            print(f"  Writing locale to {locale_conf_path}...")
-            if not write_file_as_root(locale_conf_path, f"LANG={locale}\n", progress_callback):
-                raise OSError(f"Failed to write {locale_conf_path}")
-        except Exception as e:
-            err_msg = f"Failed to configure locale {locale}: {e}"
-            print(f"  ERROR: {err_msg}")
-            errors.append(err_msg)
-            all_success = False
-    else:
-         print("Skipping locale configuration (not provided).")
+    skip_locale_stack_for_plasma_oobe = _target_has_plasma_session(target_root)
+    if skip_locale_stack_for_plasma_oobe:
+        print(
+            "Target has Plasma: not writing timezone, /etc/locale.conf, or "
+            "/etc/vconsole.conf (left for Plasma Setup OOBE, same idea as fedora-kde Anaconda profile)."
+        )
 
-    # --- Keymap --- 
-    keymap = config_data.get('keyboard', {}).get('layout')
-    if keymap:
-        print(f"Configuring Keymap to {keymap}...")
-        vconsole_conf_path = os.path.join(target_root, "etc/vconsole.conf")
-        try:
-            print(f"  Writing keymap to {vconsole_conf_path}...")
-            if not write_file_as_root(vconsole_conf_path, f"KEYMAP={keymap}\n", progress_callback):
-                raise OSError(f"Failed to write {vconsole_conf_path}")
-        except Exception as e:
-            err_msg = f"Failed to configure keymap {keymap}: {e}"
-            print(f"  ERROR: {err_msg}")
-            errors.append(err_msg)
-            all_success = False
-    else:
-        print("Skipping keymap configuration (not provided).")
-        
-    # --- Hostname --- 
+    # --- Timezone ---
+    if not skip_locale_stack_for_plasma_oobe:
+        tz = config_data.get('timedate', {}).get('timezone')
+        if tz:
+            print(f"Configuring Timezone to {tz}...")
+            tz_file_path = os.path.join(target_root, "etc/timezone")
+            localtime_path = os.path.join(target_root, "etc/localtime")
+            zoneinfo_path = os.path.join(target_root, f"usr/share/zoneinfo/{tz}")
+
+            try:
+                print(f"  Writing timezone name to {tz_file_path}...")
+                if not write_file_as_root(tz_file_path, f"{tz}\n", progress_callback):
+                    raise OSError(f"Failed to write {tz_file_path}")
+
+                if os.path.exists(zoneinfo_path):
+                    print(f"  Linking {localtime_path} -> {zoneinfo_path}...")
+                    if os.path.lexists(localtime_path):
+                        _run_command(["rm", "-f", localtime_path], "Remove existing localtime", progress_callback)
+                    ok, _, _ = _run_command(
+                        ["ln", "-sf", f"/usr/share/zoneinfo/{tz}", localtime_path],
+                        "Create localtime symlink",
+                        progress_callback,
+                    )
+                    if not ok:
+                        raise OSError("Failed to create localtime symlink")
+                else:
+                    print(f"  Warning: Zoneinfo file not found at {zoneinfo_path}. Cannot link /etc/localtime.")
+
+            except Exception as e:
+                err_msg = f"Failed to configure timezone {tz}: {e}"
+                print(f"  ERROR: {err_msg}")
+                errors.append(err_msg)
+                all_success = False
+        else:
+            print("Skipping timezone configuration (not provided).")
+
+    # --- Locale ---
+    if not skip_locale_stack_for_plasma_oobe:
+        locale = config_data.get('language', {}).get('locale')
+        if locale:
+            print(f"Configuring Locale to {locale}...")
+            locale_conf_path = os.path.join(target_root, "etc/locale.conf")
+            try:
+                print(f"  Writing locale to {locale_conf_path}...")
+                if not write_file_as_root(locale_conf_path, f"LANG={locale}\n", progress_callback):
+                    raise OSError(f"Failed to write {locale_conf_path}")
+            except Exception as e:
+                err_msg = f"Failed to configure locale {locale}: {e}"
+                print(f"  ERROR: {err_msg}")
+                errors.append(err_msg)
+                all_success = False
+        else:
+            print("Skipping locale configuration (not provided).")
+
+    # --- Keymap ---
+    if not skip_locale_stack_for_plasma_oobe:
+        keymap = config_data.get('keyboard', {}).get('layout')
+        if keymap:
+            print(f"Configuring Keymap to {keymap}...")
+            vconsole_conf_path = os.path.join(target_root, "etc/vconsole.conf")
+            try:
+                print(f"  Writing keymap to {vconsole_conf_path}...")
+                if not write_file_as_root(vconsole_conf_path, f"KEYMAP={keymap}\n", progress_callback):
+                    raise OSError(f"Failed to write {vconsole_conf_path}")
+            except Exception as e:
+                err_msg = f"Failed to configure keymap {keymap}: {e}"
+                print(f"  ERROR: {err_msg}")
+                errors.append(err_msg)
+                all_success = False
+        else:
+            print("Skipping keymap configuration (not provided).")
+
+    # --- Hostname ---
     # Use "oreon" as default so installed system does not inherit live env hostname
     hostname = config_data.get('network', {}).get('hostname') or "oreon"
     print(f"Configuring Hostname to {hostname}...")
@@ -547,63 +562,133 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
     final_error_str = "\n".join(errors)
     return all_success, final_error_str
 
-def create_user_in_container(target_root, user_config, progress_callback=None):
-    """Creates user account in target via chroot."""
-    username = user_config.get('username')
-    password = user_config.get('password', None) # Get password from config
-    is_admin = user_config.get('is_admin', False)
-    real_name = user_config.get('real_name', '') 
-    
-    if not username:
-        return False, "Username not provided in user configuration.", None
-    # Allow proceeding even if password is None or empty, chpasswd might handle it or fail later
-    # if not password:
-    #      return False, "Password not provided for user creation.", None
-
-    # Build useradd command
-    useradd_cmd = ["useradd", "-m", "-s", "/bin/bash", "-U"]
-    if real_name:
-        useradd_cmd.extend(["-c", real_name])
-    if is_admin:
-        useradd_cmd.extend(["-G", "wheel"]) # Add to wheel group for sudo
-    useradd_cmd.append(username)
-    
-    success, err, _ = _run_in_chroot(target_root, useradd_cmd, f"Create User {username}", progress_callback, timeout=30)
-    if not success: return False, err, None
-    
-    # Set password using chpasswd -R (runs on host, updates target's passwd; avoids chroot PAM/NSS hang)
-    if password is not None:
-        chpasswd_input = f"{username}:{password}\n"
-        success, err, _ = _run_command(
-            ["chpasswd", "-R", target_root],
-            f"Set Password for {username}",
-            progress_callback,
-            timeout=15,
-            pipe_input=chpasswd_input
-        )
-        if not success: 
-            print(f"Warning: Failed to set password for {username} after user creation: {err}")
-            # Decide if this should be a fatal error for the whole installation
-            # return False, err, None # Stop installation if password set fails?
-            pass # Continue for now
-    else:
-         print(f"Warning: No password provided for user {username}. Account created without password set.")
-        
-    return True, "", None
-
 
 # Live users to remove from installed system (live environment accounts)
 LIVE_USERNAMES = ["liveuser", "live", "fedora", "gnome"]
+
+
+def _target_has_gnome_shell(target_root):
+    return os.path.isfile(os.path.join(target_root, "usr/bin/gnome-shell"))
+
+
+def _target_has_plasma_session(target_root):
+    return (
+        os.path.isfile(os.path.join(target_root, "usr/bin/startplasma-wayland"))
+        or os.path.isfile(os.path.join(target_root, "usr/bin/startplasma-x11"))
+    )
+
+
+def _target_display_manager_basename(target_root):
+    """Basename of the unit display-manager.service points at (e.g. plasmalogin.service)."""
+    link_path = os.path.join(target_root, "etc/systemd/system/display-manager.service")
+    try:
+        if os.path.islink(link_path):
+            return os.path.basename(os.readlink(link_path))
+    except OSError:
+        pass
+    return None
+
+
+def _target_plasma_oobe_display_manager_kind(target_root, progress_callback=None):
+    """Return 'plasmalogin' or 'sddm' for plasma-setup autologin, or None if neither applies.
+
+    Upstream plasma-setup-bootutil only uses plasmalogin.conf.d when systemd
+    GetUnitFileState(plasmalogin.service) equals the string 'enabled'. When the
+    DM is selected via display-manager.service while the unit file state is
+    static or indirect, bootutil writes SDDM autologin instead even though
+    Plasma Login Manager is what starts, so OOBE never autologins.
+    """
+    base = _target_display_manager_basename(target_root) or ""
+    low = base.lower()
+    if "plasmalogin" in low or "plasma-login" in low:
+        return "plasmalogin"
+    if "sddm" in low:
+        return "sddm"
+    if "gdm" in low or "lightdm" in low:
+        return None
+
+    ok_p, _, out_p = _run_command(
+        ["systemctl", "--root", target_root, "is-enabled", "plasmalogin.service"],
+        "is-enabled plasmalogin.service (install root)",
+        progress_callback,
+        timeout=20,
+    )
+    if ok_p and (out_p or "").strip() == "enabled":
+        return "plasmalogin"
+
+    ok_s, _, out_s = _run_command(
+        ["systemctl", "--root", target_root, "is-enabled", "sddm.service"],
+        "is-enabled sddm.service (install root)",
+        progress_callback,
+        timeout=20,
+    )
+    if ok_s and (out_s or "").strip() == "enabled":
+        return "sddm"
+
+    for wants_name in ("graphical.target.wants", "multi-user.target.wants"):
+        wants = os.path.join(target_root, "etc/systemd/system", wants_name)
+        if os.path.lexists(os.path.join(wants, "plasmalogin.service")):
+            return "plasmalogin"
+        if os.path.lexists(os.path.join(wants, "sddm.service")):
+            return "sddm"
+
+    if os.path.isfile(
+        os.path.join(target_root, "usr/lib/systemd/system/plasmalogin.service")
+    ) or os.path.isfile(os.path.join(target_root, "lib/systemd/system/plasmalogin.service")):
+        return "plasmalogin"
+    if os.path.isfile(
+        os.path.join(target_root, "usr/lib/systemd/system/sddm.service")
+    ) or os.path.isfile(os.path.join(target_root, "lib/systemd/system/sddm.service")):
+        return "sddm"
+    return None
+
+
+_PLASMA_SETUP_AUTOLOGIN_SNIPPET = (
+    "[Autologin]\n"
+    "User=plasma-setup\n"
+    "Session=plasma\n"
+)
+
+
+def write_plasma_setup_display_manager_autologin(target_root, progress_callback=None):
+    """Write the same autologin drop-in as KDE plasma-setup-bootutil for the real default DM."""
+    dm_kind = _target_plasma_oobe_display_manager_kind(target_root, progress_callback)
+    if dm_kind is None:
+        print(
+            "  Skipping plasma-setup DM autologin drop-in "
+            "(no plasmalogin or SDDM default detected)."
+        )
+        return True, ""
+
+    sddm_path = os.path.join(target_root, "etc/sddm.conf.d/99-plasma-setup.conf")
+    pl_path = os.path.join(target_root, "etc/plasmalogin.conf.d/99-plasma-setup.conf")
+    if dm_kind == "plasmalogin":
+        inst_path, stale_path = pl_path, sddm_path
+    else:
+        inst_path, stale_path = sddm_path, pl_path
+
+    if not write_file_as_root(inst_path, _PLASMA_SETUP_AUTOLOGIN_SNIPPET, progress_callback):
+        return False, f"Could not write plasma-setup autologin at {inst_path}"
+
+    print(f"  Wrote plasma-setup autologin for {dm_kind} at {inst_path}")
+
+    _run_command(
+        ["rm", "-f", stale_path],
+        f"Remove stale plasma-setup autologin {stale_path}",
+        progress_callback,
+        timeout=10,
+    )
+    return True, ""
 
 
 def remove_live_users_and_configure_oobe(target_root, install_user_created=False, install_username=None, progress_callback=None, btrfs_subvolumes=False):
     """Remove live-environment users from the target and configure first-boot behavior.
 
     - Removes users in LIVE_USERNAMES (e.g. liveuser) so the system does not boot to them.
-    - If install_user_created and install_username: create marker so GNOME OOBE is skipped
-      for that user on first login (installer already did language/keyboard/user setup).
-    - If no user was created: leave OOBE to run (GDM will show no normal users and can run
-      gnome-initial-setup when appropriate).
+    - On GNOME installs only: if install_user_created, write gnome-initial-setup-done so GDM
+      skips duplicate account setup (installer already collected user).
+    - On KDE Plasma installs: do not write those markers so Plasma Welcome and first-session
+      onboarding can still run after first login.
     """
     if progress_callback:
         progress_callback("Removing live users and configuring first boot...", None)
@@ -645,8 +730,7 @@ def remove_live_users_and_configure_oobe(target_root, install_user_created=False
         except Exception as e:
             print(f"Warning: Could not remove {acct_file}: {e}")
 
-    if install_user_created and install_username:
-        # Mark OOBE as done so first login goes to desktop (installer already did setup)
+    if install_user_created and install_username and _target_has_gnome_shell(target_root) and not _target_has_plasma_session(target_root):
         user_home = os.path.join(target_root, "home", install_username)
         marker_dir = os.path.join(user_home, ".config")
         marker_file = os.path.join(marker_dir, "gnome-initial-setup-done")
@@ -654,7 +738,7 @@ def remove_live_users_and_configure_oobe(target_root, install_user_created=False
             os.makedirs(marker_dir, exist_ok=True)
             with open(marker_file, "w") as f:
                 f.write("")
-            print(f"  Created OOBE-done marker for {install_username}")
+            print(f"  Created GNOME OOBE-done marker for {install_username}")
         except Exception as e:
             print(f"Warning: Could not create OOBE marker: {e}")
         var_lib = os.path.join(target_root, "var/lib")
@@ -663,11 +747,110 @@ def remove_live_users_and_configure_oobe(target_root, install_user_created=False
             os.makedirs(var_lib, exist_ok=True)
             with open(gis_done, "w") as f:
                 f.write("")
-            print("  Created system-wide OOBE-done marker")
+            print("  Created system-wide GNOME OOBE-done marker")
         except Exception as e:
             print(f"Warning: Could not create {gis_done}: {e}")
+    elif install_user_created and install_username and _target_has_plasma_session(target_root):
+        print("  Plasma session detected, skipping GNOME OOBE markers (Plasma Setup handles first boot)")
 
     print("Live user removal and OOBE configuration complete.")
+    return True, ""
+
+
+def configure_plasma_setup_oobe(target_root, progress_callback=None):
+    """Enable KDE first-boot OOBE service robustly.
+
+    Different Plasma snapshots/images may ship either:
+    - plasma-setup.service
+    - kde-initial-system-setup.service
+    """
+    candidate_units = ["plasma-setup.service", "kde-initial-system-setup.service"]
+    unit_name = None
+    for cand in candidate_units:
+        cand_paths = [
+            os.path.join(target_root, "usr/lib/systemd/system", cand),
+            os.path.join(target_root, "lib/systemd/system", cand),
+        ]
+        if any(os.path.isfile(p) for p in cand_paths):
+            unit_name = cand
+            break
+    if not unit_name:
+        return (
+            False,
+            "No Plasma OOBE systemd unit found (plasma-setup.service or kde-initial-system-setup.service). "
+            "Add plasma-setup to the image.",
+        )
+
+    done_markers = [
+        os.path.join(target_root, "etc/plasma-setup-done"),
+        os.path.join(target_root, "etc/kde-initial-system-setup-done"),
+    ]
+
+    if progress_callback:
+        progress_callback("Configuring Plasma Setup (first boot OOBE)...", None)
+
+    for marker in done_markers:
+        _run_command(
+            ["rm", "-f", marker],
+            f"Remove OOBE done marker {marker}",
+            progress_callback,
+            timeout=10,
+        )
+        try:
+            if os.path.exists(marker):
+                os.remove(marker)
+        except Exception:
+            pass
+        if os.path.exists(marker):
+            return False, f"Could not remove OOBE done marker {marker}"
+
+    # Plasma session and login stack treat this empty file as "initial setup" mode.
+    init_mode_path = os.path.join(target_root, "var/lib/plasma-setup-init-mode")
+    if not write_file_as_root(init_mode_path, "", progress_callback):
+        return False, f"Could not create {init_mode_path}"
+    print(f"  Created plasma-setup init mode marker {init_mode_path}")
+
+    # Unmask if image masked the service.
+    masked_path = os.path.join(target_root, "etc/systemd/system", unit_name)
+    try:
+        if os.path.islink(masked_path) and os.readlink(masked_path) == "/dev/null":
+            _run_command(["rm", "-f", masked_path], f"Unmask {unit_name}", progress_callback, timeout=10)
+    except Exception:
+        pass
+
+    ok, err, _ = _run_command(
+        ["systemctl", "--root", target_root, "enable", unit_name],
+        f"Enable {unit_name} for first-boot OOBE",
+        progress_callback,
+        timeout=60,
+    )
+    if not ok:
+        return False, err or f"systemctl enable {unit_name} failed"
+
+    # Upstream kde-initial-system-setup.service uses:
+    #   Before=display-manager.service
+    #   WantedBy=multi-user.target
+    # It must be pulled in by multi-user.target so it runs before SDDM.
+    wants_dir = os.path.join(target_root, "etc/systemd/system/multi-user.target.wants")
+    ensure_directory(wants_dir, progress_callback)
+    link_path = os.path.join(wants_dir, unit_name)
+    if not os.path.exists(link_path):
+        unit_source = f"/usr/lib/systemd/system/{unit_name}"
+        _run_command(
+            ["ln", "-s", unit_source, link_path],
+            f"Create graphical.target wants symlink for {unit_name}",
+            progress_callback,
+            timeout=10,
+        )
+
+    print(f"  {unit_name} enabled for Plasma Setup OOBE on first boot.")
+
+    autologin_ok, autologin_err = write_plasma_setup_display_manager_autologin(
+        target_root, progress_callback
+    )
+    if not autologin_ok:
+        return False, autologin_err or "plasma-setup display manager autologin failed"
+
     return True, ""
 
 
@@ -1838,6 +2021,8 @@ def copy_live_environment(target_root, progress_callback=None):
         "/etc/resolv.conf",  # Will be copied separately
         "/etc/hosts",  # Will be regenerated
         "/etc/hostname",  # Will be set by configuration
+        "/etc/plasma-setup-done",  # Must not suppress first-boot Plasma OOBE
+        "/etc/kde-initial-system-setup-done",  # Alternate OOBE marker
         "/etc/machine-id",  # Will be regenerated
         "/etc/adjtime",  # Will be regenerated
         "/var/lib/dbus/machine-id",  # Will be regenerated
@@ -1924,6 +2109,14 @@ def copy_live_environment(target_root, progress_callback=None):
             ]
             for pat in exclude_patterns:
                 rsync_cmd.extend(["--exclude", pat])
+            # Apply file/path exclusions relative to the directory being copied.
+            for file_pat in exclude_files:
+                if file_pat == directory:
+                    rsync_cmd.extend(["--exclude", "."])
+                elif file_pat.startswith(directory.rstrip("/") + "/"):
+                    rel_pat = file_pat[len(directory.rstrip("/")) + 1:]
+                    if rel_pat:
+                        rsync_cmd.extend(["--exclude", rel_pat])
             if directory == "/boot":
                 rsync_cmd.extend(["--exclude", "efi/***", "--exclude", "efi/"])
             rsync_cmd.extend([f"{source}/", destination])
