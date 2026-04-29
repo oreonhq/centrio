@@ -33,9 +33,6 @@ from ui.welcome import WelcomePage
 from ui.summary import SummaryPage
 from ui.progress import ProgressPage
 from ui.finished import FinishedPage
-from ui.keyboard import KeyboardPage
-from ui.language import LanguagePage
-from ui.timedate import TimeDatePage
 from ui.disk import DiskPage
 from ui.network import NetworkConnectivityPage
 from ui.payload import PayloadPage
@@ -48,7 +45,7 @@ class CentrioInstallerWindow(QMainWindow):
         self.required_configs = set() # Set of keys for required configurations
         self.main_page_order = ["welcome", "summary", "progress", "finished"]
         # All known configuration page keys
-        self.config_page_keys = ["keyboard", "language", "timedate", "disk", "network", "payload"]
+        self.config_page_keys = ["disk", "network", "payload"]
         self.final_config = {} # Stores final selected values passed back from ui
 
         self.setWindowTitle("Centrio Installer")
@@ -64,7 +61,6 @@ class CentrioInstallerWindow(QMainWindow):
         main_box.addWidget(self.view_stack, 1)
 
         # --- Add ui to the stack ---
-        # Main flow ui (pass main_window so welcome can restart for language change)
         self.welcome_page = WelcomePage(main_window=self)
         self.view_stack.addWidget(self.welcome_page)
 
@@ -78,16 +74,6 @@ class CentrioInstallerWindow(QMainWindow):
         self.finished_page = FinishedPage(app=None)
         self.view_stack.addWidget(self.finished_page)
 
-        # Configuration ui - Pass main_window and the overlay
-        self.keyboard_page = KeyboardPage(main_window=self, overlay_widget=None)
-        self.view_stack.addWidget(self.keyboard_page)
-        
-        self.language_page = LanguagePage(main_window=self, overlay_widget=None)
-        self.view_stack.addWidget(self.language_page)
-        
-        self.timedate_page = TimeDatePage(main_window=self, overlay_widget=None)
-        self.view_stack.addWidget(self.timedate_page)
-        
         self.disk_page = DiskPage(main_window=self, overlay_widget=None)
         self.view_stack.addWidget(self.disk_page)
         
@@ -102,9 +88,6 @@ class CentrioInstallerWindow(QMainWindow):
             "summary": self.summary_page,
             "progress": self.progress_page,
             "finished": self.finished_page,
-            "keyboard": self.keyboard_page,
-            "language": self.language_page,
-            "timedate": self.timedate_page,
             "disk": self.disk_page,
             "network": self.network_page,
             "payload": self.payload_page,

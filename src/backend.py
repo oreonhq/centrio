@@ -650,8 +650,81 @@ _PLASMA_SETUP_AUTOLOGIN_SNIPPET = (
 )
 
 
+def _remove_autologin_sections_from_ini_text(text):
+    """
+    Remove any [Autologin] sections from an INI-like file.
+
+    Keeps all other sections intact. If [Autologin] is the last section,
+    it will be removed through end-of-file.
+    """
+    lines = text.splitlines(keepends=True)
+    out = []
+    in_autologin = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not in_autologin:
+            if stripped.lower() == "[autologin]":
+                in_autologin = True
+                continue
+            out.append(line)
+            continue
+
+        # We are currently skipping the [Autologin] section until the next section header.
+        # Section headers look like [Something]
+        if stripped.startswith("[") and stripped.endswith("]") and stripped.lower() != "[autologin]":
+            in_autologin = False
+            out.append(line)
+        else:
+            continue
+
+    return "".join(out)
+
+
+def purge_plasmalogin_autologin_configs(target_root, progress_callback=None):
+    """Remove stale Plasma Login autologin config copied from the live ISO."""
+    conf_main = os.path.join(target_root, "etc/plasmalogin.conf")
+    conf_d = os.path.join(target_root, "etc/plasmalogin.conf.d")
+
+    def _process_file(path):
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                original = f.read()
+            updated = _remove_autologin_sections_from_ini_text(original)
+            if updated == original:
+                return
+            if not updated.strip():
+                _run_command(
+                    ["rm", "-f", path],
+                    f"Remove empty plasmalogin config {path}",
+                    progress_callback,
+                    timeout=10,
+                )
+                return
+            write_file_as_root(path, updated, progress_callback)
+        except Exception as e:
+            print(f"Warning: Failed to purge plasmalogin autologin from {path}: {e}")
+
+    _process_file(conf_main)
+
+    try:
+        if os.path.isdir(conf_d):
+            for name in os.listdir(conf_d):
+                if not name.endswith(".conf"):
+                    continue
+                _process_file(os.path.join(conf_d, name))
+    except Exception as e:
+        print(f"Warning: Failed to purge plasmalogin.conf.d: {e}")
+
+
 def write_plasma_setup_display_manager_autologin(target_root, progress_callback=None):
     """Write the same autologin drop-in as KDE plasma-setup-bootutil for the real default DM."""
+    # If the live ISO left behind a plasmalogin autologin for a live user,
+    # it can mess with the first-boot flow. Remove that junk first.
+    purge_plasmalogin_autologin_configs(target_root, progress_callback=progress_callback)
+
     dm_kind = _target_plasma_oobe_display_manager_kind(target_root, progress_callback)
     if dm_kind is None:
         print(
@@ -2023,6 +2096,7 @@ def copy_live_environment(target_root, progress_callback=None):
         "/etc/hostname",  # Will be set by configuration
         "/etc/plasma-setup-done",  # Must not suppress first-boot Plasma OOBE
         "/etc/kde-initial-system-setup-done",  # Alternate OOBE marker
+        "/etc/plasmalogin.conf",  # Live ISO may contain stale autologin config
         "/etc/machine-id",  # Will be regenerated
         "/etc/adjtime",  # Will be regenerated
         "/var/lib/dbus/machine-id",  # Will be regenerated

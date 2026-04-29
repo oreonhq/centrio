@@ -26,7 +26,7 @@ class SummaryPage(QWidget):
         title.setObjectName("pageTitle")
         outer.addWidget(title)
 
-        subtitle = QLabel("Review and complete all required settings before proceeding.")
+        subtitle = QLabel("Review and complete installation settings before proceeding.")
         subtitle.setObjectName("pageSubtitle")
         outer.addWidget(subtitle)
 
@@ -49,9 +49,6 @@ class SummaryPage(QWidget):
         self.status_label.setObjectName("pageSubtitle")
         outer.addWidget(self.status_label)
 
-        self._add_config_row("keyboard",  "Keyboard Layout",          "Configure keyboard input method",             True)
-        self._add_config_row("language",  "System Language",           "Set the default system locale",               False)
-        self._add_config_row("timedate",  "Time & Date",               "Timezone and time synchronization",           True)
         self._add_config_row("network",   "Network Connectivity",      "Network for additional software",             True)
         self._add_config_row("disk",      "Installation Destination",  "Disk selection and partitioning method",      True)
         self._add_config_row("payload",   "Software Packages",         "Package selection and repositories",          True)
