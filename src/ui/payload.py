@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import backend
+
 from .base import BaseConfigurationPage
 
 
@@ -78,7 +80,7 @@ class PayloadPage(BaseConfigurationPage):
         desktop_layout = QVBoxLayout(desktop_box)
         desktop_layout.setContentsMargins(14, 10, 14, 12)
         desktop_layout.setSpacing(6)
-        self.server_install = QCheckBox("Install server profile")
+        self.server_install = QCheckBox("Install server profile (headless, removes KDE Plasma)")
         self.server_install.toggled.connect(self._on_server_mode_toggled)
         self.desktop_mode = QCheckBox("Install desktop profile")
         self.desktop_mode.setChecked(True)
@@ -271,6 +273,7 @@ class PayloadPage(BaseConfigurationPage):
             "oem_repo_url":    self.repo_url.text().strip(),
             "keep_cache":      self.keep_cache.isChecked(),
             "use_live_copy":   True,
+            "offline_install": backend.install_skipped_network({"network": net}),
         }
         self.show_toast(
             f"Software plan saved. {len(selected_packages)} DNF packages, {len(flatpak_packages)} Flatpak apps."

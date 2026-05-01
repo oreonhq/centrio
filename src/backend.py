@@ -1015,6 +1015,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     flatpak_packages = package_config.get("flatpak_packages", [])
     minimal_install = package_config.get("minimal_install", False)
     keep_cache = package_config.get("keep_cache", True)
+    offline_install = package_config.get("offline_install", False)
     
     print(f"Packages to install: {len(packages)}")
     print(f"Additional repositories: {len(repositories)}")
@@ -1024,12 +1025,15 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     
     # --- Setup Additional Repositories First ---
     if repositories:
-        if progress_callback:
-            progress_callback("Setting up additional repositories...", 0.1)
-        success, err = setup_repositories(target_root, repositories, progress_callback)
-        if not success:
-            print(f"Warning: Some repositories failed to setup: {err}")
-            # Continue anyway, as base installation might still work
+        if offline_install:
+            print("Skipping additional repository setup (offline install).")
+        else:
+            if progress_callback:
+                progress_callback("Setting up additional repositories...", 0.1)
+            success, err = setup_repositories(target_root, repositories, progress_callback)
+            if not success:
+                print(f"Warning: Some repositories failed to setup: {err}")
+                # Continue anyway, as base installation might still work
     
     # --- Install Packages ---
     if progress_callback:
@@ -1055,7 +1059,9 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
             packages.insert(packages.index(arch["grub_efi_modules_pkg"]) + 1, "grub2-pc")
         print("Using default package list")
     
-    success, err = _install_packages_dnf_impl(target_root, packages, progress_callback, keep_cache)
+    success, err = _install_packages_dnf_impl(
+        target_root, packages, progress_callback, keep_cache, cacheonly=offline_install
+    )
     if not success:
         return False, err
     
@@ -1064,7 +1070,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
         if progress_callback:
             progress_callback("Setting up Flatpak...", 0.85)
         
-        success, err = setup_flatpak(target_root, progress_callback)
+        success, err = setup_flatpak(target_root, progress_callback, offline_install=offline_install)
         if not success:
             print(f"Warning: Flatpak setup failed: {err}")
             # Don't fail the entire installation for Flatpak issues
@@ -1085,8 +1091,11 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     print("Enhanced package installation completed successfully.")
     return True, ""
 
-def _install_packages_dnf_impl(target_root, packages, progress_callback=None, keep_cache=True):
-    """Implementation of DNF package installation with progress tracking."""
+def _install_packages_dnf_impl(target_root, packages, progress_callback=None, keep_cache=True, cacheonly=False):
+    """Implementation of DNF package installation with progress tracking.
+
+    cacheonly: pass True when installing without network (dnf -C), using local cache only.
+    """
     
     # --- Filter out problematic packages --- 
     filtered_packages = []
@@ -1118,16 +1127,18 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
     )
 
     # Build DNF command with package exclusions and speed optimizations
-    dnf_cmd = [
-        "dnf", 
-        "install", 
-        "-y", 
-        "--nogpgcheck", 
+    dnf_cmd = ["dnf"]
+    if cacheonly:
+        dnf_cmd.extend(["-C", "--noplugins"])
+    dnf_cmd.extend([
+        "install",
+        "-y",
+        "--nogpgcheck",
         f"--installroot={target_root}",
         f"--releasever={releasever}",
         f"--setopt=install_weak_deps=False",
         "--setopt=max_parallel_downloads=10",
-        "--setopt=fastestmirror=True",
+        "--setopt=fastestmirror=False" if cacheonly else "--setopt=fastestmirror=True",
         "--exclude=firefox",
         "--exclude=redhat-flatpak-repo", 
         "--exclude=almalinux-*",
@@ -1137,8 +1148,8 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         "--exclude=oreon-*",
         "--exclude=centrio-installer",
         "--setopt=installonly_limit=0",  # Don't limit kernel installations
-        "--setopt=keepcache=1" if keep_cache else "--setopt=keepcache=0"
-    ]
+        "--setopt=keepcache=1" if keep_cache else "--setopt=keepcache=0",
+    ])
     if not enable_scriptlets:
         dnf_cmd.append("--setopt=tsflags=noscripts")  # Skip problematic scriptlets
     else:
@@ -1320,7 +1331,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
             if process.stderr and not process.stderr.closed:
                 process.stderr.close()
 
-def setup_flatpak(target_root, progress_callback=None):
+def setup_flatpak(target_root, progress_callback=None, offline_install=False):
     """Setup Flatpak and add Flathub repository in the target system."""
     print("Setting up Flatpak...")
     
@@ -1337,6 +1348,8 @@ def setup_flatpak(target_root, progress_callback=None):
         if result.returncode != 0:
             print(f"Package {package} not found, installing...")
             install_cmd = ["dnf", "install", "-y", package, f"--installroot={target_root}"]
+            if offline_install:
+                install_cmd = ["dnf", "-C", "--noplugins", "install", "-y", package, f"--installroot={target_root}"]
             success, err, _ = _run_command(install_cmd, f"Install {package}", progress_callback, timeout=300)
             if not success:
                 return False, f"Failed to install {package}: {err}"
@@ -1435,11 +1448,14 @@ def install_packages_dnf(target_root, progress_callback=None):
 # --- Bootloader Installation ---
 # Installation logic is in install_logic.py
 
-def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False):
     """Installs GRUB2 for UEFI (with Secure Boot) or legacy BIOS. Delegates to install_logic.
     When boot_partition_device is set (separate /boot), GRUB uses that partition for config/kernel."""
     from install_logic import install_bootloader
-    return install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback, boot_partition_device)
+    return install_bootloader(
+        target_root, primary_disk, efi_partition_device, progress_callback, boot_partition_device,
+        offline_install=offline_install,
+    )
 
 
 def regenerate_grub_cfg_in_chroot(target_root, progress_callback=None):
@@ -1505,7 +1521,7 @@ def _start_service(service_name):
     return _manage_service("start", service_name)
 
 
-def remove_centrio_installer():
+def remove_centrio_installer(offline_install=False):
     """Remove the centrio-installer package and installer desktop files from the live system after successful install."""
     # Remove desktop files from LIVE system first (user sees "Install Oreon" on live session)
     for desktop_name in ["anaconda.desktop", "liveinst.desktop"]:
@@ -1520,6 +1536,31 @@ def remove_centrio_installer():
                 print(f"Removed {desktop_name} from {subdir}")
     # Remove the package (also removes its desktop file if not already deleted)
     try:
+        if offline_install:
+            ok_q, _, _ = _run_command(
+                ["rpm", "-q", "centrio-installer"],
+                "Query centrio-installer on live system",
+                timeout=10,
+            )
+            if not ok_q:
+                print("centrio-installer not installed on live system (nothing to remove)")
+                return
+            success, err, _ = _run_command(
+                ["rpm", "-e", "centrio-installer"],
+                "Remove centrio-installer via rpm (offline)",
+                timeout=120,
+            )
+            if not success:
+                success, err, _ = _run_command(
+                    ["rpm", "-e", "--nodeps", "centrio-installer"],
+                    "Remove centrio-installer via rpm --nodeps (offline)",
+                    timeout=120,
+                )
+            if success:
+                print("Centrio-installer removed from live system (rpm).")
+            else:
+                print(f"Could not remove centrio-installer (non-fatal): {err}")
+            return
         success, err, _ = _run_command(
             ["dnf", "remove", "-y", "centrio-installer"],
             "Remove centrio-installer from live system",
@@ -1842,7 +1883,7 @@ def _remove_dm_mappings(disk_device, progress_callback=None):
     return all_success, final_error_str 
 
 # Enhanced GRUB package verification with distribution-specific handling
-def verify_grub_packages(target_root):
+def verify_grub_packages(target_root, offline_install=False):
     # Detect distribution type and set appropriate package names
     os_info = get_os_release_info(target_root=target_root)
     distro_id = os_info.get("ID", "unknown").lower()
@@ -1902,6 +1943,13 @@ def verify_grub_packages(target_root):
         try:
             print("Attempting to install missing GRUB packages...")
             if "ubuntu" in distro_id or "debian" in distro_like:
+                if offline_install:
+                    return (
+                        False,
+                        "Required GRUB packages are missing on the target and apt cannot run offline. "
+                        "Use an image that includes GRUB or enable network for this install.",
+                        None,
+                    )
                 install_cmd = ["apt-get", "install", "-y"] + missing_packages
             else:
                 # Get releasever from target so repo URLs (e.g. EPEL) resolve. Use major version for RHEL-family.
@@ -1910,10 +1958,16 @@ def verify_grub_packages(target_root):
                     releasever = releasever.split(".")[0]
                 if not releasever:
                     return False, "Could not detect VERSION_ID for DNF (needed for --releasever). Check target /etc/os-release.", None
-                install_cmd = [
-                    "dnf", "install", "-y",
-                    f"--releasever={releasever}",
-                ] + missing_packages
+                if offline_install:
+                    install_cmd = [
+                        "dnf", "-C", "--noplugins", "install", "-y",
+                        f"--releasever={releasever}",
+                    ] + missing_packages
+                else:
+                    install_cmd = [
+                        "dnf", "install", "-y",
+                        f"--releasever={releasever}",
+                    ] + missing_packages
             
             success, err, stdout = _run_in_chroot(target_root, install_cmd, "Install missing GRUB packages", timeout=300)
             if success:
@@ -2224,7 +2278,7 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False):
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, offline_install=False):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -2232,7 +2286,7 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
     - Setting up bootloader
     - Configuring network
     - Setting up users
-    - When server_install: remove GNOME/desktop packages
+    - When server_install: remove KDE Plasma desktop and boot to multi-user.target
     """
     
     print("Setting up live environment for target disk...")
@@ -2581,14 +2635,60 @@ GRUB_ENABLE_BLSCFG=true
         print(f"ERROR: initramfs regeneration failed: {e}")
         return False, f"initramfs regeneration failed (required for boot): {e}"
 
-    # --- Server install: remove GNOME/desktop packages ---
+    # --- Server install: remove KDE Plasma / graphical desktop ---
     if server_install:
         try:
-            gnome_pkgs = ["gdm", "gnome-shell", "gnome-session", "gnome-initial-setup", "gnome-software", "@gnome-desktop"]
-            _run_in_chroot(target_root, ["dnf", "remove", "-y"] + gnome_pkgs, "Remove GNOME (server install)", progress_callback, timeout=300)
-            print("Removed GNOME packages for server installation")
+            # Batched removes: comps IDs differ between Fedora-style and EL spins; unknown groups fail the whole transaction.
+            plasma_batches = [
+                ["@kde-desktop-environment"],
+                ["@kde-desktop"],
+                ["plasma-desktop", "plasma-workspace", "kwin"],
+                ["sddm", "plasmalogin"],
+                ["plasma-setup", "plasma-systemsettings"],
+                ["kinfocenter", "powerdevil", "bluedevil", "plasma-nm"],
+                ["plasma-discover"],
+                ["kde-gtk-config", "breeze-gtk", "xdg-desktop-portal-kde", "kde-cli-tools"],
+            ]
+            for batch in plasma_batches:
+                if not batch:
+                    continue
+                if offline_install:
+                    dnf_rm = ["dnf", "-C", "--noplugins", "remove", "-y"] + batch
+                else:
+                    dnf_rm = ["dnf", "remove", "-y", "--noplugins"] + batch
+                ok_batch, err_batch, _ = _run_in_chroot(
+                    target_root,
+                    dnf_rm,
+                    f"Remove Plasma/server batch ({batch[0]})",
+                    progress_callback,
+                    timeout=900,
+                )
+                if ok_batch:
+                    print(f"Removed Plasma/server batch ({batch[0]})")
+                else:
+                    print(f"Warning: Plasma remove batch ({batch[0]}) skipped or failed: {err_batch}")
+
+            for svc in (
+                "display-manager.service",
+                "sddm.service",
+                "plasmalogin.service",
+                "gdm.service",
+            ):
+                _run_command(
+                    ["systemctl", "--root", target_root, "disable", svc],
+                    f"Disable {svc} for server profile",
+                    progress_callback,
+                    timeout=30,
+                )
+            _run_command(
+                ["systemctl", "--root", target_root, "set-default", "multi-user.target"],
+                "Default target multi-user (server profile)",
+                progress_callback,
+                timeout=30,
+            )
+            print("Server profile: Plasma batches processed, graphical login disabled, default target multi-user.")
         except Exception as e:
-            print(f"Warning: Could not remove GNOME packages: {e}")
+            print(f"Warning: Server profile Plasma removal or systemd preset failed: {e}")
 
     # --- Remove live-specific GNOME/Software config overrides ---
     live_dconf_dirs = [
@@ -2601,30 +2701,30 @@ GRUB_ENABLE_BLSCFG=true
             _run_command(["rm", "-f", d], f"Remove live config {d}", progress_callback, timeout=5)
             print(f"Removed live config: {d}")
 
-    # --- Re-enable GNOME Software updates tab (livesys-scripts disables it on live boot) ---
-    # Livesys appends allow-updates=false, download-updates=false to this override; remove it so installed system has updates.
-    gs_override = os.path.join(target_root, "usr/share/glib-2.0/schemas/org.gnome.software.gschema.override")
-    ok, _, _ = _run_command(["test", "-f", gs_override], "Check gs override", progress_callback, timeout=5)
-    if ok:
-        _run_command(["rm", "-f", gs_override], "Remove GNOME Software schema override", progress_callback, timeout=5)
-        print("Removed org.gnome.software.gschema.override so updates tab is enabled")
-    if write_file_as_root(gs_override, "[org.gnome.software]\nallow-updates=true\ndownload-updates=true\n", progress_callback):
-        print("Wrote org.gnome.software.gschema.override with updates enabled")
-    # Rebuild schema cache
+    # --- GNOME Software overrides (only when GNOME shell is installed; KDE-based images skip this) ---
+    if _target_has_gnome_shell(target_root):
+        # Livesys appends allow-updates=false; restore updates behavior on GNOME desktops.
+        gs_override = os.path.join(target_root, "usr/share/glib-2.0/schemas/org.gnome.software.gschema.override")
+        ok, _, _ = _run_command(["test", "-f", gs_override], "Check gs override", progress_callback, timeout=5)
+        if ok:
+            _run_command(["rm", "-f", gs_override], "Remove GNOME Software schema override", progress_callback, timeout=5)
+            print("Removed org.gnome.software.gschema.override so updates tab is enabled")
+        if write_file_as_root(gs_override, "[org.gnome.software]\nallow-updates=true\ndownload-updates=true\n", progress_callback):
+            print("Wrote org.gnome.software.gschema.override with updates enabled")
+
+        search_ini = os.path.join(target_root, "usr/share/gnome-shell/search-providers/org.gnome.Software-search-provider.ini")
+        ok_cat, _, content = _run_command(["cat", search_ini], "Read search provider ini", progress_callback, timeout=5)
+        if ok_cat and content:
+            content = content.replace("DefaultDisabled=true", "DefaultDisabled=false")
+            if "DefaultDisabled=" not in content:
+                content = content.rstrip() + "\nDefaultDisabled=false\n"
+            if write_file_as_root(search_ini, content, progress_callback):
+                print("Re-enabled GNOME Software search provider")
+
     try:
         _run_in_chroot(target_root, ["glib-compile-schemas", "/usr/share/glib-2.0/schemas"], "Compile GLib schemas", progress_callback)
     except Exception as e:
         print(f"Warning: Could not compile schemas: {e}")
-
-    # --- Re-enable GNOME Software search provider (livesys sets DefaultDisabled=true) ---
-    search_ini = os.path.join(target_root, "usr/share/gnome-shell/search-providers/org.gnome.Software-search-provider.ini")
-    ok_cat, _, content = _run_command(["cat", search_ini], "Read search provider ini", progress_callback, timeout=5)
-    if ok_cat and content:
-        content = content.replace("DefaultDisabled=true", "DefaultDisabled=false")
-        if "DefaultDisabled=" not in content:
-            content = content.rstrip() + "\nDefaultDisabled=false\n"
-        if write_file_as_root(search_ini, content, progress_callback):
-            print("Re-enabled GNOME Software search provider")
 
     # --- Ensure essential directories exist ---
     essential_dirs = [
@@ -2755,6 +2855,22 @@ def check_network_connectivity():
         return False
 
 
+def install_skipped_network(config_data):
+    """True when installs must not use networked DNF (cache-only / rpm instead).
+
+    That applies when the user chose Continue without network, when network
+    status is not connected, or when config is missing (conservative default).
+    """
+    if not isinstance(config_data, dict):
+        return True
+    net = config_data.get("network") or {}
+    if bool(net.get("skip_network", True)):
+        return True
+    if net.get("network_status") != "connected":
+        return True
+    return False
+
+
 def install_packages_on_live_copy(target_root, package_config, progress_callback=None):
     """Installs additional packages on top of the copied live environment.
     
@@ -2776,13 +2892,17 @@ def install_packages_on_live_copy(target_root, package_config, progress_callback
     print(f"Flatpak packages to install: {len(flatpak_packages)}")
     
     btrfs_subvolumes = package_config.get("btrfs_subvolumes", False)
+    offline_install = package_config.get("offline_install", False)
     if repositories:
-        if progress_callback:
-            progress_callback("Setting up additional repositories...", 0.1)
-        success, err = setup_repositories(target_root, repositories, progress_callback)
-        if not success:
-            print(f"Warning: Some repositories failed to setup: {err}")
-            # Continue anyway, as base system is already present
+        if offline_install:
+            print("Skipping additional repository setup (offline install).")
+        else:
+            if progress_callback:
+                progress_callback("Setting up additional repositories...", 0.1)
+            success, err = setup_repositories(target_root, repositories, progress_callback)
+            if not success:
+                print(f"Warning: Some repositories failed to setup: {err}")
+                # Continue anyway, as base system is already present
     
     # --- Install Additional Packages ---
     if packages:
@@ -2790,7 +2910,9 @@ def install_packages_on_live_copy(target_root, package_config, progress_callback
             progress_callback("Installing additional packages...", 0.2)
         
         # Use DNF to install additional packages (not the full system)
-        success, err = _install_packages_dnf_impl(target_root, packages, progress_callback, keep_cache=True)
+        success, err = _install_packages_dnf_impl(
+            target_root, packages, progress_callback, keep_cache=True, cacheonly=offline_install
+        )
         if not success:
             return False, err
 
@@ -2925,7 +3047,9 @@ GRUB_BTRFS_SNAPSHOT_KERNEL_PARAMETERS=\"systemd.volatile=state\"
     # --- NVIDIA Drivers (x86_64 only; uses official NVIDIA repo, scriptlets enabled) ---
     nvidia_drivers = package_config.get("nvidia_drivers", False)
     arch = get_host_architecture()
-    if nvidia_drivers and arch["arch"] == "x86_64":
+    if nvidia_drivers and offline_install:
+        print("Skipping NVIDIA driver install (requires network repositories).")
+    elif nvidia_drivers and arch["arch"] == "x86_64":
         if progress_callback:
             progress_callback("Setting up NVIDIA driver repository...", 0.5)
         nvidia_repo_url = "https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64"
@@ -2961,7 +3085,7 @@ gpgcheck=0
         if progress_callback:
             progress_callback("Setting up Flatpak...", 0.85)
         
-        success, err = setup_flatpak(target_root, progress_callback)
+        success, err = setup_flatpak(target_root, progress_callback, offline_install=offline_install)
         if not success:
             print(f"Warning: Flatpak setup failed: {err}")
             # Don't fail the entire installation for Flatpak issues

@@ -71,6 +71,7 @@ class ProgressPage(QWidget):
     def _run_installation_steps(self, config_data):
         udisks_stopped_for_storage = False
         try:
+            offline_install = backend.install_skipped_network(config_data)
             disk_config = config_data.get("disk", {})
             commands = disk_config.get("commands", [])
             partitions = disk_config.get("partitions", [])
@@ -193,6 +194,7 @@ class ProgressPage(QWidget):
                 primary_disk,
                 efi,
                 progress_callback=self._scaled_progress_callback(0.87, 0.99),
+                offline_install=offline_install,
             )
             if not boot_ok:
                 raise RuntimeError(boot_err or "Bootloader install failed")
@@ -206,6 +208,7 @@ class ProgressPage(QWidget):
                 progress_callback=self._scaled_progress_callback(0.94, 0.995),
                 server_install=bool(payload_cfg.get("server_install", False)),
                 btrfs_subvolumes=bool(disk_cfg.get("btrfs_subvolumes", False)),
+                offline_install=offline_install,
             )
             if not post_ok:
                 raise RuntimeError(post_err or "Post-copy system finalization failed")
@@ -217,15 +220,16 @@ class ProgressPage(QWidget):
             if not fstab_ok:
                 raise RuntimeError(fstab_err or "Failed to generate fstab")
 
-            # Run OOBE setup LAST so no later stage can overwrite markers/units.
-            ps_ok, ps_err = backend.configure_plasma_setup_oobe(
-                self.target_root,
-                progress_callback=self._scaled_progress_callback(0.997, 0.999),
-            )
-            if not ps_ok:
-                raise RuntimeError(ps_err or "Plasma Setup OOBE configuration failed")
+            # Run Plasma first-boot OOBE only for desktop installs (server profile strips Plasma).
+            if not bool(payload_cfg.get("server_install", False)):
+                ps_ok, ps_err = backend.configure_plasma_setup_oobe(
+                    self.target_root,
+                    progress_callback=self._scaled_progress_callback(0.997, 0.999),
+                )
+                if not ps_ok:
+                    raise RuntimeError(ps_err or "Plasma Setup OOBE configuration failed")
 
-            backend.remove_centrio_installer()
+            backend.remove_centrio_installer(offline_install=offline_install)
             self.signals.done.emit(True, "")
         except Exception as e:
             self.installation_error = str(e)

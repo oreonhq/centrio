@@ -257,7 +257,7 @@ def _get_device_uuid(device_path):
     return None
 
 
-def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False):
     """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
     signed shim+grub from host, stub grub.cfg on ESP.
     Mounts the target ESP to a private temp dir so we always write to the correct partition."""
@@ -267,7 +267,7 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
         return False, "EFI partition device does not exist: %s" % efi_partition_device, None
 
     from backend import verify_grub_packages
-    vok, verr, _ = verify_grub_packages(target_root)
+    vok, verr, _ = verify_grub_packages(target_root, offline_install=offline_install)
     if not vok:
         return False, verr or "Required GRUB packages missing.", None
 
@@ -523,7 +523,7 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
     return False, "GRUB config missing or too small after grub2-mkconfig; fallback failed: %s" % err2
 
 
-def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False):
     """
     Install bootloader for target: UEFI (with Secure Boot support) or legacy BIOS.
     Works with dnf-based systems. Returns (success, error_msg, verification_dict or None).
@@ -539,7 +539,8 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if uefi:
         ok, err, efi_install_id = _install_uefi_bootloader(
             target_root, primary_disk, efi_partition_device, progress_callback,
-            boot_partition_device=boot_partition_device
+            boot_partition_device=boot_partition_device,
+            offline_install=offline_install,
         )
         if efi_install_id is None:
             efi_install_id = BOOTLOADER_ID
