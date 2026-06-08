@@ -1,0 +1,60 @@
+name: Require Team Approval
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-approval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Token
+        id: get_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Verify and Auto-Approve
+        env:
+          GH_TOKEN: ${{ steps.get_token.outputs.token }}
+        run: |
+          ORG="${{ github.repository_owner }}"
+          TEAM="${{ github.event.repository.name }}"
+          PR="${{ github.event.pull_request.number }}"
+          AUTHOR="${{ github.event.pull_request.user.login }}"
+
+          # 1. Check if the PR author is a maintainer
+          if gh api orgs/$ORG/teams/$TEAM/memberships/$AUTHOR > /dev/null 2>&1; then
+            echo "Author is a maintainer. Having the bot submit an official approval..."
+
+            # The bot physically approves the PR, satisfying GitHub's native UI requirements
+            gh pr review $PR --approve --body "🤖 **Auto-Approved:** PR authored by an authorized maintainer (@$AUTHOR)."
+
+            exit 0
+          fi
+
+          # 2. If the author is NOT a maintainer, check if a maintainer has manually approved it
+          APPROVERS=$(gh api repos/$ORG/$TEAM/pulls/$PR/reviews --jq '.[] | select(.state == "APPROVED") | .user.login' | sort -u)
+
+          if [ -z "$APPROVERS" ]; then
+            echo "No approvals found."
+            exit 1
+          fi
+
+          APPROVED=false
+          for USER in $APPROVERS; do
+            if gh api orgs/$ORG/teams/$TEAM/memberships/$USER > /dev/null 2>&1; then
+              echo "Approved by authorized maintainer: @$USER"
+              APPROVED=true
+              break
+            fi
+          done
+
+          if [ "$APPROVED" = false ]; then
+            echo "Approvals found, but none are from the authorized maintainer team."
+            exit 1
+          fi
