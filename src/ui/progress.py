@@ -1,6 +1,7 @@
 import threading
 import os
 import subprocess
+import time
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QLabel, QProgressBar, QVBoxLayout, QWidget
@@ -59,6 +60,80 @@ class ProgressPage(QWidget):
             self._update_progress_text(text, f)
 
         return cb
+
+    _CORE_PACKAGES = frozenset([
+        "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-efi-aa64", "grub2-efi-aa64-modules",
+        "grub2-pc", "grub2-common", "grub2-tools", "shim-x64", "shim-aa64", "shim", "efibootmgr",
+        "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "centrio-installer",
+    ])
+
+    def _install_additional_packages(self, config_data, offline_install):
+        payload_cfg = config_data.get("payload", {}) if isinstance(config_data, dict) else {}
+        disk_cfg = config_data.get("disk", {}) if isinstance(config_data, dict) else {}
+        btrfs_subvolumes = bool(disk_cfg.get("btrfs_subvolumes", False))
+
+        packages = payload_cfg.get("packages", [])
+        repositories = payload_cfg.get("repositories", [])
+        flatpak_enabled = payload_cfg.get("flatpak_enabled", False)
+        flatpak_packages = payload_cfg.get("flatpak_packages", [])
+        nvidia_drivers = bool(payload_cfg.get("nvidia_drivers", False))
+
+        extra_packages = [p for p in packages if p not in self._CORE_PACKAGES]
+        snapper_packages = (
+            ["snapper", "python3-dnf-plugin-snapper", "grub-btrfs", "inotify-tools"]
+            if btrfs_subvolumes else []
+        )
+        has_extra_work = bool(
+            extra_packages or repositories or flatpak_enabled or flatpak_packages
+            or btrfs_subvolumes or nvidia_drivers
+        )
+        if not has_extra_work:
+            print("No additional packages selected - base system only")
+            return True, ""
+
+        needs_network = bool(
+            extra_packages or repositories or flatpak_enabled or flatpak_packages
+            or (nvidia_drivers and not offline_install)
+        )
+        if needs_network and not offline_install:
+            self._update_progress_text("Refreshing network...", 0.74)
+            backend.restart_network_manager()
+            self._update_progress_text("Checking network connectivity...", 0.74)
+            network_ok = False
+            for _ in range(8):
+                if backend.check_network_connectivity():
+                    network_ok = True
+                    break
+                time.sleep(2)
+            if not network_ok:
+                raise RuntimeError(
+                    "Additional software was selected, but no internet connection is available. "
+                    "Connect to Wi-Fi/Ethernet and retry, or choose Continue without network "
+                    "to install base system only."
+                )
+        elif needs_network and offline_install:
+            raise RuntimeError(
+                "Additional software was selected, but this install is offline. "
+                "Connect to the network or deselect extra packages and NVIDIA drivers."
+            )
+
+        package_config = {
+            "packages": extra_packages + snapper_packages,
+            "repositories": repositories,
+            "flatpak_enabled": flatpak_enabled,
+            "flatpak_packages": flatpak_packages,
+            "nvidia_drivers": nvidia_drivers,
+            "server_install": bool(payload_cfg.get("server_install", False)),
+            "minimal_install": False,
+            "keep_cache": payload_cfg.get("keep_cache", True),
+            "btrfs_subvolumes": btrfs_subvolumes,
+            "offline_install": offline_install,
+        }
+        return backend.install_packages_on_live_copy(
+            self.target_root,
+            package_config,
+            progress_callback=self._scaled_progress_callback(0.74, 0.82),
+        )
 
     def start_installation(self, main_window, config_data):
         self.main_window = main_window
@@ -169,16 +244,20 @@ class ProgressPage(QWidget):
             cfg_ok, cfg_err = backend.configure_system_in_container(
                 self.target_root,
                 config_data,
-                progress_callback=self._scaled_progress_callback(0.75, 0.87),
+                progress_callback=self._scaled_progress_callback(0.75, 0.78),
             )
             if not cfg_ok:
                 raise RuntimeError(cfg_err or "System configuration failed")
+
+            pkg_ok, pkg_err = self._install_additional_packages(config_data, offline_install)
+            if not pkg_ok:
+                raise RuntimeError(pkg_err or "Additional package installation failed")
 
             cleanup_ok, cleanup_err = backend.remove_live_users_and_configure_oobe(
                 self.target_root,
                 install_user_created=False,
                 install_username=None,
-                progress_callback=self._scaled_progress_callback(0.82, 0.90),
+                progress_callback=self._scaled_progress_callback(0.82, 0.88),
                 btrfs_subvolumes=bool(disk_config.get("btrfs_subvolumes", False)),
             )
             if not cleanup_ok:

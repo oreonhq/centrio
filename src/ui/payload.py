@@ -89,7 +89,7 @@ class PayloadPage(BaseConfigurationPage):
         desktop_layout.addWidget(self.server_install)
         content_layout.addWidget(desktop_box)
 
-        # --- Default Browser (Flatpak only) ---
+        # --- Default Browser ---
         self.browser_box = QGroupBox("Default Browser")
         browser_layout = QVBoxLayout(self.browser_box)
         browser_layout.setContentsMargins(14, 10, 14, 12)
@@ -97,8 +97,11 @@ class PayloadPage(BaseConfigurationPage):
         self.browser_group = QButtonGroup(self)
         self.browser_checks = {}
         browser_options = [
-            ("org.mozilla.firefox",    "Firefox"),
-            ("org.chromium.Chromium",  "Chromium"),
+            ("firefox",                "Firefox (DNF)"),
+            ("com.google.Chrome",      "Chrome (Flatpak)"),
+            ("com.brave.Browser",      "Brave (Flatpak)"),
+            ("com.microsoft.Edge",     "Edge (Flatpak)"),
+            ("org.chromium.Chromium",  "Chromium (Flatpak)"),
             ("none",                   "No browser preinstalled"),
         ]
         for app_id, label in browser_options:
@@ -236,9 +239,15 @@ class PayloadPage(BaseConfigurationPage):
         selected.extend([p for p in self.custom_packages.text().split() if p.strip()])
         return selected, group_state
 
+    def _selected_browser_dnf(self):
+        chosen = next((k for k, cb in self.browser_checks.items() if cb.isChecked()), None)
+        if chosen == "firefox":
+            return "firefox"
+        return None
+
     def _selected_browser_flatpak(self):
         chosen = next((k for k, cb in self.browser_checks.items() if cb.isChecked()), None)
-        if chosen and chosen != "none":
+        if chosen and chosen not in ("none", "firefox"):
             return [chosen]
         return []
 
@@ -249,6 +258,9 @@ class PayloadPage(BaseConfigurationPage):
         custom = [p for p in self.custom_packages.text().split() if p.strip()]
         if not has_network:
             selected_packages = [p for p in selected_packages if p not in custom]
+        browser_dnf = self._selected_browser_dnf()
+        if has_network and browser_dnf and browser_dnf not in selected_packages:
+            selected_packages.append(browser_dnf)
         repos = []
         for repo_id, check in self.repo_checks.items():
             if check.isChecked() and has_network:
@@ -257,16 +269,18 @@ class PayloadPage(BaseConfigurationPage):
         if has_network and self.repo_url.text().strip():
             repos.append({"id": "oem_custom", "name": "OEM Custom Repository", "url": self.repo_url.text().strip()})
         flatpak_packages = []
-        if has_network and self.flatpak_enabled.isChecked():
-            flatpak_packages = [app for app, cb in self.flatpak_checks.items() if cb.isChecked()]
+        if has_network:
+            if self.flatpak_enabled.isChecked():
+                flatpak_packages = [app for app, cb in self.flatpak_checks.items() if cb.isChecked()]
             flatpak_packages += self._selected_browser_flatpak()
         flatpak_packages += [app for app, cb in self.gaming_checks.items() if cb.isChecked()]
+        flatpak_needed = bool(flatpak_packages)
         config_values = {
             "package_groups":  group_state,
             "packages":        selected_packages,
             "flatpak_packages": flatpak_packages,
             "repositories":    repos,
-            "flatpak_enabled": bool(has_network and self.flatpak_enabled.isChecked()),
+            "flatpak_enabled": bool(has_network and (self.flatpak_enabled.isChecked() or flatpak_needed)),
             "nvidia_drivers":  self.nvidia_drivers.isChecked(),
             "server_install":  self.server_install.isChecked(),
             "custom_packages": custom,

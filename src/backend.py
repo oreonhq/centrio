@@ -1139,7 +1139,6 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         f"--setopt=install_weak_deps=False",
         "--setopt=max_parallel_downloads=10",
         "--setopt=fastestmirror=False" if cacheonly else "--setopt=fastestmirror=True",
-        "--exclude=firefox",
         "--exclude=redhat-flatpak-repo", 
         "--exclude=almalinux-*",
         "--exclude=steam",
@@ -3055,7 +3054,6 @@ GRUB_BTRFS_SNAPSHOT_KERNEL_PARAMETERS=\"systemd.volatile=state\"
         nvidia_repo_url = "https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64"
         nvidia_repo_path = os.path.join(target_root, "etc/yum.repos.d/cuda-x86_64.repo")
         try:
-            os.makedirs(os.path.dirname(nvidia_repo_path), exist_ok=True)
             repo_content = f"""[cuda-x86_64]
 name=NVIDIA CUDA
 baseurl={nvidia_repo_url}
@@ -3069,16 +3067,30 @@ gpgcheck=0
         except Exception as e:
             print(f"Warning: Failed to add NVIDIA repo: {e}")
         nvidia_pkgs = [
+            "dkms", "kernel-devel",
             "nvidia-driver", "kmod-nvidia-latest-dkms", "nvidia-driver-libs",
             "nvidia-driver-cuda-libs", "nvidia-modprobe", "nvidia-persistenced",
-            "nvidia-kmod-common"
+            "nvidia-kmod-common",
         ]
         if progress_callback:
             progress_callback("Installing NVIDIA drivers (scriptlets enabled)...", 0.55)
-        success, err = _install_packages_dnf_impl(target_root, nvidia_pkgs, progress_callback, keep_cache=True)
+        success, err = _install_packages_dnf_impl(
+            target_root, nvidia_pkgs, progress_callback, keep_cache=True, cacheonly=offline_install
+        )
         if not success:
             print(f"Warning: NVIDIA driver installation failed: {err}")
-            # Non-fatal; base system is already installed
+        else:
+            _DBUS_UNSET = ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"]
+            ok_dkms, err_dkms, _ = _run_in_chroot(
+                target_root,
+                ["dkms", "autoinstall"],
+                "Build NVIDIA kernel modules with DKMS",
+                progress_callback,
+                timeout=900,
+                env_unset=_DBUS_UNSET,
+            )
+            if not ok_dkms:
+                print(f"Warning: DKMS autoinstall for NVIDIA failed: {err_dkms}")
     
     # --- Setup Flatpak if enabled ---
     if flatpak_enabled:
