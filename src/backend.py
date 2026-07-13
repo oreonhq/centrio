@@ -1447,13 +1447,15 @@ def install_packages_dnf(target_root, progress_callback=None):
 # --- Bootloader Installation ---
 # Installation logic is in install_logic.py
 
-def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False):
+def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False):
     """Installs GRUB2 for UEFI (with Secure Boot) or legacy BIOS. Delegates to install_logic.
     When boot_partition_device is set (separate /boot), GRUB uses that partition for config/kernel."""
     from install_logic import install_bootloader
     return install_bootloader(
         target_root, primary_disk, efi_partition_device, progress_callback, boot_partition_device,
         offline_install=offline_install,
+        dual_boot=dual_boot,
+        preserve_efi=preserve_efi,
     )
 
 

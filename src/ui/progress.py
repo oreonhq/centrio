@@ -264,16 +264,23 @@ class ProgressPage(QWidget):
                 raise RuntimeError(cleanup_err or "Failed to remove live users")
 
             efi = None
+            boot_part = None
             for part in disk_config.get("partitions", []):
                 if part.get("mountpoint") == "/boot/efi":
                     efi = part.get("device")
-                    break
+                elif part.get("mountpoint") == "/boot":
+                    boot_part = part.get("device")
+            dual_boot = bool(disk_config.get("dual_boot", False))
+            preserve_efi = bool(disk_config.get("preserve_efi", False))
             boot_ok, boot_err, _ = backend.install_bootloader_in_container(
                 self.target_root,
                 primary_disk,
                 efi,
                 progress_callback=self._scaled_progress_callback(0.87, 0.99),
+                boot_partition_device=boot_part,
                 offline_install=offline_install,
+                dual_boot=dual_boot,
+                preserve_efi=preserve_efi,
             )
             if not boot_ok:
                 raise RuntimeError(boot_err or "Bootloader install failed")

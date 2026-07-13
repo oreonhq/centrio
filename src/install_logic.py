@@ -57,9 +57,313 @@ def _write_file_as_root(path, content, progress_callback=None):
 
 BOOTLOADER_ID = "Oreon"
 
+# OEM laptop / prebuilt vendors that need firmware-builtin certs enrolled
+_SBCTL_OEM_VENDOR_KEYWORDS = (
+    "framework",
+    "lenovo",
+    "dell",
+    "hp",
+    "apple",
+    "panasonic",
+    "toshiba",
+)
+
+_SETUPMODE_EFIVAR_GUID = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
 # --- UEFI and BIOS detection ---
 def is_uefi_system():
     return os.path.exists("/sys/firmware/efi")
+
+
+def _read_sys_vendor():
+    path = "/sys/class/dmi/id/sys_vendor"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return (f.read() or "").strip().lower()
+    except OSError:
+        return ""
+
+
+def _sbctl_binary(target_root=None):
+    """Return sbctl path on host, or under target_root if only there."""
+    for candidate in ("/usr/bin/sbctl", "/usr/sbin/sbctl", "/bin/sbctl"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    if target_root:
+        for rel in ("usr/bin/sbctl", "usr/sbin/sbctl", "bin/sbctl"):
+            p = os.path.join(target_root, rel)
+            if os.path.isfile(p):
+                return p
+    which = shutil.which("sbctl")
+    return which
+
+
+def _is_secure_boot_setup_mode(progress_callback=None):
+    """True when firmware is in Setup Mode (keys unlocked for enrollment)."""
+    if not is_uefi_system():
+        return False
+
+    sbctl = _sbctl_binary()
+    if sbctl:
+        ok, _, out = _run_command(
+            [sbctl, "status"],
+            "Check Secure Boot Setup Mode via sbctl",
+            progress_callback,
+            timeout=30,
+        )
+        if ok and out:
+            for line in out.splitlines():
+                low = line.lower().strip()
+                if "setup mode" not in low:
+                    continue
+                # sbctl prints "Setup Mode: <mark> Enabled|Disabled"
+                if "enabled" in low:
+                    return True
+                if "disabled" in low:
+                    return False
+
+    # Fallback: EFI SetupMode variable (attr 4 bytes + value 1 byte)
+    efivars = "/sys/firmware/efi/efivars"
+    try:
+        names = os.listdir(efivars)
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith("SetupMode-") and name.endswith(_SETUPMODE_EFIVAR_GUID):
+            try:
+                with open(os.path.join(efivars, name), "rb") as f:
+                    data = f.read()
+                if len(data) >= 5:
+                    return data[4] == 1
+            except OSError:
+                pass
+            break
+    return False
+
+
+def _ensure_oreon_bootx64(target_root, efi_install_id, progress_callback=None):
+    """Make sure /boot/efi/EFI/oreon/bootx64.efi exists on the target ESP."""
+    arch = get_host_architecture()
+    oreon_dir = os.path.join(target_root, "boot", "efi", "EFI", "oreon")
+    dest = os.path.join(oreon_dir, "bootx64.efi")
+    if os.path.isfile(dest):
+        return dest
+
+    vendor = efi_install_id or BOOTLOADER_ID
+    candidates = [
+        os.path.join(target_root, "boot", "efi", "EFI", "oreon", "BOOTX64.EFI"),
+        os.path.join(target_root, "boot", "efi", "EFI", "oreon", arch["efi_boot"]),
+        os.path.join(target_root, "boot", "efi", "EFI", "oreon", arch["efi_shim"]),
+        os.path.join(target_root, "boot", "efi", "EFI", vendor, arch["efi_shim"]),
+        os.path.join(target_root, "boot", "efi", "EFI", vendor, arch["efi_boot"]),
+        os.path.join(target_root, "boot", "efi", "EFI", vendor, "bootx64.efi"),
+        os.path.join(target_root, "boot", "efi", "EFI", "BOOT", arch["efi_boot"]),
+        os.path.join(target_root, "boot", "efi", "EFI", "BOOT", "bootx64.efi"),
+    ]
+    src = next((p for p in candidates if os.path.isfile(p)), None)
+    if not src:
+        return None
+    if not _ensure_directory(oreon_dir, progress_callback):
+        return None
+    ok, err, _ = _run_command(
+        ["cp", "-f", src, dest],
+        "Stage oreon/bootx64.efi for sbctl signing",
+        progress_callback,
+        timeout=30,
+    )
+    if not ok:
+        print(f"Warning: could not stage oreon/bootx64.efi: {err}")
+        return None
+    return dest
+
+
+def _collect_sbctl_sign_targets(target_root, efi_install_id, progress_callback=None):
+    """EFI bootloader + kernels + initramfs paths relative to the install root."""
+    paths = []
+    bootx64 = _ensure_oreon_bootx64(target_root, efi_install_id, progress_callback)
+    if bootx64:
+        paths.append("/boot/efi/EFI/oreon/bootx64.efi")
+    else:
+        print("Warning: /boot/efi/EFI/oreon/bootx64.efi missing, skipping EFI sign target")
+
+    boot_dir = os.path.join(target_root, "boot")
+    try:
+        names = os.listdir(boot_dir)
+    except OSError:
+        names = []
+
+    for name in sorted(names):
+        if name.startswith("vmlinuz-") and "rescue" not in name:
+            paths.append("/boot/" + name)
+        elif (
+            name.startswith("initramfs-")
+            and name.endswith(".img")
+            and "rescue" not in name
+            and "kdump" not in name
+        ):
+            paths.append("/boot/" + name)
+
+    # Dedup while keeping order
+    out = []
+    seen = set()
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def provision_secure_boot_with_sbctl(target_root, efi_partition_device=None, efi_install_id=None, progress_callback=None):
+    """
+    Secure Boot key provisioning via sbctl during post-install / bootloader phase.
+
+    - Not in Setup Mode: skip enrollment entirely (OEM-locked firmware stays untouched)
+    - Setup Mode: create-keys, vendor-aware enroll-keys, then sign bootloader/kernel/initramfs
+    """
+    if not is_uefi_system():
+        print("Skipping sbctl Secure Boot provisioning (not UEFI).")
+        return True, ""
+
+    if progress_callback:
+        progress_callback("Checking Secure Boot Setup Mode...", None)
+
+    if not _is_secure_boot_setup_mode(progress_callback):
+        print(
+            "Secure Boot is not in Setup Mode (keys already locked/populated). "
+            "Bypassing sbctl key enrollment for OEM/pre-seeded firmware compatibility."
+        )
+        return True, ""
+
+    sbctl_host = _sbctl_binary()
+    sbctl_target = _sbctl_binary(target_root)
+    if not sbctl_host and not sbctl_target:
+        print("Warning: sbctl not found on host or target. Skipping Secure Boot provisioning.")
+        return True, ""
+
+    # Prefer chroot so keys + files.db live on the installed system with correct paths
+    use_chroot = bool(sbctl_target)
+    if not use_chroot and sbctl_host:
+        # Stage host binary into target so chroot signing paths stay clean
+        dest_bin = os.path.join(target_root, "usr", "bin", "sbctl")
+        if _ensure_directory(os.path.dirname(dest_bin), progress_callback):
+            ok_cp, _, _ = _run_command(
+                ["cp", "-f", sbctl_host, dest_bin],
+                "Stage sbctl into target for chroot use",
+                progress_callback,
+                timeout=30,
+            )
+            if ok_cp:
+                _run_command(["chmod", "755", dest_bin], "chmod sbctl", progress_callback, timeout=5)
+                use_chroot = True
+
+    if efi_partition_device:
+        ok_m, err_m, _ = _efi_partition_ensure_mounted(
+            target_root, efi_partition_device, progress_callback
+        )
+        if not ok_m:
+            return False, err_m or "Failed to mount ESP for sbctl signing"
+
+    if progress_callback:
+        progress_callback("Creating Secure Boot keys (sbctl create-keys)...", None)
+
+    if use_chroot:
+        ok, err, _ = _run_in_chroot(
+            target_root,
+            ["sbctl", "create-keys"],
+            "sbctl create-keys",
+            progress_callback,
+            timeout=120,
+        )
+    else:
+        ok, err, _ = _run_command(
+            [sbctl_host, "create-keys"],
+            "sbctl create-keys",
+            progress_callback,
+            timeout=120,
+        )
+        if ok:
+            # Persist keys onto the installed system
+            for rel in ("var/lib/sbctl", "usr/share/secureboot"):
+                src = "/" + rel
+                if os.path.isdir(src):
+                    dst = os.path.join(target_root, rel)
+                    _ensure_directory(os.path.dirname(dst), progress_callback)
+                    _run_command(
+                        ["cp", "-a", src, dst],
+                        f"Copy {rel} to target",
+                        progress_callback,
+                        timeout=60,
+                    )
+    if not ok:
+        return False, err or "sbctl create-keys failed"
+
+    vendor = _read_sys_vendor()
+    oem_match = any(k in vendor for k in _SBCTL_OEM_VENDOR_KEYWORDS)
+    if oem_match:
+        enroll_cmd = ["sbctl", "enroll-keys", "-i", "--microsoft", "--firmware-builtin"]
+        enroll_desc = (
+            f"sbctl enroll-keys -i --microsoft --firmware-builtin "
+            f"(OEM vendor match in '{vendor or 'unknown'}')"
+        )
+    else:
+        enroll_cmd = ["sbctl", "enroll-keys", "-i", "--microsoft"]
+        enroll_desc = (
+            f"sbctl enroll-keys -i --microsoft "
+            f"(standard mainboard fallback, vendor='{vendor or 'unknown'}')"
+        )
+
+    if progress_callback:
+        progress_callback("Enrolling Secure Boot keys...", None)
+    print(enroll_desc)
+
+    if use_chroot:
+        ok, err, _ = _run_in_chroot(
+            target_root, enroll_cmd, enroll_desc, progress_callback, timeout=180
+        )
+    else:
+        ok, err, _ = _run_command(
+            [sbctl_host] + enroll_cmd[1:], enroll_desc, progress_callback, timeout=180
+        )
+    if not ok:
+        return False, err or "sbctl enroll-keys failed"
+
+    sign_targets = _collect_sbctl_sign_targets(
+        target_root, efi_install_id or BOOTLOADER_ID, progress_callback
+    )
+    if not sign_targets:
+        return False, "No bootloader/kernel/initramfs targets found for sbctl sign"
+
+    if progress_callback:
+        progress_callback("Signing bootloader, kernel, and initramfs with sbctl...", None)
+
+    for rel_path in sign_targets:
+        abs_on_target = os.path.join(target_root, rel_path.lstrip("/"))
+        if not os.path.isfile(abs_on_target):
+            print(f"Warning: skip missing sign target {rel_path}")
+            continue
+        sign_cmd = ["sbctl", "sign", "-s", rel_path]
+        if use_chroot:
+            ok, err, _ = _run_in_chroot(
+                target_root,
+                sign_cmd,
+                f"sbctl sign -s {rel_path}",
+                progress_callback,
+                timeout=180,
+            )
+        else:
+            ok, err, _ = _run_command(
+                [sbctl_host, "sign", "-s", abs_on_target],
+                f"sbctl sign -s {abs_on_target}",
+                progress_callback,
+                timeout=180,
+            )
+        if not ok:
+            return False, err or f"sbctl sign failed for {rel_path}"
+        print(f"Signed with sbctl: {rel_path}")
+
+    print("sbctl Secure Boot provisioning completed.")
+    return True, ""
 
 
 def _efi_partition_ensure_mounted(target_root, efi_partition_device, progress_callback=None):
@@ -257,10 +561,11 @@ def _get_device_uuid(device_path):
     return None
 
 
-def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False):
+def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False):
     """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
     signed shim+grub from host, stub grub.cfg on ESP.
-    Mounts the target ESP to a private temp dir so we always write to the correct partition."""
+    Mounts the target ESP to a private temp dir so we always write to the correct partition.
+    Dual boot + preserve EFI never overwrites an existing EFI/BOOT fallback (Windows)."""
     if not efi_partition_device:
         return False, "UEFI install requires the EFI partition device (e.g. /dev/sda1).", None
     if not os.path.exists(efi_partition_device):
@@ -276,7 +581,11 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
         return False, "Host has no signed shim/grub in /boot/efi/EFI or /efi/EFI.", None
 
     arch = get_host_architecture()
-    efi_install_id = efi_vendor if efi_vendor else BOOTLOADER_ID
+    # Dual boot preserve: always use Oreon vendor dir so we dont collide with Windows
+    if dual_boot and preserve_efi:
+        efi_install_id = BOOTLOADER_ID
+    else:
+        efi_install_id = efi_vendor if efi_vendor else BOOTLOADER_ID
     tmp_mount = tempfile.mkdtemp(prefix="centrio_efi_")
     try:
         ok, err, _ = _run_command(
@@ -288,16 +597,16 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
 
         efi_dir = os.path.join(tmp_mount, "EFI", efi_install_id)
         efi_boot = os.path.join(tmp_mount, "EFI", "BOOT")
-        if not _ensure_directory(efi_dir, progress_callback) or not _ensure_directory(efi_boot, progress_callback):
+        if not _ensure_directory(efi_dir, progress_callback):
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
             return False, "Failed to create EFI dirs on ESP", None
 
-        host_vendor_dir = os.path.join("/boot/efi/EFI", efi_install_id)
+        host_vendor_dir = os.path.join("/boot/efi/EFI", efi_vendor or efi_install_id)
         ok_dir, _, _ = _run_command(["test", "-d", host_vendor_dir], "Check host EFI vendor dir", progress_callback, timeout=5)
         if not ok_dir:
-            host_vendor_dir = os.path.join("/efi/EFI", efi_install_id)
+            host_vendor_dir = os.path.join("/efi/EFI", efi_vendor or efi_install_id)
             ok_dir, _, _ = _run_command(["test", "-d", host_vendor_dir], "Check host EFI vendor dir", progress_callback, timeout=5)
-        if ok_dir:
+        if ok_dir and not (dual_boot and preserve_efi):
             ok_ls, _, ls_out = _run_command(["ls", "-1", host_vendor_dir], "List host EFI vendor dir", progress_callback, timeout=5)
             if ok_ls and ls_out:
                 for name in [n.strip() for n in ls_out.splitlines() if n.strip()]:
@@ -313,17 +622,37 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
                 if not ok:
                     _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
                     return False, err or "Failed to copy shim/grub", None
+            ok, err, _ = _run_command(
+                ["cp", shim_src, os.path.join(efi_dir, "bootx64.efi")],
+                "Copy shim as bootx64.efi",
+                progress_callback,
+            )
+            if not ok:
+                print(f"Warning: could not stage bootx64.efi: {err}")
 
-        ok, err, _ = _run_command(["cp", shim_src, os.path.join(efi_boot, arch["efi_boot"])], "Copy shim to EFI/BOOT", progress_callback)
-        if not ok:
-            _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
-            return False, err or "Failed to copy shim to EFI/BOOT", None
-        # Some firmware/shim fallback paths expect GRUB at EFI/BOOT/<efi_grub>
-        # (e.g. \EFI\Boot\grubx64.efi). Keep a copy there as well.
-        ok, err, _ = _run_command(["cp", grub_src, os.path.join(efi_boot, arch["efi_grub"])], "Copy grub to EFI/BOOT", progress_callback)
-        if not ok:
-            _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
-            return False, err or "Failed to copy grub to EFI/BOOT", None
+        bootx64_dest = os.path.join(efi_boot, arch["efi_boot"])
+        existing_boot = os.path.isfile(bootx64_dest)
+        microsoft_efi = os.path.isfile(
+            os.path.join(tmp_mount, "EFI", "Microsoft", "Boot", "bootmgfw.efi")
+        )
+        skip_fallback = dual_boot and preserve_efi and (existing_boot or microsoft_efi)
+        if skip_fallback:
+            print(
+                "Dual boot preserve EFI: leaving EFI/BOOT fallback untouched "
+                "(existing OS boot files present)."
+            )
+        else:
+            if not _ensure_directory(efi_boot, progress_callback):
+                _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
+                return False, "Failed to create EFI/BOOT on ESP", None
+            ok, err, _ = _run_command(["cp", shim_src, bootx64_dest], "Copy shim to EFI/BOOT", progress_callback)
+            if not ok:
+                _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
+                return False, err or "Failed to copy shim to EFI/BOOT", None
+            ok, err, _ = _run_command(["cp", grub_src, os.path.join(efi_boot, arch["efi_grub"])], "Copy grub to EFI/BOOT", progress_callback)
+            if not ok:
+                _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
+                return False, err or "Failed to copy grub to EFI/BOOT", None
 
         # When boot_partition_device given (separate /boot), use its UUID so GRUB reads from /boot partition
         if boot_partition_device:
@@ -487,21 +816,103 @@ def _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progr
         return False, "Failed to copy/patch grub.cfg from live: %s" % e
 
 
-def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None):
+def _ensure_windows_grub_entry(target_root, progress_callback=None):
+    """If Microsoft bootmgfw.efi exists on the target ESP, make sure GRUB can chainload it."""
+    bootmgfw = os.path.join(
+        target_root, "boot", "efi", "EFI", "Microsoft", "Boot", "bootmgfw.efi"
+    )
+    if not os.path.isfile(bootmgfw):
+        return False
+    drop_in_dir = os.path.join(target_root, "etc", "grub.d")
+    drop_in = os.path.join(drop_in_dir, "45_centrio_windows")
+    esp_uuid = _get_uuid_for_mount_target(os.path.join(target_root, "boot", "efi"))
+    if esp_uuid:
+        script = (
+            "#!/bin/sh\n"
+            "exec tail -n +3 $0\n"
+            "menuentry 'Windows Boot Manager' --class windows --class os {\n"
+            "    insmod part_gpt\n"
+            "    insmod fat\n"
+            "    search --no-floppy --fs-uuid --set=root %s\n"
+            "    chainloader /EFI/Microsoft/Boot/bootmgfw.efi\n"
+            "}\n"
+        ) % esp_uuid
+    else:
+        script = (
+            "#!/bin/sh\n"
+            "exec tail -n +3 $0\n"
+            "menuentry 'Windows Boot Manager' --class windows --class os {\n"
+            "    insmod part_gpt\n"
+            "    insmod fat\n"
+            "    search --no-floppy --file --set=root /EFI/Microsoft/Boot/bootmgfw.efi\n"
+            "    chainloader /EFI/Microsoft/Boot/bootmgfw.efi\n"
+            "}\n"
+        )
+    if not _ensure_directory(drop_in_dir, progress_callback):
+        return False
+    if not _write_file_as_root(drop_in, script, progress_callback):
+        return False
+    _run_command(["chmod", "755", drop_in], "chmod Windows GRUB drop-in", progress_callback, timeout=5)
+    print("Added Centrio Windows Boot Manager GRUB entry for dual boot.")
+    return True
+
+
+def _patch_grub_default_os_prober(target_root, enable, progress_callback=None):
+    """Set GRUB_DISABLE_OS_PROBER in target /etc/default/grub."""
+    grub_default = os.path.join(target_root, "etc", "default", "grub")
+    value = "false" if enable else "true"
+    content = ""
+    ok_cat, _, cat_out = _run_command(["cat", grub_default], "Read /etc/default/grub", progress_callback, timeout=5)
+    if ok_cat and cat_out:
+        content = cat_out
+    if re.search(r"^GRUB_DISABLE_OS_PROBER=", content, re.MULTILINE):
+        content = re.sub(
+            r"^GRUB_DISABLE_OS_PROBER=.*$",
+            f"GRUB_DISABLE_OS_PROBER={value}",
+            content,
+            flags=re.MULTILINE,
+        )
+    else:
+        content = (content.rstrip() + f"\nGRUB_DISABLE_OS_PROBER={value}\n") if content else f"GRUB_DISABLE_OS_PROBER={value}\n"
+    return _write_file_as_root(grub_default, content, progress_callback)
+
+
+def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None, dual_boot=False):
     """Generate /boot/grub2/grub.cfg for target (must run inside chroot to see target's /boot). Returns (success, error_msg).
-    GRUB_DISABLE_OS_PROBER=true avoids os-prober scanning block devices in chroot, which can hang indefinitely.
+    Dual boot enables os-prober (with timeout). Otherwise disable it to avoid chroot hangs.
     If grub2-mkconfig produces empty/small output, falls back to copying grub.cfg from the live env and patching root UUID."""
     grub_cfg_chroot = "/boot/grub2/grub.cfg"
     cfg_path = os.path.join(target_root, "boot", "grub2", "grub.cfg")
 
+    if dual_boot:
+        _patch_grub_default_os_prober(target_root, enable=True, progress_callback=progress_callback)
+        if is_uefi:
+            # ESP must be mounted for Windows detection / drop-in
+            _ensure_windows_grub_entry(target_root, progress_callback)
+        os_prober_env = "false"
+        mkconfig_timeout = 180
+    else:
+        _patch_grub_default_os_prober(target_root, enable=False, progress_callback=progress_callback)
+        os_prober_env = "true"
+        mkconfig_timeout = 120
+
     ok, err, _ = _run_in_chroot(
         target_root,
-        ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", grub_cfg_chroot],
+        ["env", f"GRUB_DISABLE_OS_PROBER={os_prober_env}", "grub2-mkconfig", "-o", grub_cfg_chroot],
         "grub2-mkconfig",
-        progress_callback
+        progress_callback,
+        timeout=mkconfig_timeout,
     )
+    if not ok and dual_boot:
+        print(f"Warning: dual-boot grub2-mkconfig with os-prober failed ({err}); retrying without os-prober.")
+        ok, err, _ = _run_in_chroot(
+            target_root,
+            ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", grub_cfg_chroot],
+            "grub2-mkconfig (no os-prober fallback)",
+            progress_callback,
+            timeout=120,
+        )
     if not ok:
-        # Fall back to copying from live env
         target_root_uuid = _get_root_uuid(target_root)
         if target_root_uuid:
             ok2, err2 = _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progress_callback)
@@ -513,7 +924,6 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
     if ok_stat and size_out and size_out.strip().isdigit() and int(size_out.strip()) >= 100:
         return True, ""
 
-    # grub2-mkconfig produced empty or too-small output; fall back to live env
     target_root_uuid = _get_root_uuid(target_root)
     if not target_root_uuid:
         return False, "GRUB config missing or too small and could not get target root UUID."
@@ -523,7 +933,7 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
     return False, "GRUB config missing or too small after grub2-mkconfig; fallback failed: %s" % err2
 
 
-def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False):
+def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False):
     """
     Install bootloader for target: UEFI (with Secure Boot support) or legacy BIOS.
     Works with dnf-based systems. Returns (success, error_msg, verification_dict or None).
@@ -541,6 +951,8 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
             target_root, primary_disk, efi_partition_device, progress_callback,
             boot_partition_device=boot_partition_device,
             offline_install=offline_install,
+            dual_boot=dual_boot,
+            preserve_efi=preserve_efi,
         )
         if efi_install_id is None:
             efi_install_id = BOOTLOADER_ID
@@ -550,19 +962,33 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if not ok:
         return False, err, None
 
-    # Common: generate grub.cfg on root fs at /boot/grub2/grub.cfg (standard location).
-    ok, err = _generate_grub_cfg(target_root, primary_disk, uefi, progress_callback)
+    # Remount ESP at target before grub.cfg / Windows detection for dual boot
+    if uefi and efi_partition_device:
+        _efi_partition_ensure_mounted(target_root, efi_partition_device, progress_callback)
+
+    ok, err = _generate_grub_cfg(
+        target_root, primary_disk, uefi, progress_callback, dual_boot=dual_boot
+    )
     if not ok:
         return False, err, None
 
-    # Skip dracut regeneration for live copy, the copied initramfs is already valid.
-    # BLS entries were patched with correct root=UUID. Plymouth is in the copied initramfs.
-    # Regenerating in chroot can hang (udev/systemd probing); the copy boots fine without it.
+    if uefi:
+        if progress_callback:
+            progress_callback("Provisioning Secure Boot with sbctl...", None)
+        ok_sb, err_sb = provision_secure_boot_with_sbctl(
+            target_root,
+            efi_partition_device=efi_partition_device,
+            efi_install_id=efi_install_id,
+            progress_callback=progress_callback,
+        )
+        if not ok_sb:
+            return False, err_sb or "Secure Boot provisioning with sbctl failed", None
 
     verification = {
         "uefi": uefi,
         "bootloader_id": efi_install_id if uefi else BOOTLOADER_ID,
         "primary_disk": primary_disk,
         "efi_partition": efi_partition_device if uefi else None,
+        "dual_boot": dual_boot,
     }
     return True, "", verification
