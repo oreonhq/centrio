@@ -1522,20 +1522,121 @@ def _start_service(service_name):
     return _manage_service("start", service_name)
 
 
-def remove_centrio_installer(offline_install=False):
-    """Remove the centrio-installer package and installer desktop files from the live system after successful install."""
-    # Remove desktop files from LIVE system first (user sees "Install Oreon" on live session)
-    for desktop_name in ["anaconda.desktop", "liveinst.desktop"]:
-        for subdir in ["/usr/share/applications", "/etc/xdg/autostart"]:
-            path = f"{subdir}/{desktop_name}"
+def _purge_installer_desktop_artifacts(root="/", progress_callback=None):
+    """Remove installer launcher leftovers under root (target or live).
+
+    livesys-scripts can rename liveinst.desktop to anaconda.desktop, and copies
+    often land under Desktop/ and /etc/skel so they would resurface for new users.
+    """
+    root = root or "/"
+    is_host = root in ("/", "")
+    names = (
+        "liveinst.desktop",
+        "anaconda.desktop",
+        "org.fedoraproject.AnacondaInstaller.desktop",
+    )
+    app_dirs = [
+        "usr/share/applications",
+        "usr/local/share/applications",
+        "etc/xdg/autostart",
+        "usr/share/applications/kde",
+        "usr/share/applications/kde4",
+    ]
+    desktop_dirs = [
+        "etc/skel/Desktop",
+        "etc/skel/.local/share/applications",
+    ]
+    for username in LIVE_USERNAMES:
+        desktop_dirs.append(f"home/{username}/Desktop")
+        desktop_dirs.append(f"home/{username}/.local/share/applications")
+
+    removed = []
+
+    def _abs(rel):
+        if is_host:
+            return "/" + rel.lstrip("/")
+        return os.path.join(root, rel)
+
+    for subdir in app_dirs + desktop_dirs:
+        for name in names:
+            path = _abs(os.path.join(subdir, name))
             ok, err, _ = _run_command(
                 ["rm", "-f", path],
-                f"Remove {desktop_name} from live system",
-                timeout=5
+                f"Remove installer desktop {path}",
+                progress_callback,
+                timeout=5,
             )
             if ok:
-                print(f"Removed {desktop_name} from {subdir}")
-    # Remove the package (also removes its desktop file if not already deleted)
+                removed.append(path)
+            elif err and "No such file" not in err and "cannot remove" not in (err or "").lower():
+                print(f"Warning: Could not remove {path}: {err}")
+
+    # Catch renamed/copied launchers that still point at Centrio / liveinst
+    scan_roots = [_abs(d) for d in app_dirs + desktop_dirs]
+    for scan in scan_roots:
+        ok_ls, _, ls_out = _run_command(
+            ["ls", "-1A", scan],
+            f"List installer scan dir {scan}",
+            progress_callback,
+            timeout=5,
+        )
+        if not ok_ls or not ls_out:
+            continue
+        for entry in [n.strip() for n in ls_out.splitlines() if n.strip()]:
+            if not entry.endswith(".desktop"):
+                continue
+            path = os.path.join(scan, entry)
+            ok_c, _, text = _run_command(
+                ["cat", path],
+                f"Read desktop file {path}",
+                progress_callback,
+                timeout=5,
+            )
+            if not ok_c or not text:
+                continue
+            low = text.lower()
+            if (
+                "liveinst" in low
+                or "/usr/share/centrio" in low
+                or "centrio/main.py" in low
+                or "name=install oreon" in low
+            ):
+                ok, err, _ = _run_command(
+                    ["rm", "-f", path],
+                    f"Remove leftover installer launcher {path}",
+                    progress_callback,
+                    timeout=5,
+                )
+                if ok:
+                    removed.append(path)
+
+    centrio_app = _abs("usr/share/centrio")
+    ok_dir, _, _ = _run_command(
+        ["test", "-d", centrio_app],
+        f"Check {centrio_app}",
+        progress_callback,
+        timeout=5,
+    )
+    if ok_dir:
+        ok, err, _ = _run_command(
+            ["rm", "-rf", centrio_app],
+            f"Remove {centrio_app}",
+            progress_callback,
+            timeout=30,
+        )
+        if ok:
+            removed.append(centrio_app)
+        else:
+            print(f"Warning: Could not remove {centrio_app}: {err}")
+
+    for p in removed:
+        print(f"Purged installer artifact: {p}")
+    return removed
+
+
+def remove_centrio_installer(offline_install=False):
+    """Remove the centrio-installer package and installer desktop files from the live system after successful install."""
+    _purge_installer_desktop_artifacts("/", progress_callback=None)
     try:
         if offline_install:
             ok_q, _, _ = _run_command(
@@ -1561,6 +1662,7 @@ def remove_centrio_installer(offline_install=False):
                 print("Centrio-installer removed from live system (rpm).")
             else:
                 print(f"Could not remove centrio-installer (non-fatal): {err}")
+            _purge_installer_desktop_artifacts("/", progress_callback=None)
             return
         success, err, _ = _run_command(
             ["dnf", "remove", "-y", "centrio-installer"],
@@ -1571,9 +1673,55 @@ def remove_centrio_installer(offline_install=False):
             print("Centrio-installer removed from live system.")
         else:
             print(f"Could not remove centrio-installer (non-fatal): {err}")
+        _purge_installer_desktop_artifacts("/", progress_callback=None)
     except Exception as e:
         print(f"Could not remove centrio-installer (non-fatal): {e}")
 
+
+def remove_centrio_installer_from_target(target_root, progress_callback=None, offline_install=False):
+    """Remove centrio-installer and all Install Oreon / liveinst launchers from the installed system."""
+    if not target_root:
+        return
+    # Drop the package first so RPM owns fewer leftover paths
+    try:
+        r = subprocess.run(
+            ["rpm", "-q", "centrio-installer", f"--root={target_root}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            if offline_install:
+                ok, err, _ = _run_command(
+                    ["rpm", "-e", "--nodeps", "centrio-installer", f"--root={target_root}"],
+                    "Remove centrio-installer from target (rpm)",
+                    progress_callback,
+                    timeout=120,
+                )
+            else:
+                ok, err, _ = _run_in_chroot(
+                    target_root,
+                    ["dnf", "remove", "-y", "centrio-installer"],
+                    "Remove centrio-installer from target",
+                    progress_callback,
+                    timeout=180,
+                )
+                if not ok:
+                    ok, err, _ = _run_command(
+                        ["rpm", "-e", "--nodeps", "centrio-installer", f"--root={target_root}"],
+                        "Remove centrio-installer from target (rpm fallback)",
+                        progress_callback,
+                        timeout=120,
+                    )
+            if ok:
+                print("Removed centrio-installer package from target")
+            else:
+                print(f"Warning: Could not remove centrio-installer from target: {err}")
+    except Exception as e:
+        print(f"Warning: Could not remove centrio-installer from target: {e}")
+
+    _purge_installer_desktop_artifacts(target_root, progress_callback=progress_callback)
 
 def swapoff_on_disk(disk_device, progress_callback=None):
     """Disable swap that is backed by disk_device or its partitions.
@@ -2430,21 +2578,13 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
     except Exception as e:
         print(f"Warning: Could not remove livesys-scripts: {e}")
 
-    # --- Remove installer desktop files (anaconda.desktop, liveinst.desktop) from TARGET ---
-    # Use _run_command (sudo) since target files are root-owned
-    for desktop_name in ["anaconda.desktop", "liveinst.desktop"]:
-        for subdir in ["usr/share/applications", "etc/xdg/autostart"]:
-            desktop_path = os.path.join(target_root, subdir, desktop_name)
-            ok, err, _ = _run_command(
-                ["rm", "-f", desktop_path],
-                f"Remove {desktop_name} from /{subdir}",
-                progress_callback,
-                timeout=5
-            )
-            if ok:
-                print(f"Removed {desktop_name} from /{subdir}")
-            elif err and "No such file" not in err:
-                print(f"Warning: Could not remove {desktop_path}: {err}")
+    # Drop Install Oreon / liveinst launchers and the installer package from the TARGET.
+    # Live copy brings them over; livesys also copies/renames desktop files into Desktop/skel.
+    remove_centrio_installer_from_target(
+        target_root,
+        progress_callback=progress_callback,
+        offline_install=offline_install,
+    )
 
     # --- Plymouth: ensure dracut includes plymouth so initramfs shows splash ---
     plymouth_conf = os.path.join(target_root, "etc/dracut.conf.d/01-plymouth.conf")
