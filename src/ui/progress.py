@@ -182,11 +182,22 @@ class ProgressPage(QWidget):
                         raise RuntimeError(
                             f"Could not turn off swap on the target disk before wiping. Details: {so2_err}"
                         )
+                cmd_timeout = 120
+                if cmd and cmd[0] in (
+                    "pvcreate",
+                    "vgcreate",
+                    "lvcreate",
+                    "vgchange",
+                    "pvremove",
+                    "vgremove",
+                    "lvremove",
+                ):
+                    cmd_timeout = 300
                 ok, err, _ = backend._run_command(
                     cmd,
                     f"Storage step {idx + 1}",
                     progress_callback=storage_cb,
-                    timeout=120,
+                    timeout=cmd_timeout,
                 )
                 if not ok:
                     raise RuntimeError(err or f"Storage command failed: {' '.join(cmd)}")
@@ -217,7 +228,16 @@ class ProgressPage(QWidget):
                         pass
             if not backend.ensure_directory(self.target_root):
                 raise RuntimeError(f"Could not create {self.target_root}")
-            for part in sorted(partitions, key=lambda p: 0 if p.get("mountpoint") == "/" else 1):
+
+            def _mount_sort_key(part):
+                mp = part.get("mountpoint") or ""
+                if mp == "/":
+                    return (0, "")
+                # /boot before /boot/efi, /home after /boot
+                depth = len([p for p in mp.split("/") if p])
+                return (depth, mp)
+
+            for part in sorted(partitions, key=_mount_sort_key):
                 mountpoint = part.get("mountpoint")
                 device = part.get("device")
                 if not mountpoint or not device:
@@ -289,12 +309,19 @@ class ProgressPage(QWidget):
             # artifacts and can produce non-bootable installs.
             payload_cfg = config_data.get("payload", {}) if isinstance(config_data, dict) else {}
             disk_cfg = config_data.get("disk", {}) if isinstance(config_data, dict) else {}
+            lvm_vg = disk_cfg.get("lvm_vg") or "oreon"
+            lvm_root_lv = disk_cfg.get("lvm_root_lv") or "root"
+            lvm_root = None
+            if disk_cfg.get("lvm_thin"):
+                lvm_root = f"{lvm_vg}/{lvm_root_lv}"
             post_ok, post_err = backend.setup_live_environment_post_copy(
                 self.target_root,
                 progress_callback=self._scaled_progress_callback(0.94, 0.995),
                 server_install=bool(payload_cfg.get("server_install", False)),
                 btrfs_subvolumes=bool(disk_cfg.get("btrfs_subvolumes", False)),
                 offline_install=offline_install,
+                lvm_root=lvm_root,
+                separate_boot=bool(disk_cfg.get("separate_boot", False)),
             )
             if not post_ok:
                 raise RuntimeError(post_err or "Post-copy system finalization failed")

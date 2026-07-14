@@ -2427,7 +2427,7 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, offline_install=False):
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, offline_install=False, lvm_root=None, separate_boot=False):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -2436,6 +2436,8 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
     - Configuring network
     - Setting up users
     - When server_install: remove KDE Plasma desktop and boot to multi-user.target
+    - lvm_root: e.g. "oreon/root" when / is an LVM thin LV (keeps rd.lvm.lv= in BLS)
+    - separate_boot: True when /boot is its own partition (fix BLS linux/initrd paths)
     """
     
     print("Setting up live environment for target disk...")
@@ -2607,6 +2609,7 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
     # --- Ensure /etc/default/grub exists with full content for Plymouth boot splash ---
     grub_default = os.path.join(target_root, "etc/default/grub")
     grub_default_dir = os.path.dirname(grub_default)
+    lvm_cmdline = f"rd.lvm.lv={lvm_root}" if lvm_root else None
     try:
         content = ""
         ok_cat, _, cat_out = _run_command(["cat", grub_default], "Read etc/default/grub", progress_callback, timeout=5)
@@ -2614,28 +2617,35 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
             content = cat_out
         # If file is missing or empty/minimal, write full template (live env may have empty grub)
         if not content.strip() or len(content) < 80:
+            cmdline = "crashkernel=auto rhgb quiet splash rd.plymouth=1"
+            if lvm_cmdline:
+                cmdline = f"{cmdline} {lvm_cmdline}"
             grub_template = '''GRUB_TIMEOUT=5
 GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
 GRUB_DEFAULT=saved
 GRUB_DISABLE_SUBMENU=true
 GRUB_TERMINAL_OUTPUT="console"
-GRUB_CMDLINE_LINUX="crashkernel=auto rhgb quiet splash rd.plymouth=1"
+GRUB_CMDLINE_LINUX="%s"
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
 GRUB_DISABLE_RECOVERY="true"
 GRUB_ENABLE_BLSCFG=true
-'''
+''' % cmdline
             if write_file_as_root(grub_default, grub_template, progress_callback):
                 print("Created /etc/default/grub with full template (was empty or missing)")
         else:
-            # Patch existing content to ensure quiet splash
+            # Patch existing content to ensure quiet splash (+ LVM activation when needed)
             modified = False
             match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
                 quote_char, args = match.group(1), match.group(2)
                 args_list = [p for p in args.split() if p and p != "nomodeset"]
+                # Drop stale live LVM refs then add ours if needed
+                args_list = [p for p in args_list if not p.startswith("rd.lvm.lv=")]
                 for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
                     if param not in args_list:
                         args_list.append(param)
+                if lvm_cmdline and lvm_cmdline not in args_list:
+                    args_list.append(lvm_cmdline)
                 new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, " ".join(args_list), quote_char)
                 content = content[:match.start()] + new_line + content[match.end():]
                 modified = True
@@ -2658,8 +2668,7 @@ GRUB_ENABLE_BLSCFG=true
     except Exception as e:
         print(f"Warning: Could not write /etc/default/grub: {e}")
 
-    # --- Fix BLS boot entries: live env uses LVM (rd.lvm.lv=oreon/root); centrio uses plain partitions ---
-    # Replace root= and remove rd.lvm.lv params so the installed system boots from its actual root (UUID)
+    # --- Fix BLS boot entries for the installed root (UUID + optional rd.lvm.lv) ---
     bls_dir = os.path.join(target_root, "boot", "loader", "entries")
     ok_dir, _, _ = _run_command(["test", "-d", bls_dir], "Check BLS dir", progress_callback, timeout=5)
     if ok_dir:
@@ -2675,9 +2684,7 @@ GRUB_ENABLE_BLSCFG=true
                     rd_lvm_re = re.compile(r'\brd\.lvm\.lv=[^\s]+\s*')
                     root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+|live:[^\s]+)\s*')
                     resume_re = re.compile(r'\bresume=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
-                    # Live uses BTRFS subvol=root; our plain mkfs.btrfs has no subvolumes - strip rootflags
                     rootflags_subvol_re = re.compile(r'\brootflags=[^\s]*subvol=[^\s]+\s*|\brootflags=[^\s]+\s*')
-                    # Live-ISO arguments break installed boots if preserved in BLS entries.
                     live_arg_prefixes = (
                         "rd.live.",
                         "live.",
@@ -2697,7 +2704,6 @@ GRUB_ENABLE_BLSCFG=true
                             if tok in ("liveimg", "overlay", "rd.live.image"):
                                 continue
                             kept.append(tok)
-                        # Deduplicate while preserving order
                         out = []
                         seen = set()
                         for tok in kept:
@@ -2716,28 +2722,29 @@ GRUB_ENABLE_BLSCFG=true
                         try:
                             new_lines = []
                             for line in content.splitlines():
-                                if btrfs_subvolumes and (line.startswith("linux ") or line.startswith("initrd ")):
-                                    # Separate /boot: GRUB root is /boot partition; paths need leading /
-                                    # /boot/vmlinuz-xxx -> /vmlinuz-xxx (partition root = /boot)
+                                if (btrfs_subvolumes or separate_boot) and (
+                                    line.startswith("linux ") or line.startswith("initrd ")
+                                ):
+                                    # Separate /boot: GRUB/BLS paths are relative to /boot partition
                                     idx = 6 if line.startswith("linux ") else 7
                                     rest = line[idx:].lstrip()
                                     if rest.startswith("/boot/"):
                                         line = line[:idx] + "/" + rest[6:]
                                 if line.startswith("options "):
-                                    opts = line[8:]  # strip "options "
-                                    opts = rd_lvm_re.sub("", opts)  # remove rd.lvm.lv=oreon/root etc
-                                    opts = root_uuid_re.sub("", opts)  # remove old root=
-                                    opts = resume_re.sub("", opts)  # remove resume= (live's swap UUID; installed system differs)
-                                    if not btrfs_subvolumes:
-                                        opts = rootflags_subvol_re.sub("", opts)  # remove rootflags (live BTRFS; plain install has no subvols)
-                                    else:
-                                        opts = rootflags_subvol_re.sub("", opts)  # remove live's rootflags first
+                                    opts = line[8:]
+                                    opts = rd_lvm_re.sub("", opts)
+                                    opts = root_uuid_re.sub("", opts)
+                                    opts = resume_re.sub("", opts)
+                                    opts = rootflags_subvol_re.sub("", opts)
+                                    if btrfs_subvolumes:
                                         opts = opts.strip()
                                         if "rootflags=" not in opts:
-                                            opts = (opts + " rootflags=subvol=root").strip()  # Fedora-style root subvolume
+                                            opts = (opts + " rootflags=subvol=root").strip()
                                     opts = _strip_live_kernel_args(opts)
                                     opts = opts.strip()
                                     add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
+                                    if lvm_root:
+                                        add.append(f"rd.lvm.lv={lvm_root}")
                                     for p in add:
                                         if p not in opts.split():
                                             opts = (opts + " " + p).strip()
@@ -2745,7 +2752,11 @@ GRUB_ENABLE_BLSCFG=true
                                 new_lines.append(line)
                             new_content = "\n".join(new_lines) + "\n"
                             if write_file_as_root(path, new_content, progress_callback):
-                                print(f"Fixed BLS entry {name} (root=UUID, removed live/LVM args)")
+                                msg = f"Fixed BLS entry {name} (root=UUID"
+                                if lvm_root:
+                                    msg += f", rd.lvm.lv={lvm_root}"
+                                msg += ")"
+                                print(msg)
                         except Exception as e:
                             print(f"Warning: Could not patch BLS entry {path}: {e}")
         except Exception as e:
