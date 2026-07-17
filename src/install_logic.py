@@ -177,14 +177,38 @@ def _ensure_oreon_bootx64(target_root, efi_install_id, progress_callback=None):
     return dest
 
 
+def _looks_like_pe(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
 def _collect_sbctl_sign_targets(target_root, efi_install_id, progress_callback=None):
-    """EFI bootloader + kernels + initramfs paths relative to the install root."""
     paths = []
     bootx64 = _ensure_oreon_bootx64(target_root, efi_install_id, progress_callback)
     if bootx64:
         paths.append("/boot/efi/EFI/oreon/bootx64.efi")
     else:
         print("Warning: /boot/efi/EFI/oreon/bootx64.efi missing, skipping EFI sign target")
+
+    efi_roots = [
+        os.path.join(target_root, "boot", "efi", "EFI", "oreon"),
+        os.path.join(target_root, "boot", "efi", "EFI", "BOOT"),
+    ]
+    for efi_dir in efi_roots:
+        try:
+            for name in sorted(os.listdir(efi_dir)):
+                if not name.lower().endswith(".efi"):
+                    continue
+                abs_p = os.path.join(efi_dir, name)
+                if not os.path.isfile(abs_p):
+                    continue
+                rel = "/" + os.path.relpath(abs_p, target_root)
+                paths.append(rel.replace("\\", "/"))
+        except OSError:
+            pass
 
     boot_dir = os.path.join(target_root, "boot")
     try:
@@ -195,19 +219,17 @@ def _collect_sbctl_sign_targets(target_root, efi_install_id, progress_callback=N
     for name in sorted(names):
         if name.startswith("vmlinuz-") and "rescue" not in name:
             paths.append("/boot/" + name)
-        elif (
-            name.startswith("initramfs-")
-            and name.endswith(".img")
-            and "rescue" not in name
-            and "kdump" not in name
-        ):
-            paths.append("/boot/" + name)
 
-    # Dedup while keeping order
     out = []
     seen = set()
     for p in paths:
         if p in seen:
+            continue
+        abs_p = os.path.join(target_root, p.lstrip("/"))
+        if not os.path.isfile(abs_p):
+            continue
+        if not _looks_like_pe(abs_p):
+            print(f"Skip non-PE sign target: {p}")
             continue
         seen.add(p)
         out.append(p)
@@ -215,12 +237,6 @@ def _collect_sbctl_sign_targets(target_root, efi_install_id, progress_callback=N
 
 
 def provision_secure_boot_with_sbctl(target_root, efi_partition_device=None, efi_install_id=None, progress_callback=None):
-    """
-    Secure Boot key provisioning via sbctl during post-install / bootloader phase.
-
-    - Not in Setup Mode: skip enrollment entirely (OEM-locked firmware stays untouched)
-    - Setup Mode: create-keys, vendor-aware enroll-keys, then sign bootloader/kernel/initramfs
-    """
     if not is_uefi_system():
         print("Skipping sbctl Secure Boot provisioning (not UEFI).")
         return True, ""
@@ -241,10 +257,8 @@ def provision_secure_boot_with_sbctl(target_root, efi_partition_device=None, efi
         print("Warning: sbctl not found on host or target. Skipping Secure Boot provisioning.")
         return True, ""
 
-    # Prefer chroot so keys + files.db live on the installed system with correct paths
     use_chroot = bool(sbctl_target)
     if not use_chroot and sbctl_host:
-        # Stage host binary into target so chroot signing paths stay clean
         dest_bin = os.path.join(target_root, "usr", "bin", "sbctl")
         if _ensure_directory(os.path.dirname(dest_bin), progress_callback):
             ok_cp, _, _ = _run_command(
@@ -283,7 +297,6 @@ def provision_secure_boot_with_sbctl(target_root, efi_partition_device=None, efi
             timeout=120,
         )
         if ok:
-            # Persist keys onto the installed system
             for rel in ("var/lib/sbctl", "usr/share/secureboot"):
                 src = "/" + rel
                 if os.path.isdir(src):
@@ -332,10 +345,10 @@ def provision_secure_boot_with_sbctl(target_root, efi_partition_device=None, efi
         target_root, efi_install_id or BOOTLOADER_ID, progress_callback
     )
     if not sign_targets:
-        return False, "No bootloader/kernel/initramfs targets found for sbctl sign"
+        return False, "No PE bootloader/kernel targets found for sbctl sign"
 
     if progress_callback:
-        progress_callback("Signing bootloader, kernel, and initramfs with sbctl...", None)
+        progress_callback("Signing bootloader and kernel with sbctl...", None)
 
     for rel_path in sign_targets:
         abs_on_target = os.path.join(target_root, rel_path.lstrip("/"))

@@ -1845,191 +1845,668 @@ def swapoff_on_disk(disk_device, progress_callback=None):
     return (len(errors) == 0, "\n".join(errors))
 
 
+def _dm_remove_priority(name):
+    if "-tpool" in name:
+        return 1
+    if "_tdata" in name or "_tmeta" in name or "-tdata" in name or "-tmeta" in name:
+        return 2
+    if "pmspare" in name:
+        return 3
+    return 0
+
+
+def _disk_member_devices(disk_device, progress_callback=None):
+    devices = {disk_device}
+    ok, _, out = _run_command(
+        ["lsblk", "-n", "-o", "PATH", "--raw", disk_device],
+        f"List partitions on {disk_device}",
+        progress_callback,
+        timeout=15,
+    )
+    if ok:
+        for line in (out or "").splitlines():
+            path = line.strip()
+            if path and path != disk_device:
+                devices.add(path)
+    return devices
+
+
+def _vgs_on_disk(disk_device, progress_callback=None):
+    vgs = set()
+    for device in _disk_member_devices(disk_device, progress_callback):
+        ok, err, out = _run_command(
+            ["pvs", "--noheadings", "-o", "vg_name", "--select", f"pv_name={device}"],
+            f"Find VG on {device}",
+            progress_callback,
+            timeout=20,
+        )
+        if not ok:
+            err_l = (err or "").lower()
+            if "no physical volume" in err_l or "failed to find" in err_l:
+                continue
+            print(f"Warning: pvs failed for {device}: {err}")
+            continue
+        for line in (out or "").splitlines():
+            name = line.strip()
+            if name:
+                vgs.add(name)
+    return vgs
+
+
+def _remove_vg_dm_stack(vg_name, progress_callback=None):
+    if not vg_name:
+        return True, ""
+    leaf = _dm_leaf_name(vg_name)
+    prefix = f"{leaf}-"
+
+    ok_lvs, _, lvs_out = _run_command(
+        ["lvs", "-a", "--noheadings", "-o", "lv_name", vg_name],
+        f"List LVs in {vg_name}",
+        progress_callback,
+        timeout=30,
+    )
+    if ok_lvs:
+        for line in (lvs_out or "").splitlines():
+            lv = line.strip()
+            if lv:
+                _run_command(
+                    ["lvchange", "-an", f"{vg_name}/{lv}"],
+                    f"Deactivate {vg_name}/{lv}",
+                    progress_callback,
+                    timeout=30,
+                )
+
+    _run_command(
+        ["vgchange", "-an", vg_name],
+        f"Deactivate VG {vg_name}",
+        progress_callback,
+        timeout=60,
+    )
+
+    for _pass in range(3):
+        ok_ls, _, ls_out = _run_command(
+            ["dmsetup", "ls"],
+            "List DM devices",
+            progress_callback,
+            timeout=15,
+        )
+        names = []
+        if ok_ls:
+            for line in (ls_out or "").splitlines():
+                name = (line.split() or [""])[0].strip()
+                if name == leaf or name.startswith(prefix):
+                    names.append(name)
+        if not names:
+            break
+        names.sort(key=lambda n: (_dm_remove_priority(n), -len(n), n))
+        for name in names:
+            _run_command(
+                ["dmsetup", "remove", "-f", name],
+                f"Remove DM {name}",
+                progress_callback,
+                timeout=30,
+            )
+        try:
+            subprocess.run(["udevadm", "settle", "--timeout=5"], check=False, timeout=8)
+        except Exception:
+            pass
+    return True, ""
+
+
+def _vg_dm_still_present(vg_name, progress_callback=None):
+    leaf = _dm_leaf_name(vg_name)
+    prefix = f"{leaf}-"
+    ok_ls, _, ls_out = _run_command(
+        ["dmsetup", "ls"],
+        "Check leftover DM nodes",
+        progress_callback,
+        timeout=15,
+    )
+    if not ok_ls:
+        return False
+    for line in (ls_out or "").splitlines():
+        name = (line.split() or [""])[0].strip()
+        if name == leaf or name.startswith(prefix):
+            return True
+    return False
+
+
+def scrub_vg_dm_stacks(vg_names, progress_callback=None):
+    for vg_name in sorted(set(vg_names or [])):
+        if not vg_name:
+            continue
+        _remove_vg_dm_stack(vg_name, progress_callback)
+    return True, ""
+
+
+def teardown_lvm_on_disk(disk_device, progress_callback=None):
+    """Deactivate every VG on disk_device and tear down its dm thin stack."""
+    if not disk_device:
+        return True, "", []
+    if progress_callback:
+        progress_callback(f"Tearing down LVM on {disk_device}...", None)
+    _run_command(
+        ["pvscan", "--cache"],
+        f"Refresh PV cache for {disk_device}",
+        progress_callback,
+        timeout=30,
+    )
+    vgs = _vgs_on_disk(disk_device, progress_callback)
+    if not vgs:
+        return True, "", []
+    errors = []
+    for vg_name in sorted(vgs):
+        _remove_vg_dm_stack(vg_name, progress_callback)
+        if _vg_dm_still_present(vg_name, progress_callback):
+            errors.append(
+                f"DM nodes for {vg_name} still present after teardown "
+                f"(live thin stack still holds the disk)"
+            )
+    if errors:
+        return False, "\n".join(errors), sorted(vgs)
+    return True, "", sorted(vgs)
+
+
 # --- LVM Deactivation Helper --- 
 def _deactivate_lvm_on_disk(disk_device, progress_callback=None):
     """Attempts to find and deactivate LVM VGs associated with a disk and its partitions."""
-    print(f"Checking for and deactivating LVM on {disk_device} and its partitions...")
-    if progress_callback:
-        progress_callback(f"Checking LVM on {disk_device}...", None) # Text only update
-
-    devices_to_check = set([disk_device])
-    vg_names_found = set()
-    all_success = True
-    errors = []
-
-    # 1. Find partitions of the main disk
-    try:
-        lsblk_cmd = ["lsblk", "-n", "-o", "PATH", "--raw", disk_device]
-        print(f"  Running: {' '.join(shlex.quote(c) for c in lsblk_cmd)}")
-        lsblk_result = subprocess.run(lsblk_cmd, capture_output=True, text=True, check=False, timeout=10)
-        if lsblk_result.returncode == 0:
-            found_paths = [line.strip() for line in lsblk_result.stdout.split('\n') if line.strip() and line.strip() != disk_device]
-            print(f"  Found potential partition paths via lsblk: {found_paths}")
-            devices_to_check.update(found_paths)
-        else:
-            print(f"  Warning: lsblk failed for {disk_device} (rc={lsblk_result.returncode}), checking only base device for PVs.")
-    except Exception as e:
-        print(f"  Warning: Error running lsblk to find partitions for {disk_device}: {e}")
-        # Continue with just the base disk_device
-
-    # 2. Find VGs associated with each device (disk + partitions)
-    print(f"  Checking devices for LVM PVs: {list(devices_to_check)}")
-    for device in devices_to_check:
-        try:
-            pvs_cmd = ["pvs", "--noheadings", "-o", "vg_name", "--select", f"pv_name={device}"]
-            # Use subprocess directly here as _run_command adds too much noise for non-errors
-            print(f"    Checking PV on {device}...")
-            result = subprocess.run(pvs_cmd, capture_output=True, text=True, check=False, timeout=10)
-            
-            if result.returncode == 0:
-                vgs = set(line.strip() for line in result.stdout.splitlines() if line.strip())
-                if vgs:
-                     print(f"      Found VGs on {device}: {vgs}")
-                     vg_names_found.update(vgs)
-            elif "No physical volume found" in result.stderr or "No PVs found" in result.stdout:
-                # This is expected if the device isn't an LVM PV
-                pass
-            else:
-                 # Real error running pvs
-                 err_msg = f"Failed to run pvs for {device}: {result.stderr.strip()}"
-                 print(f"    Warning: {err_msg}")
-                 errors.append(err_msg)
-                 all_success = False # Mark as potentially incomplete
-                 
-        except Exception as e:
-             err_msg = f"Unexpected error checking PV on {device}: {e}"
-             print(f"    ERROR: {err_msg}")
-             errors.append(err_msg)
-             all_success = False
-             
-    if not vg_names_found:
-         print(f"  No LVM Volume Groups found associated with {disk_device} or its partitions.")
-         return True, "" # Not an error if no VGs found
-
-    # 3. Deactivate all found VGs
-    print(f"  Found unique LVM VGs to deactivate: {vg_names_found}. Attempting deactivation...")
-    for vg_name in vg_names_found:
-         vgchange_cmd = ["vgchange", "-an", vg_name]
-         # Use _run_command here as deactivation failure is important
-         vg_success, vg_err, _ = _run_command(vgchange_cmd, f"Deactivate VG {vg_name}")
-         if not vg_success:
-             print(f"    Warning: Failed to deactivate VG {vg_name}: {vg_err}")
-             errors.append(f"Failed to deactivate VG {vg_name}: {vg_err}")
-             all_success = False
-         else:
-              print(f"    Successfully deactivated VG {vg_name}.")
-              time.sleep(0.5) # Small delay after deactivation
-              
-    if progress_callback:
-         status = "Deactivation complete." if all_success and not errors else "Deactivation attempted, some errors occurred."
-         progress_callback(f"LVM Check on {disk_device}: {status}", None)
-         
-    final_error_str = "\n".join(errors)
-    return all_success, final_error_str
+    ok, err, _vgs = teardown_lvm_on_disk(disk_device, progress_callback)
+    if not ok:
+        print(f"LVM teardown on {disk_device} failed: {err}")
+    return ok, err
 
 # --- Device Mapper Removal Helper --- 
 def _remove_dm_mappings(disk_device, progress_callback=None):
-    """Attempts to find and remove device-mapper mappings for LVM LVs on a disk."""
-    print(f"Checking for and removing LVM device-mapper mappings associated with {disk_device}...")
+    """Remove dm nodes for every VG that has a PV on disk_device."""
+    if not disk_device:
+        return True, ""
     if progress_callback:
         progress_callback(f"Removing DM mappings for {disk_device}...", None)
+    vgs = _vgs_on_disk(disk_device, progress_callback)
+    if not vgs:
+        return True, ""
+    for vg_name in sorted(vgs):
+        _remove_vg_dm_stack(vg_name, progress_callback)
+    return True, ""
 
-    devices_to_check = set([disk_device])
-    vg_names_found = set()
-    lvs_to_remove = set() # Store LV paths like /dev/vg/lv or /dev/mapper/vg-lv
-    all_success = True
-    errors = []
 
-    # 1. Find partitions (same logic as _deactivate_lvm_on_disk)
+def _disk_member_paths(disk_device):
+    paths = set()
+    if not disk_device:
+        return paths
     try:
-        lsblk_cmd = ["lsblk", "-n", "-o", "PATH", "--raw", disk_device]
-        lsblk_result = subprocess.run(lsblk_cmd, capture_output=True, text=True, check=False, timeout=10)
-        if lsblk_result.returncode == 0:
-            devices_to_check.update([p.strip() for p in lsblk_result.stdout.split('\n') if p.strip()])
+        paths.add(os.path.realpath(disk_device))
+    except OSError:
+        paths.add(disk_device)
+    try:
+        r = subprocess.run(
+            ["lsblk", "-n", "-o", "PATH", "--paths", disk_device],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            for line in (r.stdout or "").splitlines():
+                p = (line or "").strip()
+                if not p:
+                    continue
+                try:
+                    paths.add(os.path.realpath(p))
+                except OSError:
+                    paths.add(p)
     except Exception:
-        pass # Ignore errors, just use base disk device
+        pass
+    return paths
 
-    # 2. Find VGs associated with each device
-    for device in devices_to_check:
+
+def _source_on_disk(source, disk_paths):
+    if not source or not disk_paths:
+        return False
+    src = str(source).strip()
+    if not src:
+        return False
+    # findmnt can report "UUID=..." or "/dev/sda3[/root]"
+    if src.startswith("UUID=") or src.startswith("PARTUUID=") or src.startswith("LABEL="):
         try:
-            pvs_cmd = ["pvs", "--noheadings", "-o", "vg_name", "--select", f"pv_name={device}"]
-            result = subprocess.run(pvs_cmd, capture_output=True, text=True, check=False, timeout=10)
-            if result.returncode == 0:
-                vg_names_found.update(line.strip() for line in result.stdout.splitlines() if line.strip())
-        except Exception as e:
-            errors.append(f"Error finding VGs on {device}: {e}")
-            all_success = False
-            
-    if not vg_names_found:
-         print(f"  No LVM Volume Groups found for {disk_device}, skipping dmsetup removal.")
-         return True, ""
+            r = subprocess.run(
+                ["findfs", src],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                src = r.stdout.strip()
+        except Exception:
+            return False
+    if "[" in src:
+        src = src.split("[", 1)[0]
+    try:
+        src_r = os.path.realpath(src)
+    except OSError:
+        src_r = src
+    if src_r in disk_paths:
+        return True
+    # LVM/DM: walk parents via lsblk -s
+    try:
+        r = subprocess.run(
+            ["lsblk", "-s", "-n", "-o", "PATH", "--paths", src_r],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            for line in (r.stdout or "").splitlines():
+                p = (line or "").strip()
+                if not p:
+                    continue
+                try:
+                    if os.path.realpath(p) in disk_paths:
+                        return True
+                except OSError:
+                    if p in disk_paths:
+                        return True
+    except Exception:
+        pass
+    return False
 
-    # 3. Find LVs within those VGs
-    print(f"  Found VGs: {vg_names_found}. Checking for associated LVs...")
-    for vg_name in vg_names_found:
-        try:
-             # Get LV paths, prefer /dev/mapper/ format if possible, else /dev/vg/lv
-             lvs_cmd = ["lvs", "--noheadings", "-o", "lv_path", vg_name]
-             result = subprocess.run(lvs_cmd, capture_output=True, text=True, check=False, timeout=10)
-             if result.returncode == 0:
-                 lv_paths = set(line.strip() for line in result.stdout.splitlines() if line.strip())
-                 if lv_paths:
-                      print(f"    Found LVs in VG {vg_name}: {lv_paths}")
-                      lvs_to_remove.update(lv_paths)
-             else:
-                 err_msg = f"Failed to list LVs for VG {vg_name}: {result.stderr.strip()}"
-                 print(f"    Warning: {err_msg}")
-                 errors.append(err_msg)
-                 all_success = False
-        except Exception as e:
-             err_msg = f"Unexpected error listing LVs for VG {vg_name}: {e}"
-             print(f"    ERROR: {err_msg}")
-             errors.append(err_msg)
-             all_success = False
-             
-    if not lvs_to_remove:
-        print(f"  No active LVs found in VGs {vg_names_found}.")
-        return True, "\n".join(errors) # Return success even if LVs couldn't be listed, but include errors
 
-    # 4. Remove DM mappings for found LVs
-    print(f"  Attempting to remove DM mappings for LVs: {lvs_to_remove}")
-    for lv_path in lvs_to_remove:
-        # Need the mapper name (e.g., vg--name-lv--name) which might differ from lv_path (/dev/vg_name/lv_name)
-        # We can try removing both common forms: /dev/mapper/vg-lv and the lv_path directly
-        # dmsetup usually works with the name in /dev/mapper
-        mapper_name = os.path.basename(lv_path)
-        # Attempt removal using the basename (common case)
-        dmsetup_cmd = ["dmsetup", "remove", mapper_name]
-        dm_success, dm_err, _ = _run_command(dmsetup_cmd, f"Remove DM mapping {mapper_name}")
-        
-        if dm_success:
-            print(f"    Successfully removed DM mapping {mapper_name}.")
-            time.sleep(0.5) # Small delay
-        else:
-            # If basename fails, try the full path (less common for dmsetup remove)
-            if "No such device or address" not in dm_err:
-                print(f"    Attempting removal using full path {lv_path}...")
-                dmsetup_cmd_fullpath = ["dmsetup", "remove", lv_path]
-                dm_success_fp, dm_err_fp, _ = _run_command(dmsetup_cmd_fullpath, f"Remove DM mapping {lv_path}")
-                if dm_success_fp:
-                     print(f"    Successfully removed DM mapping using full path {lv_path}.")
-                     time.sleep(0.5) # Small delay
-                elif "No such device or address" not in dm_err_fp:
-                    # Only report error if it wasn't already gone
-                    err_msg = f"Failed to remove DM mapping {mapper_name} (and {lv_path}): {dm_err_fp}"
-                    print(f"    Warning: {err_msg}")
-                    errors.append(err_msg)
-                    all_success = False # Mark as failure if any removal fails
-                # else: Ignore "No such device" error on second attempt too
-            # else: Ignore "No such device" error on first attempt
+def live_root_on_disk(disk_device):
+    disk_paths = _disk_member_paths(disk_device)
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "/"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return _source_on_disk(r.stdout.strip(), disk_paths)
+    except Exception:
+        pass
+    return False
 
+
+def umount_mounts_on_disk(disk_device, progress_callback=None):
+    """Unmount every filesystem whose source sits on disk_device."""
+    if not disk_device:
+        return True, ""
     if progress_callback:
-        status = "DM removal complete." if all_success and not errors else "DM removal attempted, some errors occurred."
-        progress_callback(f"DM Check on {disk_device}: {status}", None)
+        progress_callback(f"Unmounting filesystems on {disk_device}...", None)
+    disk_paths = _disk_member_paths(disk_device)
+    mounts = []
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                src, tgt = parts[0], parts[1]
+                if tgt in ("/", "/proc", "/sys", "/dev", "/run", "/dev/pts", "/dev/shm"):
+                    continue
+                if _source_on_disk(src, disk_paths):
+                    mounts.append((src, tgt))
+    except Exception as e:
+        return False, f"Could not read mounts: {e}"
 
-    final_error_str = "\n".join(errors)
-    # Return success overall unless a removal failed with an error other than "No such device"
-    return all_success, final_error_str 
+    # deepest mounts first
+    mounts.sort(key=lambda x: x[1].count("/"), reverse=True)
+    errors = []
+    for src, tgt in mounts:
+        print(f"  Unmounting {tgt} (from {src})")
+        ok, err, _ = _run_command(["umount", tgt], f"Unmount {tgt}", progress_callback, timeout=30)
+        if ok:
+            continue
+        ok2, err2, _ = _run_command(
+            ["umount", "-l", tgt], f"Lazy unmount {tgt}", progress_callback, timeout=30
+        )
+        if not ok2:
+            errors.append(f"{tgt}: {err2 or err}")
+    return (len(errors) == 0), "\n".join(errors)
+
+
+def reread_partition_table(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
+    if progress_callback:
+        progress_callback(f"Rereading partition table on {disk_device}...", None)
+    last_err = ""
+    for cmd in (
+        ["partprobe", disk_device],
+        ["blockdev", "--rereadpt", disk_device],
+        ["partx", "-u", disk_device],
+    ):
+        ok, err, _ = _run_command(
+            cmd, f"Reread PT ({cmd[0]})", progress_callback, timeout=30
+        )
+        if ok:
+            try:
+                subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+            except Exception:
+                pass
+            return True, ""
+        last_err = err or last_err
+    return False, last_err or "partition table reread failed"
+
+
+def forget_kernel_partitions(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
+    _run_command(
+        ["partx", "-d", disk_device],
+        f"partx -d {disk_device}",
+        progress_callback,
+        timeout=30,
+    )
+    try:
+        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+    except Exception:
+        pass
+    return True, ""
+
+
+def partition_nodes_ready(disk_device, expect_count):
+    if not disk_device or not expect_count:
+        return False
+    prefix = "p" if ("nvme" in disk_device or "mmcblk" in disk_device) else ""
+    for i in range(1, int(expect_count) + 1):
+        if not os.path.exists(f"{disk_device}{prefix}{i}"):
+            return False
+    return True
+
+
+def ensure_partitions_visible(disk_device, expect_count, progress_callback=None):
+    if partition_nodes_ready(disk_device, expect_count):
+        return True, ""
+    release_disk_for_install(disk_device, progress_callback)
+    ok, err = reread_partition_table(disk_device, progress_callback)
+    if partition_nodes_ready(disk_device, expect_count):
+        return True, ""
+    return False, err or f"kernel still does not see {expect_count} partitions on {disk_device}"
+
+
+def table_written_kernel_busy(err_text):
+    t = (err_text or "").lower()
+    return "unable to inform the kernel" in t or (
+        "have been written" in t and "in use" in t
+    )
+
+
+def _dm_leaf_name(name):
+    return str(name).replace("-", "--")
+
+
+def lvm_mapper_path(vg_name, lv_name):
+    return f"/dev/mapper/{_dm_leaf_name(vg_name)}-{_dm_leaf_name(lv_name)}"
+
+
+def purge_stale_vg_dm(vg_name, progress_callback=None):
+    if not vg_name:
+        return True, ""
+    if progress_callback:
+        progress_callback(f"Clearing stale DM nodes for {vg_name}...", None)
+    _remove_vg_dm_stack(vg_name, progress_callback)
+    _run_command(
+        ["vgremove", "-f", "-y", vg_name],
+        f"Remove leftover VG {vg_name}",
+        progress_callback,
+        timeout=60,
+    )
+    try:
+        subprocess.run(["udevadm", "settle", "--timeout=5"], check=False, timeout=8)
+    except Exception:
+        pass
+    return True, ""
+
+
+def ensure_lvm_thin_pool_ready(vg_name, pool_name, progress_callback=None, timeout=30):
+    if not vg_name or not pool_name:
+        return False, "missing vg/pool name"
+    full = f"{vg_name}/{pool_name}"
+    tpool_name = f"{_dm_leaf_name(vg_name)}-{_dm_leaf_name(pool_name)}-tpool"
+    if progress_callback:
+        progress_callback(f"Waiting for thin pool {full}...", None)
+
+    def _diag():
+        bits = []
+        for cmd in (
+            ["lvs", "-a", "-o", "+devices,lv_attr,lv_active,pool_lv,segtype", vg_name],
+            ["dmsetup", "ls"],
+            ["ls", "-la", "/dev/mapper"],
+        ):
+            ok, err, out = _run_command(
+                cmd, f"diag {' '.join(cmd[:2])}", progress_callback, timeout=15
+            )
+            body = (out or "").strip()
+            if err and not ok:
+                body = (body + "\n" + err).strip()
+            bits.append(f"$ {' '.join(cmd)}\n{body}")
+        return "\n".join(bits)
+
+    def _pool_active(out):
+        return "active" in (out or "").lower()
+
+    def _tpool_visible():
+        if os.path.exists(f"/dev/mapper/{tpool_name}"):
+            return True
+        ok_dm, _, dm_out = _run_command(
+            ["dmsetup", "info", "-c", "--noheadings", "-o", "name", tpool_name],
+            f"dmsetup info {tpool_name}",
+            progress_callback,
+            timeout=15,
+        )
+        return bool(ok_dm and tpool_name in (dm_out or ""))
+
+    deadline = time.time() + max(8, int(timeout))
+    last_err = ""
+    activated_once = False
+    while time.time() < deadline:
+        ok, err, out = _run_command(
+            ["lvs", "--noheadings", "-o", "lv_name,segtype,lv_active", full],
+            f"Check thin pool {full}",
+            progress_callback,
+            timeout=20,
+        )
+        if not ok:
+            last_err = err or "lvs failed"
+            time.sleep(0.2)
+            continue
+
+        fields = (out or "").split()
+        segtype = fields[1].lower() if len(fields) > 1 else ""
+        active_txt = " ".join(fields[2:]) if len(fields) > 2 else ""
+        if segtype and segtype != "thin-pool":
+            last_err = f"{full} segtype={segtype!r}, want thin-pool"
+            time.sleep(0.2)
+            continue
+
+        if _pool_active(active_txt) or _tpool_visible():
+            return True, ""
+
+        if not activated_once:
+            ok_act, err_act, _ = _run_command(
+                ["lvchange", "-ay", "--monitor", "n", full],
+                f"Activate thin pool {full}",
+                progress_callback,
+                timeout=45,
+            )
+            activated_once = True
+            if not ok_act:
+                err_l = (err_act or "").lower()
+                if "used by another device" in err_l:
+                    if _tpool_visible():
+                        return True, ""
+                    ok2, _, out2 = _run_command(
+                        ["lvs", "--noheadings", "-o", "lv_active", full],
+                        f"Re-check active {full}",
+                        progress_callback,
+                        timeout=15,
+                    )
+                    if ok2 and _pool_active(out2):
+                        return True, ""
+                last_err = err_act or "lvchange failed"
+            try:
+                subprocess.run(
+                    ["udevadm", "settle", "--timeout=5"],
+                    check=False,
+                    timeout=8,
+                )
+            except Exception:
+                pass
+            continue
+
+        last_err = f"thin pool {full} not active yet"
+        time.sleep(0.2)
+
+    detail = _diag()
+    print(f"ensure_lvm_thin_pool_ready failed for {full}\n{detail}")
+    return False, f"thin pool {full} not ready: {last_err}\n{detail}"
+
+
+def ensure_lvm_lv_ready(vg_name, lv_name, progress_callback=None, timeout=45):
+    if not vg_name or not lv_name:
+        return False, "missing vg/lv name"
+    mapper = lvm_mapper_path(vg_name, lv_name)
+    full = f"{vg_name}/{lv_name}"
+    if progress_callback:
+        progress_callback(f"Activating {full}...", None)
+
+    ok, err, out = _run_command(
+        ["lvs", "--noheadings", "-o", "lv_name,lv_active", full],
+        f"Check LV {full}",
+        progress_callback,
+        timeout=30,
+    )
+    if not ok:
+        return False, f"LV {full} was not created: {err}"
+
+    if os.path.exists(mapper) and "active" in (out or "").lower():
+        return True, ""
+
+    ok, err, _ = _run_command(
+        ["lvchange", "-ay", "--monitor", "n", full],
+        f"Activate LV {full}",
+        progress_callback,
+        timeout=60,
+    )
+    if not ok:
+        if "used by another device" in (err or "").lower() and os.path.exists(mapper):
+            return True, ""
+        return False, f"Failed to activate {full}: {err}"
+
+    try:
+        subprocess.run(["udevadm", "settle", "--timeout=5"], check=False, timeout=8)
+    except Exception:
+        pass
+
+    deadline = time.time() + max(5, int(timeout))
+    while time.time() < deadline:
+        if os.path.exists(mapper):
+            return True, ""
+        ok_dm, _, _ = _run_command(
+            ["dmsetup", "info", mapper],
+            f"dmsetup info {mapper}",
+            progress_callback,
+            timeout=10,
+        )
+        if ok_dm and os.path.exists(mapper):
+            return True, ""
+        try:
+            subprocess.run(["udevadm", "settle", "--timeout=3"], check=False, timeout=5)
+        except Exception:
+            pass
+        time.sleep(0.15)
+
+    bits = []
+    for cmd in (
+        ["lvs", "-a", "-o", "+devices,lv_attr,lv_active,pool_lv", vg_name],
+        ["dmsetup", "ls"],
+        ["ls", "-la", "/dev/mapper"],
+    ):
+        ok, err, out = _run_command(
+            cmd, f"diag {' '.join(cmd[:2])}", progress_callback, timeout=15
+        )
+        body = (out or "").strip()
+        if err and not ok:
+            body = (body + "\n" + err).strip()
+        bits.append(f"$ {' '.join(cmd)}\n{body}")
+    detail = "\n".join(bits)
+    print(f"ensure_lvm_lv_ready failed for {full}\n{detail}")
+    return False, f"{full} activated but {mapper} never appeared\n{detail}"
+
+
+def remove_oreon_root_protection(target_root, progress_callback=None):
+    pkg = "oreon-root-protection"
+    if progress_callback:
+        progress_callback(f"Removing {pkg} (non-ext4 root)...", None)
+    ok_q, _, _ = _run_command(
+        ["rpm", "-q", "--root", target_root, pkg],
+        f"Check {pkg}",
+        progress_callback,
+        timeout=30,
+    )
+    if not ok_q:
+        return True, ""
+    ok, err, _ = _run_command(
+        ["dnf", "-y", f"--installroot={target_root}", "remove", pkg],
+        f"Remove {pkg}",
+        progress_callback,
+        timeout=300,
+    )
+    if ok:
+        return True, ""
+    ok2, err2, _ = _run_command(
+        ["rpm", "-e", "--root", target_root, pkg],
+        f"rpm -e {pkg}",
+        progress_callback,
+        timeout=120,
+    )
+    if ok2:
+        return True, ""
+    return False, err2 or err or f"failed to remove {pkg}"
+
+
+def release_disk_for_install(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
+    if live_root_on_disk(disk_device):
+        return False, (
+            f"Refusing to wipe {disk_device}: the running system root is on this disk."
+        )
+    if progress_callback:
+        progress_callback(f"Releasing {disk_device}...", None)
+
+    umount_mounts_on_disk(disk_device, progress_callback)
+    swapoff_on_disk(disk_device, progress_callback)
+    ok, err, teardown_vgs = teardown_lvm_on_disk(disk_device, progress_callback)
+    if not ok:
+        return False, f"Could not tear down LVM on {disk_device}: {err}", []
+    _remove_dm_mappings(disk_device, progress_callback)
+    umount_mounts_on_disk(disk_device, progress_callback)
+
+    try:
+        members = sorted(_disk_member_paths(disk_device))
+        if members:
+            subprocess.run(
+                ["fuser", "-km"] + members,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+    except Exception:
+        pass
+
+    try:
+        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    return True, "", teardown_vgs
+
 
 # Enhanced GRUB package verification with distribution-specific handling
 def verify_grub_packages(target_root, offline_install=False):

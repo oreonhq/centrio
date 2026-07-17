@@ -151,6 +151,7 @@ class ProgressPage(QWidget):
             commands = disk_config.get("commands", [])
             partitions = disk_config.get("partitions", [])
             primary_disk = (disk_config.get("target_disks") or [None])[0]
+            expect_parts = int(disk_config.get("expect_partitions") or 0)
             storage_cb = self._scaled_progress_callback(0.02, 0.2)
 
             if primary_disk and commands:
@@ -160,39 +161,72 @@ class ProgressPage(QWidget):
                 else:
                     print("Stopped udisks2 temporarily for storage setup.")
                     udisks_stopped_for_storage = True
-                swap_ok, swap_err = backend.swapoff_on_disk(primary_disk, storage_cb)
-                if not swap_ok:
+                rel_ok, rel_err, teardown_vgs = backend.release_disk_for_install(
+                    primary_disk, storage_cb
+                )
+                if not rel_ok:
                     raise RuntimeError(
-                        f"Could not turn off swap on the target disk. Details: {swap_err}"
+                        f"Could not release target disk. Details: {rel_err}"
                     )
-                lvm_ok, lvm_err = backend._deactivate_lvm_on_disk(primary_disk, storage_cb)
-                if not lvm_ok:
-                    print(f"Warning: LVM deactivation incomplete (continuing): {lvm_err}")
+                if teardown_vgs:
+                    disk_config["lvm_teardown_vgs"] = teardown_vgs
+                    print(f"LVM torn down on {primary_disk}: {teardown_vgs}")
+                backend.forget_kernel_partitions(primary_disk, storage_cb)
+                backend._start_service("systemd-udevd.service")
+                try:
+                    subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+                except Exception:
+                    pass
+                from ui.disk import refresh_disk_config_lvm
+
+                refresh_disk_config_lvm(disk_config)
+                commands = disk_config.get("commands", [])
+                partitions = disk_config.get("partitions", [])
+                from ui.disk import SCHEME_BTRFS, SCHEME_THIN, _vg_name_blocked
+                import storage_layout
+
+                scheme = disk_config.get("storage_scheme") or (
+                    SCHEME_THIN if disk_config.get("lvm_thin") else None
+                )
+                vg_now = disk_config.get("lvm_vg")
+                print(
+                    f"Install scheme={scheme} VG={vg_now} PV={disk_config.get('lvm_pv')}"
+                )
+                if scheme != SCHEME_BTRFS:
+                    if not vg_now:
+                        raise RuntimeError("No LVM VG name selected for install")
+                    if _vg_name_blocked(vg_now):
+                        raise RuntimeError(
+                            f"Live session already owns LVM/DM name '{vg_now}'. "
+                            "Installer refused to create a colliding volume group."
+                        )
 
             self._update_progress_text("Preparing storage...", 0.02)
             for idx, cmd in enumerate(commands):
-                if (
-                    primary_disk
-                    and cmd
-                    and cmd[0] == "wipefs"
-                    and primary_disk in cmd
-                ):
-                    so2_ok, so2_err = backend.swapoff_on_disk(primary_disk, storage_cb)
-                    if not so2_ok:
-                        raise RuntimeError(
-                            f"Could not turn off swap on the target disk before wiping. Details: {so2_err}"
-                        )
                 cmd_timeout = 120
-                if cmd and cmd[0] in (
-                    "pvcreate",
-                    "vgcreate",
-                    "lvcreate",
-                    "vgchange",
-                    "pvremove",
-                    "vgremove",
-                    "lvremove",
-                ):
-                    cmd_timeout = 300
+                cmd_bin = None
+                if cmd:
+                    for t in cmd:
+                        if (
+                            t
+                            and not str(t).startswith("-")
+                            and "=" not in str(t)
+                            and t not in ("env", "sudo", "bash")
+                        ):
+                            cmd_bin = t
+                            break
+                    if cmd_bin is None:
+                        cmd_bin = cmd[0]
+                if cmd and cmd[0] == "bash" and any("sfdisk" in str(t) for t in cmd):
+                    cmd_bin = "sfdisk"
+                if cmd and cmd[0] == "udevadm" and "settle" in cmd:
+                    cmd_timeout = 45
+                    if not any(
+                        str(t).startswith("--timeout") or str(t).startswith("-t")
+                        for t in cmd
+                    ):
+                        cmd = ["udevadm", "settle", "--timeout=30"]
+
                 ok, err, _ = backend._run_command(
                     cmd,
                     f"Storage step {idx + 1}",
@@ -200,32 +234,44 @@ class ProgressPage(QWidget):
                     timeout=cmd_timeout,
                 )
                 if not ok:
-                    raise RuntimeError(err or f"Storage command failed: {' '.join(cmd)}")
-                if (
-                    ok
-                    and primary_disk
-                    and cmd
-                    and cmd[0] == "wipefs"
-                    and primary_disk in cmd
-                ):
-                    pp_ok, pp_err, _ = backend._run_command(
-                        ["partprobe", primary_disk],
-                        f"Reread partitions on {primary_disk} after wipefs",
-                        progress_callback=storage_cb,
-                        timeout=30,
-                    )
-                    if not pp_ok:
-                        print(f"Warning: partprobe after wipefs failed: {pp_err}")
-                    try:
-                        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
-                    except FileNotFoundError:
-                        pass
-                    except Exception as e:
-                        print(f"Warning: udevadm settle after wipefs: {e}")
-                    try:
-                        subprocess.run(["sync"], check=False, timeout=15)
-                    except Exception:
-                        pass
+                    if (
+                        primary_disk
+                        and expect_parts
+                        and cmd_bin in ("sfdisk", "parted")
+                        and backend.table_written_kernel_busy(err)
+                    ):
+                        vis_ok, vis_err = backend.ensure_partitions_visible(
+                            primary_disk, expect_parts, storage_cb
+                        )
+                        if not vis_ok:
+                            raise RuntimeError(vis_err or err)
+                    elif (
+                        primary_disk
+                        and expect_parts
+                        and cmd_bin == "partprobe"
+                    ):
+                        if not backend.partition_nodes_ready(
+                            primary_disk, expect_parts
+                        ):
+                            vis_ok, vis_err = backend.ensure_partitions_visible(
+                                primary_disk, expect_parts, storage_cb
+                            )
+                            if not vis_ok:
+                                raise RuntimeError(err)
+                    else:
+                        raise RuntimeError(
+                            err or f"Storage command failed: {' '.join(cmd)}"
+                        )
+
+            # Industry path: libblockdev (same stack as Anaconda/blivet)
+            import storage_layout
+
+            self._update_progress_text("Creating root storage...", 0.08)
+            ok, err = storage_layout.apply_root_storage(disk_config, storage_cb)
+            if not ok:
+                raise RuntimeError(err or "Root storage setup failed")
+            partitions = disk_config.get("partitions", [])
+
             if not backend.ensure_directory(self.target_root):
                 raise RuntimeError(f"Could not create {self.target_root}")
 
@@ -233,7 +279,6 @@ class ProgressPage(QWidget):
                 mp = part.get("mountpoint") or ""
                 if mp == "/":
                     return (0, "")
-                # /boot before /boot/efi, /home after /boot
                 depth = len([p for p in mp.split("/") if p])
                 return (depth, mp)
 
@@ -261,10 +306,19 @@ class ProgressPage(QWidget):
             if not copy_ok:
                 raise RuntimeError(copy_err or "Live copy failed")
 
+            fs_now = (disk_config.get("filesystem") or "ext4").lower()
+            if fs_now != "ext4":
+                rm_ok, rm_err = backend.remove_oreon_root_protection(
+                    self.target_root,
+                    progress_callback=self._scaled_progress_callback(0.75, 0.76),
+                )
+                if not rm_ok:
+                    raise RuntimeError(rm_err or "Failed to remove oreon-root-protection")
+
             cfg_ok, cfg_err = backend.configure_system_in_container(
                 self.target_root,
                 config_data,
-                progress_callback=self._scaled_progress_callback(0.75, 0.78),
+                progress_callback=self._scaled_progress_callback(0.76, 0.78),
             )
             if not cfg_ok:
                 raise RuntimeError(cfg_err or "System configuration failed")
@@ -305,15 +359,11 @@ class ProgressPage(QWidget):
             if not boot_ok:
                 raise RuntimeError(boot_err or "Bootloader install failed")
 
-            # v2 originally skipped post-copy finalization; that leaves live-boot
-            # artifacts and can produce non-bootable installs.
             payload_cfg = config_data.get("payload", {}) if isinstance(config_data, dict) else {}
             disk_cfg = config_data.get("disk", {}) if isinstance(config_data, dict) else {}
-            lvm_vg = disk_cfg.get("lvm_vg") or "oreon"
+            lvm_vg = disk_cfg.get("lvm_vg")
             lvm_root_lv = disk_cfg.get("lvm_root_lv") or "root"
-            lvm_root = None
-            if disk_cfg.get("lvm_thin"):
-                lvm_root = f"{lvm_vg}/{lvm_root_lv}"
+            lvm_root = f"{lvm_vg}/{lvm_root_lv}" if lvm_vg else None
             post_ok, post_err = backend.setup_live_environment_post_copy(
                 self.target_root,
                 progress_callback=self._scaled_progress_callback(0.94, 0.995),
@@ -333,7 +383,6 @@ class ProgressPage(QWidget):
             if not fstab_ok:
                 raise RuntimeError(fstab_err or "Failed to generate fstab")
 
-            # Run Plasma first-boot OOBE only for desktop installs (server profile strips Plasma).
             if not bool(payload_cfg.get("server_install", False)):
                 ps_ok, ps_err = backend.configure_plasma_setup_oobe(
                     self.target_root,
