@@ -57,8 +57,237 @@ def _write_file_as_root(path, content, progress_callback=None):
 
 BOOTLOADER_ID = "Oreon"
 
+_SETUPMODE_EFIVAR_GUID = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+_OREON_SB_OWNER_GUID = "6f72656f-6e2d-5342-2d6b-657973000001"
+_KERNEL_KEYS_REL = "usr/share/doc/kernel-keys"
+
+
 def is_uefi_system():
     return os.path.exists("/sys/firmware/efi")
+
+
+def _find_host_or_target_tool(name, target_root=None):
+    for candidate in (f"/usr/bin/{name}", f"/usr/sbin/{name}", f"/bin/{name}"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    which = shutil.which(name)
+    if which:
+        return which
+    if target_root:
+        for rel in (f"usr/bin/{name}", f"usr/sbin/{name}", f"bin/{name}"):
+            p = os.path.join(target_root, rel)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    return None
+
+
+def _is_secure_boot_setup_mode(progress_callback=None):
+    if not is_uefi_system():
+        return False
+    efivars = "/sys/firmware/efi/efivars"
+    try:
+        names = os.listdir(efivars)
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith("SetupMode-") and name.endswith(_SETUPMODE_EFIVAR_GUID):
+            try:
+                with open(os.path.join(efivars, name), "rb") as f:
+                    data = f.read()
+                if len(data) >= 5:
+                    return data[4] == 1
+            except OSError:
+                pass
+            break
+    return False
+
+
+def _kernel_keys_uki_names():
+    arch = get_host_architecture().get("arch", "").lower()
+    if arch in ("aarch64", "arm64"):
+        return ("secureboot-uki-aa64.cer", "secureboot-uki-aarch64.cer", "secureboot-uki.cer")
+    return ("secureboot-uki-x86_64.cer", "secureboot-uki.cer")
+
+
+def _list_kernel_key_dirs(root=""):
+    base = os.path.join(root, _KERNEL_KEYS_REL) if root else os.path.join("/", _KERNEL_KEYS_REL)
+    try:
+        names = sorted(os.listdir(base), reverse=True)
+    except OSError:
+        return []
+    return [os.path.join(base, n) for n in names if os.path.isdir(os.path.join(base, n))]
+
+
+def _find_kernel_sb_certs(root=""):
+    """Return (uki_cer_path_or_None, ca_cer_path_or_None) from kernel-keys."""
+    uki_names = _kernel_keys_uki_names()
+    for key_dir in _list_kernel_key_dirs(root):
+        uki = next((os.path.join(key_dir, n) for n in uki_names if os.path.isfile(os.path.join(key_dir, n))), None)
+        ca = os.path.join(key_dir, "kernel-signing-ca.cer")
+        if not os.path.isfile(ca):
+            ca = None
+        if uki or ca:
+            return uki, ca
+    return None, None
+
+
+def _cer_to_pem(cer_path, pem_path, progress_callback=None):
+    ok, err, _ = _run_command(
+        ["openssl", "x509", "-inform", "DER", "-in", cer_path, "-outform", "PEM", "-out", pem_path],
+        f"DER->PEM {os.path.basename(cer_path)}",
+        progress_callback,
+        timeout=30,
+    )
+    if ok and os.path.isfile(pem_path):
+        return True, ""
+    ok, err, _ = _run_command(
+        ["openssl", "x509", "-in", cer_path, "-outform", "PEM", "-out", pem_path],
+        f"PEM copy {os.path.basename(cer_path)}",
+        progress_callback,
+        timeout=30,
+    )
+    if ok and os.path.isfile(pem_path):
+        return True, ""
+    return False, err or f"Failed to convert {cer_path} to PEM"
+
+
+def _clear_secure_boot_efivar_immutable(progress_callback=None):
+    efivars = "/sys/firmware/efi/efivars"
+    try:
+        names = os.listdir(efivars)
+    except OSError:
+        return
+    prefixes = ("db-", "KEK-", "PK-", "dbx-")
+    for name in names:
+        if not name.startswith(prefixes):
+            continue
+        path = os.path.join(efivars, name)
+        _run_command(
+            ["chattr", "-i", path],
+            f"chattr -i {name}",
+            progress_callback,
+            timeout=5,
+        )
+
+
+def _cert_to_esl(cert_to_efi, pem_path, esl_path, progress_callback=None):
+    ok, err, _ = _run_command(
+        [cert_to_efi, "-g", _OREON_SB_OWNER_GUID, pem_path, esl_path],
+        f"cert-to-efi-sig-list {os.path.basename(pem_path)}",
+        progress_callback,
+        timeout=30,
+    )
+    if not ok or not os.path.isfile(esl_path):
+        return False, err or f"cert-to-efi-sig-list failed for {pem_path}"
+    return True, ""
+
+
+def _concat_files(paths, out_path):
+    with open(out_path, "wb") as out:
+        for p in paths:
+            with open(p, "rb") as inp:
+                out.write(inp.read())
+
+
+def _efi_updatevar_esl(efi_updatevar, esl_path, var_name, progress_callback=None):
+    ok, err, _ = _run_command(
+        [efi_updatevar, "-e", "-f", esl_path, var_name],
+        f"efi-updatevar -e -f {os.path.basename(esl_path)} {var_name}",
+        progress_callback,
+        timeout=60,
+    )
+    if not ok:
+        return False, err or f"efi-updatevar failed for {var_name}"
+    return True, ""
+
+
+def provision_secure_boot_keys(target_root, progress_callback=None):
+    """
+    Enroll Oreon/kernel Secure Boot certs into firmware with efitools.
+    Only runs in Setup Mode. Uses public certs from /usr/share/doc/kernel-keys.
+    """
+    if not is_uefi_system():
+        print("Skipping Secure Boot key enrollment (not UEFI).")
+        return True, ""
+
+    if progress_callback:
+        progress_callback("Checking Secure Boot Setup Mode...", None)
+
+    if not _is_secure_boot_setup_mode(progress_callback):
+        print(
+            "Secure Boot not in Setup Mode. Skipping efi-updatevar key enrollment."
+        )
+        return True, ""
+
+    efi_updatevar = _find_host_or_target_tool("efi-updatevar", target_root)
+    cert_to_efi = _find_host_or_target_tool("cert-to-efi-sig-list", target_root)
+    if not efi_updatevar or not cert_to_efi:
+        return False, "efitools not found (need efi-updatevar and cert-to-efi-sig-list)"
+
+    uki, ca = _find_kernel_sb_certs(target_root)
+    if not uki and not ca:
+        uki, ca = _find_kernel_sb_certs("")
+    if not uki and not ca:
+        return False, "No kernel SB certs under /usr/share/doc/kernel-keys"
+
+    pk_src = ca or uki
+    kek_src = ca or uki
+    db_srcs = []
+    if uki:
+        db_srcs.append(uki)
+    if ca and ca not in db_srcs:
+        db_srcs.append(ca)
+
+    if progress_callback:
+        progress_callback("Building EFI signature lists from kernel certs...", None)
+
+    work = tempfile.mkdtemp(prefix="centrio-sb-")
+    try:
+        pem_paths = {}
+        for cer in {pk_src, kek_src, *db_srcs}:
+            pem = os.path.join(work, os.path.splitext(os.path.basename(cer))[0] + ".pem")
+            ok, err = _cer_to_pem(cer, pem, progress_callback)
+            if not ok:
+                return False, err
+            pem_paths[cer] = pem
+
+        db_esls = []
+        for i, cer in enumerate(db_srcs):
+            esl = os.path.join(work, f"db-{i}.esl")
+            ok, err = _cert_to_esl(cert_to_efi, pem_paths[cer], esl, progress_callback)
+            if not ok:
+                return False, err
+            db_esls.append(esl)
+        db_esl = os.path.join(work, "db.esl")
+        _concat_files(db_esls, db_esl)
+
+        kek_esl = os.path.join(work, "KEK.esl")
+        ok, err = _cert_to_esl(cert_to_efi, pem_paths[kek_src], kek_esl, progress_callback)
+        if not ok:
+            return False, err
+
+        pk_esl = os.path.join(work, "PK.esl")
+        ok, err = _cert_to_esl(cert_to_efi, pem_paths[pk_src], pk_esl, progress_callback)
+        if not ok:
+            return False, err
+
+        if progress_callback:
+            progress_callback("Enrolling Secure Boot keys with efi-updatevar...", None)
+
+        _clear_secure_boot_efivar_immutable(progress_callback)
+
+        # PK last
+        for esl, var in ((db_esl, "db"), (kek_esl, "KEK"), (pk_esl, "PK")):
+            ok, err = _efi_updatevar_esl(efi_updatevar, esl, var, progress_callback)
+            if not ok:
+                return False, err
+            print(f"Enrolled {var} via efi-updatevar from kernel SB certs")
+
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    print("Secure Boot key enrollment with efi-updatevar completed.")
+    return True, ""
 
 
 def _efi_partition_ensure_mounted(target_root, efi_partition_device, progress_callback=None):
@@ -631,7 +860,8 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
 def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False):
     """
     Install bootloader for target: UEFI or legacy BIOS.
-    Works with dnf-based systems. Returns (success, error_msg, verification_dict or None).
+    On UEFI in Setup Mode, enrolls kernel SB certs via efi-updatevar.
+    Returns (success, error_msg, verification_dict or None).
     """
     if not primary_disk:
         return False, "No primary disk specified.", None
@@ -666,6 +896,15 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     )
     if not ok:
         return False, err, None
+
+    if uefi:
+        if progress_callback:
+            progress_callback("Enrolling Secure Boot keys (efi-updatevar)...", None)
+        ok_sb, err_sb = provision_secure_boot_keys(
+            target_root, progress_callback=progress_callback
+        )
+        if not ok_sb:
+            return False, err_sb or "Secure Boot key enrollment failed", None
 
     verification = {
         "uefi": uefi,

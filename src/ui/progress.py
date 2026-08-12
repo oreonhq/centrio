@@ -64,6 +64,7 @@ class ProgressPage(QWidget):
     _CORE_PACKAGES = frozenset([
         "@core", "kernel", "grub2-efi-x64", "grub2-efi-x64-modules", "grub2-efi-aa64", "grub2-efi-aa64-modules",
         "grub2-pc", "grub2-common", "grub2-tools", "shim-x64", "shim-aa64", "shim", "efibootmgr",
+        "efitools",
         "flatpak", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "centrio-installer",
     ])
 

@@ -1051,7 +1051,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
             "@core", "kernel",
             arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "efibootmgr",
             "grub2-common", "grub2-tools",
-            arch["shim_pkg"], "shim",
+            arch["shim_pkg"], "shim", "efitools",
             "linux-firmware",
             "bash-completion", "dnf-utils"
         ]
@@ -1430,7 +1430,7 @@ def install_packages_dnf(target_root, progress_callback=None):
     
     arch = get_host_architecture()
     base_pkgs = ["@core", "kernel", arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "efibootmgr",
-                 "grub2-common", "grub2-tools", arch["shim_pkg"], "shim", "linux-firmware",
+                 "grub2-common", "grub2-tools", arch["shim_pkg"], "shim", "efitools", "linux-firmware",
                  "bash-completion", "dnf-utils"]
     if arch["has_bios"]:
         base_pkgs.insert(base_pkgs.index(arch["grub_efi_modules_pkg"]) + 1, "grub2-pc")
