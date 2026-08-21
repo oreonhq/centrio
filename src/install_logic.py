@@ -487,7 +487,7 @@ def _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progr
         return False, "Failed to copy/patch grub.cfg from live: %s" % e
 
 
-def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None):
+def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=None, dual_boot=False):
     """Generate /boot/grub2/grub.cfg for target (must run inside chroot to see target's /boot). Returns (success, error_msg).
     GRUB_DISABLE_OS_PROBER=true avoids os-prober scanning block devices in chroot, which can hang indefinitely.
     If grub2-mkconfig produces empty/small output, falls back to copying grub.cfg from the live env and patching root UUID."""
@@ -496,7 +496,7 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
 
     ok, err, _ = _run_in_chroot(
         target_root,
-        ["env", "GRUB_DISABLE_OS_PROBER=true", "grub2-mkconfig", "-o", grub_cfg_chroot],
+        ["env", f"GRUB_DISABLE_OS_PROBER={'false' if dual_boot else 'true'}", "grub2-mkconfig", "-o", grub_cfg_chroot],
         "grub2-mkconfig",
         progress_callback
     )
@@ -523,7 +523,7 @@ def _generate_grub_cfg(target_root, primary_disk, is_uefi, progress_callback=Non
     return False, "GRUB config missing or too small after grub2-mkconfig; fallback failed: %s" % err2
 
 
-def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+def install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, dual_boot=False):
     """
     Install bootloader for target: UEFI (with Secure Boot support) or legacy BIOS.
     Works with dnf-based systems. Returns (success, error_msg, verification_dict or None).
@@ -550,7 +550,7 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
         return False, err, None
 
     # Common: generate grub.cfg on root fs at /boot/grub2/grub.cfg (standard location).
-    ok, err = _generate_grub_cfg(target_root, primary_disk, uefi, progress_callback)
+    ok, err = _generate_grub_cfg(target_root, primary_disk, uefi, progress_callback, dual_boot)
     if not ok:
         return False, err, None
 

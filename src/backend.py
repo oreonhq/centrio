@@ -790,7 +790,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
         packages = [
             "@core", "kernel",
             arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "efibootmgr",
-            "grub2-common", "grub2-tools",
+            "grub2-common", "grub2-tools", "os-prober",
             arch["shim_pkg"], "shim",
             "linux-firmware",
             "bash-completion", "dnf-utils"
@@ -1162,7 +1162,7 @@ def install_packages_dnf(target_root, progress_callback=None):
     
     arch = get_host_architecture()
     base_pkgs = ["@core", "kernel", arch["grub_efi_pkg"], arch["grub_efi_modules_pkg"], "efibootmgr",
-                 "grub2-common", "grub2-tools", arch["shim_pkg"], "shim", "linux-firmware",
+                 "grub2-common", "grub2-tools", "os-prober", arch["shim_pkg"], "shim", "linux-firmware",
                  "bash-completion", "dnf-utils"]
     if arch["has_bios"]:
         base_pkgs.insert(base_pkgs.index(arch["grub_efi_modules_pkg"]) + 1, "grub2-pc")
@@ -1179,11 +1179,11 @@ def install_packages_dnf(target_root, progress_callback=None):
 # --- Bootloader Installation ---
 # Installation logic is in install_logic.py
 
-def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+def install_bootloader_in_container(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, dual_boot=False):
     """Installs GRUB2 for UEFI (with Secure Boot) or legacy BIOS. Delegates to install_logic.
     When boot_partition_device is set (separate /boot), GRUB uses that partition for config/kernel."""
     from install_logic import install_bootloader
-    return install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback, boot_partition_device)
+    return install_bootloader(target_root, primary_disk, efi_partition_device, progress_callback, boot_partition_device, dual_boot)
 
 
 def regenerate_grub_cfg_in_chroot(target_root, progress_callback=None):

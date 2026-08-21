@@ -227,7 +227,7 @@ def get_free_space_region(disk_path):
                     num = float(s) if s else 0
                     if "GIB" in size_s.upper() or "GB" in size_s.upper():
                         num *= 1024  # to MiB
-                    if num > best_size_mb and num > 100:  # at least 100 MiB
+                    if num > best_size_mb and num >= 9216:
                         best_start, best_end, best_size_mb = start_s, end_s, num
                 except (ValueError, IndexError):
                     pass
@@ -278,43 +278,48 @@ def get_parent_disk(partition_path):
     return m.group(1) if m else None
 
 
-def detect_existing_efi_partitions():
+def detect_existing_efi_partitions(disk_path=None):
     """Detect existing EFI system partitions that could be reused for dual boot."""
     efi_guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
     efi_partitions = []
     seen_paths = set()
     try:
         # Fallback: if /boot/efi is mounted, use that partition
-        ok_fm, _, out_fm = backend._run_command(
+        mounted = subprocess.run(
             ["findmnt", "-n", "-o", "SOURCE", "/boot/efi"],
-            "Find EFI mount", timeout=5
+            capture_output=True, text=True, timeout=5
         )
-        if ok_fm and out_fm and out_fm.strip():
-            src = out_fm.strip()
+        if mounted.returncode == 0 and (mounted.stdout or "").strip():
+            src = mounted.stdout.strip()
+            if disk_path and get_parent_disk(src) != disk_path:
+                src = ""
             if src and src not in seen_paths:
                 seen_paths.add(src)
                 efi_partitions.append({"path": src, "size": None, "fstype": "vfat"})
 
-        cmd = ["lsblk", "-J", "-o", "PATH,FSTYPE,PARTTYPE,SIZE"]
-        ok, _, stdout = backend._run_command(cmd, "List block devices for EFI", timeout=10)
-        if not ok:
-            raise RuntimeError("lsblk failed")
-        lsblk_data = json.loads(stdout or "{}")
+        result = subprocess.run(
+            ["lsblk", "-J", "-o", "PATH,FSTYPE,PARTTYPE,SIZE,PARTFLAGS"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, check=True
+        )
+        lsblk_data = json.loads(result.stdout or "{}")
 
         def scan_device(device):
             path = device.get("path")
-            fstype = device.get("fstype")
+            fstype = (device.get("fstype") or "").lower()
             parttype = (device.get("parttype") or "").lower()
+            flags = (device.get("partflags") or "").lower()
             size = device.get("size")
             if not path or path in seen_paths:
                 return
-            # EFI GUID (case-insensitive); also accept vfat first partition on GPT
             is_efi = (
                 fstype == "vfat" and parttype == efi_guid
             ) or (
-                fstype == "vfat" and "efi" in (path or "").lower()
+                fstype == "vfat" and ("esp" in flags or "boot" in flags)
             )
             if is_efi:
+                if disk_path and get_parent_disk(path) != disk_path:
+                    return
                 seen_paths.add(path)
                 efi_partitions.append({"path": path, "size": size, "fstype": fstype or "vfat"})
             for child in device.get("children", []):
@@ -491,7 +496,8 @@ class DiskPage(BaseConfigurationPage):
 
     def _check_dual_boot_available(self):
         """Check if dual boot is possible: EFI partitions exist and at least one disk has unallocated space."""
-        self.efi_partitions = detect_existing_efi_partitions()
+        selected = next(iter(self.selected_disks), None)
+        self.efi_partitions = detect_existing_efi_partitions(selected)
         self.disks_with_free_space = self._get_disks_with_free_space()
         if not self.efi_partitions:
             self.dual_boot_row.set_sensitive(False)
@@ -826,13 +832,26 @@ class DiskPage(BaseConfigurationPage):
         self.dual_boot_radio.set_active(False)
 
         try:
-            # Run lsblk ONCE, get JSON tree, include MOUNTPOINT (use backend for sudo when not root)
-            cmd = ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT,TRAN"]
-            print(f"Running: {' '.join(cmd)}")
-            ok, err, stdout = backend._run_command(cmd, "Scan block devices", timeout=10)
-            if not ok:
-                raise subprocess.CalledProcessError(1, cmd, err or "")
-            lsblk_data = json.loads(stdout or "{}")
+            # Run lsblk directly because disk discovery does not require privileges
+            commands = [
+                ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT,TRAN,RO"],
+                ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT"],
+            ]
+            result = None
+            errors = []
+            for cmd in commands:
+                print(f"Running: {' '.join(cmd)}")
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=10
+                )
+                if result.returncode == 0:
+                    break
+                errors.append((result.stderr or result.stdout or "").strip())
+            if result is None or result.returncode != 0:
+                detail = next((item for item in reversed(errors) if item), "unknown lsblk failure")
+                raise RuntimeError(f"lsblk failed: {detail}")
+            lsblk_data = json.loads(result.stdout or "{}")
             
             self.detected_disks = []
             all_block_devices = lsblk_data.get("blockdevices", [])
@@ -881,12 +900,11 @@ class DiskPage(BaseConfigurationPage):
             # --- Process all detected physical disks ---
             print("--- Processing detected disks ---")
             for device in all_block_devices:
-                # Skip optical, USB/portable drives
-                tran = (device.get("tran") or "").lower()
-                if tran == "usb":
-                    print(f"  Skipping USB/portable disk: {device.get('path')}")
-                    continue
-                if device.get("type") == "disk" and not any(s in (device.get("model") or "").upper() for s in ["CD", "DVD"]):
+                if (
+                    device.get("type") == "disk"
+                    and int(device.get("ro", 0) or 0) == 0
+                    and not any(s in (device.get("model") or "").upper() for s in ["CD", "DVD"])
+                ):
                     disk_path = device.get("path")
                     if not disk_path: continue
 

@@ -974,6 +974,7 @@ class ProgressPage(Gtk.Box):
             efi_partition_device,
             progress_callback=boot_cb,
             boot_partition_device=boot_partition_device,
+            dual_boot=bool(disk_config.get('dual_boot')),
         )
         if success:
             self._update_progress_text("Bootloader installed.", 0.97)
