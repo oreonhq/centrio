@@ -19,11 +19,13 @@
 import subprocess
 import shlex
 import os
-import re # For parsing os-release
+import re
+import glob
+import signal
 from utils import get_os_release_info, get_host_architecture
-import errno # For checking mount errors
-import time   # For delays
-import shutil # For copying bootloader files
+import errno
+import time
+import shutil
 
 
 def _run_command(command_list, description, progress_callback=None, timeout=None, pipe_input=None):
@@ -40,24 +42,30 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         final_command_list = command_list
         execution_method = "directly as root"
         print(f"Executing Backend Step ({execution_method}): {description} -> {' '.join(shlex.quote(c) for c in final_command_list)}")
+        if progress_callback:
+            progress_callback(description)
     else:
-        final_command_list = ["sudo"] + command_list
+        # The installer has no terminal in which to answer a password prompt.
+        # ``-n`` makes a missing live-image sudoers rule fail immediately and
+        # lets us return a useful, deterministic error instead of hanging.
+        final_command_list = ["sudo", "-n"] + command_list
         execution_method = "via sudo"
         cmd_str = ' '.join(shlex.quote(c) for c in final_command_list)
         print(f"Executing Backend Step ({execution_method}): {description} -> {cmd_str}")
         if progress_callback:
-            progress_callback(f"Requesting privileges for: {description}...")
+            progress_callback(description)
 
     stderr_output = ""
     stdout_output = ""
     try:
         # Run the command (either directly or with sudo)
         process = subprocess.Popen(
-            final_command_list, # Use the decided command list
+            final_command_list,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE if pipe_input is not None else None,
-            text=True
+            text=True,
+            start_new_session=True,
         )
         
         stdout_output, stderr_output = process.communicate(input=pipe_input, timeout=timeout)
@@ -73,6 +81,10 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
                  print(f"  Command {description} stderr:\n{filtered_stderr.strip()}")
 
         if process.returncode != 0:
+            err_join = (stderr_output or "").lower()
+            if command_list and command_list[0] == "umount" and "not mounted" in err_join:
+                print(f"SUCCESS: {description} skipped, already unmounted ({execution_method}).")
+                return True, "", stdout_output.strip()
             error_detail = stderr_output.strip() or f"Exited with code {process.returncode}"
             error_msg = f"{description} failed ({execution_method}): {error_detail}"
             if execution_method == "via sudo":
@@ -84,7 +96,8 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
                 if is_sudo_auth:
                     error_msg = (
                         f"Privilege escalation failed for {description}. "
-                        "The live user must have NOPASSWD sudo. Check /etc/sudoers on the live ISO."
+                        "The live image did not grant this account noninteractive sudo. "
+                        "Install packaging/centrio-live-sudoers on the live ISO."
                     )
                 elif process.returncode == 127:
                     error_msg = f"Command not found for {description}: {command_list[0]}"
@@ -128,8 +141,14 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
     except subprocess.TimeoutExpired:
         err = f"Timeout expired after {timeout}s for {description} ({execution_method})."
         try:
-            process.kill()
-            process.wait()
+            os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=3)
         except Exception as kill_e:
             print(f"Warning: Error trying to kill timed out process: {kill_e}")
         return False, err, stdout_output.strip() 
@@ -138,6 +157,69 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         err = f"Unexpected error during {description} ({execution_method}): {err_detail}"
         print(f"ERROR: {err}")
         return False, err, stdout_output.strip()
+
+
+_LVM_WRAP_SH = r"""
+vg="$1"
+shift
+enc="${vg//-/--}"
+mkdir -p "/dev/$vg"
+shopt -s nullglob
+(
+  while true; do
+    hit=0
+    for p in /dev/mapper/"$enc"-*; do
+      [ -e "$p" ] || continue
+      hit=1
+      n="${p##*/}"
+      n="${n#${enc}-}"
+      ln -sfn "$p" "/dev/$vg/$n" 2>/dev/null
+      ln -sfn "$p" "/dev/$vg/${n//--/-}" 2>/dev/null
+    done
+    if [ "$hit" = 1 ]; then
+      sleep 0.05
+    fi
+  done
+) &
+lpid=$!
+trap 'kill -9 $lpid 2>/dev/null; wait $lpid 2>/dev/null' EXIT
+"$@"
+st=$?
+kill -9 $lpid 2>/dev/null
+wait $lpid 2>/dev/null
+exit $st
+"""
+
+
+def kill_lvm_dev_linkers():
+    mypid = os.getpid()
+    needle = b"lvmdevlink"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == mypid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if needle not in raw:
+            continue
+        print(f"Killing leftover lvmdevlink pid {pid}")
+        _sudo_run(["kill", "-9", str(pid)], run_timeout=5)
+
+
+def run_lvm_cmd(command_list, vg_name, description, progress_callback=None, timeout=None):
+    kill_lvm_dev_linkers()
+    cmd = list(command_list)
+    if vg_name:
+        cmd = ["bash", "-c", _LVM_WRAP_SH, "lvmdevlink", vg_name] + cmd
+    try:
+        return _run_command(cmd, description, progress_callback, timeout)
+    finally:
+        kill_lvm_dev_linkers()
 
 
 def create_btrfs_subvolumes(root_device, progress_callback=None):
@@ -291,7 +373,6 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                 print(f"  /boot/efi exists but is not mounted: {target_boot_efi_path}")
         except Exception as e:
             print(f"  Warning: Could not check /boot/efi mount status: {e}")
-            # If we can't check, but the directory exists, try to include it anyway
             if os.path.exists(target_boot_efi_path):
                 mount_points["boot_efi"] = target_boot_efi_path
                 print(f"  Including /boot/efi in chroot anyway: {target_boot_efi_path}")
@@ -1845,16 +1926,6 @@ def swapoff_on_disk(disk_device, progress_callback=None):
     return (len(errors) == 0, "\n".join(errors))
 
 
-def _dm_remove_priority(name):
-    if "-tpool" in name:
-        return 1
-    if "_tdata" in name or "_tmeta" in name or "-tdata" in name or "-tmeta" in name:
-        return 2
-    if "pmspare" in name:
-        return 3
-    return 0
-
-
 def _disk_member_devices(disk_device, progress_callback=None):
     devices = {disk_device}
     ok, _, out = _run_command(
@@ -1871,104 +1942,186 @@ def _disk_member_devices(disk_device, progress_callback=None):
     return devices
 
 
+_LVM_DEVICES_CFG = [
+    "--config",
+    "devices { use_devicesfile = 0 } "
+    "global { event_activation = 0 use_lvmlockd = 0 }",
+]
+_LVM_PROBE = [
+    "--nolocking",
+    "--readonly",
+    "--config",
+    "devices { use_devicesfile = 0 } "
+    "global { event_activation = 0 use_lvmlockd = 0 }",
+]
+_LVM_TEARDOWN = [
+    "--config",
+    "devices { use_devicesfile = 0 } "
+    "global { event_activation=0 wait_for_locks=0 use_lvmlockd=0 } "
+    "activation { udev_sync = 0 auto_activation_volume_list = [] }",
+]
+_LVM_NOAUTO = [
+    "--config",
+    "global { event_activation=0 use_lvmlockd=0 } "
+    "activation { auto_activation_volume_list = [] } "
+    "devices { use_devicesfile = 0 }",
+]
+
+
+def _sudo_run(args, run_timeout=30):
+    cmd = list(args)
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=run_timeout,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+_LVM_STRAY = (
+    "lvcreate",
+    "lvremove",
+    "lvchange",
+    "vgcreate",
+    "vgremove",
+    "vgchange",
+    "pvcreate",
+    "pvremove",
+    "dmsetup",
+)
+
+
+def _clear_vg_lock(vg_name):
+    if not vg_name:
+        return
+    for path in glob.glob(f"/run/lock/lvm/V_{vg_name}") + glob.glob(
+        f"/run/lock/lvm/V_{vg_name}:*"
+    ):
+        _sudo_run(["fuser", "-k", path], run_timeout=5)
+
+
+def _kill_stray_lvm_for_vg(vg_name):
+    if not vg_name:
+        return
+    needle = vg_name.encode("utf-8", "replace")
+    mypid = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == mypid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if needle not in raw and b"lvmdevlink" not in raw:
+            continue
+        parts = raw.split(b"\0")
+        if not parts or not parts[0]:
+            continue
+        base = os.path.basename(parts[0].decode("utf-8", "replace"))
+        if base not in _LVM_STRAY and b"lvmdevlink" not in raw:
+            continue
+        print(f"Killing leftover {base} pid {pid} for VG {vg_name}")
+        _sudo_run(["kill", "-9", str(pid)], run_timeout=5)
+    _clear_vg_lock(vg_name)
+
+
 def _vgs_on_disk(disk_device, progress_callback=None):
     vgs = set()
-    for device in _disk_member_devices(disk_device, progress_callback):
-        ok, err, out = _run_command(
-            ["pvs", "--noheadings", "-o", "vg_name", "--select", f"pv_name={device}"],
-            f"Find VG on {device}",
-            progress_callback,
-            timeout=20,
-        )
-        if not ok:
-            err_l = (err or "").lower()
-            if "no physical volume" in err_l or "failed to find" in err_l:
-                continue
-            print(f"Warning: pvs failed for {device}: {err}")
+    devices = [
+        d
+        for d in sorted(_disk_member_devices(disk_device, progress_callback))
+        if d and d != disk_device
+    ]
+    if not devices:
+        return vgs
+    if progress_callback:
+        progress_callback(f"Find VGs on {disk_device}...", None)
+    proc = _sudo_run(
+        ["pvs", "--noheadings", "-o", "pv_name,vg_name"] + _LVM_PROBE + devices
+    )
+    if not proc or proc.returncode != 0:
+        err = (proc.stderr if proc else "pvs probe failed") or ""
+        print(f"Warning: pvs probe failed for {disk_device}: {err.strip()}")
+        return vgs
+    want = set(devices)
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2:
             continue
-        for line in (out or "").splitlines():
-            name = line.strip()
-            if name:
-                vgs.add(name)
+        pv_name, vg_name = fields[0], fields[1]
+        if vg_name and (pv_name in want or os.path.realpath(pv_name) in want):
+            vgs.add(vg_name)
     return vgs
+
+
+def _pvs_on_devices(devices, progress_callback=None):
+    found = []
+    devices = [d for d in sorted(devices or []) if d]
+    if not devices:
+        return found
+    if progress_callback:
+        progress_callback("List PVs on target devices...", None)
+    proc = _sudo_run(
+        ["pvs", "--noheadings", "-o", "pv_name"] + _LVM_PROBE + devices
+    )
+    if not proc or proc.returncode != 0:
+        return found
+    want = set(devices)
+    for line in (proc.stdout or "").splitlines():
+        pv_name = line.split()[0] if line.split() else ""
+        if pv_name and (pv_name in want or os.path.realpath(pv_name) in want):
+            found.append(pv_name)
+    return found
 
 
 def _remove_vg_dm_stack(vg_name, progress_callback=None):
     if not vg_name:
         return True, ""
-    leaf = _dm_leaf_name(vg_name)
-    prefix = f"{leaf}-"
+    if progress_callback:
+        progress_callback(f"Removing leftover LVM VG {vg_name}...", None)
 
-    ok_lvs, _, lvs_out = _run_command(
-        ["lvs", "-a", "--noheadings", "-o", "lv_name", vg_name],
-        f"List LVs in {vg_name}",
-        progress_callback,
-        timeout=30,
-    )
-    if ok_lvs:
-        for line in (lvs_out or "").splitlines():
-            lv = line.strip()
-            if lv:
-                _run_command(
-                    ["lvchange", "-an", f"{vg_name}/{lv}"],
-                    f"Deactivate {vg_name}/{lv}",
-                    progress_callback,
-                    timeout=30,
-                )
+    _kill_stray_lvm_for_vg(vg_name)
+    _sudo_run(["vgchange", "-an"] + _LVM_TEARDOWN + [vg_name])
+    _sudo_run(["lvremove", "-ff", "-y"] + _LVM_TEARDOWN + [vg_name])
+    _sudo_run(["vgremove", "-ff", "-y"] + _LVM_TEARDOWN + [vg_name])
 
-    _run_command(
-        ["vgchange", "-an", vg_name],
-        f"Deactivate VG {vg_name}",
-        progress_callback,
-        timeout=60,
-    )
+    proc = _sudo_run(["dmsetup", "ls"])
+    maps_out = proc.stdout if proc else ""
+    leaf = str(vg_name).replace("-", "--")
+    prefix = leaf + "-"
+    names = [
+        (line.split() or [""])[0]
+        for line in (maps_out or "").splitlines()
+        if (line.split() or [""])[0] == leaf
+        or (line.split() or [""])[0].startswith(prefix)
+    ]
 
-    for _pass in range(3):
-        ok_ls, _, ls_out = _run_command(
-            ["dmsetup", "ls"],
-            "List DM devices",
-            progress_callback,
-            timeout=15,
-        )
-        names = []
-        if ok_ls:
-            for line in (ls_out or "").splitlines():
-                name = (line.split() or [""])[0].strip()
-                if name == leaf or name.startswith(prefix):
-                    names.append(name)
-        if not names:
-            break
-        names.sort(key=lambda n: (_dm_remove_priority(n), -len(n), n))
-        for name in names:
-            _run_command(
-                ["dmsetup", "remove", "-f", name],
-                f"Remove DM {name}",
-                progress_callback,
-                timeout=30,
-            )
-        try:
-            subprocess.run(["udevadm", "settle", "--timeout=5"], check=False, timeout=8)
-        except Exception:
-            pass
+    def _remove_priority(name):
+        if "-tpool" in name:
+            return 1
+        if any(token in name for token in ("_tdata", "_tmeta", "-tdata", "-tmeta")):
+            return 2
+        if "pmspare" in name:
+            return 3
+        return 0
+
+    for name in sorted(names, key=lambda n: (_remove_priority(n), -len(n), n)):
+        mapper = f"/dev/mapper/{name}"
+        _umount_one_device(mapper, progress_callback)
+        _sudo_run(["fuser", "-k", mapper], run_timeout=5)
+        _sudo_run(["dmsetup", "remove", "--force", name], run_timeout=10)
     return True, ""
-
-
-def _vg_dm_still_present(vg_name, progress_callback=None):
-    leaf = _dm_leaf_name(vg_name)
-    prefix = f"{leaf}-"
-    ok_ls, _, ls_out = _run_command(
-        ["dmsetup", "ls"],
-        "Check leftover DM nodes",
-        progress_callback,
-        timeout=15,
-    )
-    if not ok_ls:
-        return False
-    for line in (ls_out or "").splitlines():
-        name = (line.split() or [""])[0].strip()
-        if name == leaf or name.startswith(prefix):
-            return True
-    return False
 
 
 def scrub_vg_dm_stacks(vg_names, progress_callback=None):
@@ -1980,28 +2133,41 @@ def scrub_vg_dm_stacks(vg_names, progress_callback=None):
 
 
 def teardown_lvm_on_disk(disk_device, progress_callback=None):
-    """Deactivate every VG on disk_device and tear down its dm thin stack."""
+    """Deactivate every VG with a PV on disk_device."""
     if not disk_device:
         return True, "", []
     if progress_callback:
         progress_callback(f"Tearing down LVM on {disk_device}...", None)
-    _run_command(
-        ["pvscan", "--cache"],
-        f"Refresh PV cache for {disk_device}",
-        progress_callback,
-        timeout=30,
-    )
     vgs = _vgs_on_disk(disk_device, progress_callback)
-    if not vgs:
-        return True, "", []
     errors = []
     for vg_name in sorted(vgs):
-        _remove_vg_dm_stack(vg_name, progress_callback)
-        if _vg_dm_still_present(vg_name, progress_callback):
-            errors.append(
-                f"DM nodes for {vg_name} still present after teardown "
-                f"(live thin stack still holds the disk)"
+        ok, err = _remove_vg_dm_stack(vg_name, progress_callback)
+        if not ok:
+            errors.append(err or f"could not deactivate {vg_name}")
+    for device in _pvs_on_devices(
+        [
+            d
+            for d in _disk_member_devices(disk_device, progress_callback)
+            if d != disk_device
+        ],
+        progress_callback,
+    ):
+        _run_command(
+            ["pvremove", "-ff", "-y"] + _LVM_NOAUTO + [device],
+            f"pvremove {device}",
+            progress_callback,
+            timeout=30,
+        )
+        try:
+            subprocess.run(
+                ["lvmdevices", "--deldev", device],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
             )
+        except Exception:
+            pass
     if errors:
         return False, "\n".join(errors), sorted(vgs)
     return True, "", sorted(vgs)
@@ -2017,17 +2183,7 @@ def _deactivate_lvm_on_disk(disk_device, progress_callback=None):
 
 # --- Device Mapper Removal Helper --- 
 def _remove_dm_mappings(disk_device, progress_callback=None):
-    """Remove dm nodes for every VG that has a PV on disk_device."""
-    if not disk_device:
-        return True, ""
-    if progress_callback:
-        progress_callback(f"Removing DM mappings for {disk_device}...", None)
-    vgs = _vgs_on_disk(disk_device, progress_callback)
-    if not vgs:
-        return True, ""
-    for vg_name in sorted(vgs):
-        _remove_vg_dm_stack(vg_name, progress_callback)
-    return True, ""
+    return teardown_lvm_on_disk(disk_device, progress_callback)[:2]
 
 
 def _disk_member_paths(disk_device):
@@ -2195,12 +2351,9 @@ def reread_partition_table(disk_device, progress_callback=None):
 def forget_kernel_partitions(disk_device, progress_callback=None):
     if not disk_device:
         return True, ""
-    _run_command(
-        ["partx", "-d", disk_device],
-        f"partx -d {disk_device}",
-        progress_callback,
-        timeout=30,
-    )
+    proc = _sudo_run(["partx", "-d", disk_device], run_timeout=15)
+    if proc and proc.returncode != 0:
+        print(f"Warning: partx -d {disk_device}: {(proc.stderr or proc.stdout or '').strip()}")
     try:
         subprocess.run(["udevadm", "settle"], check=False, timeout=15)
     except Exception:
@@ -2246,20 +2399,161 @@ def lvm_mapper_path(vg_name, lv_name):
 def purge_stale_vg_dm(vg_name, progress_callback=None):
     if not vg_name:
         return True, ""
-    if progress_callback:
-        progress_callback(f"Clearing stale DM nodes for {vg_name}...", None)
-    _remove_vg_dm_stack(vg_name, progress_callback)
-    _run_command(
-        ["vgremove", "-f", "-y", vg_name],
-        f"Remove leftover VG {vg_name}",
-        progress_callback,
-        timeout=60,
-    )
+    return _remove_vg_dm_stack(vg_name, progress_callback)
+
+
+def _umount_one_device(device, progress_callback=None):
+    if not device:
+        return
+    targets = []
     try:
-        subprocess.run(["udevadm", "settle", "--timeout=5"], check=False, timeout=8)
+        r = subprocess.run(
+            ["findmnt", "-nr", "-o", "TARGET", "-S", device],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            targets.extend(t.strip() for t in (r.stdout or "").splitlines() if t.strip())
     except Exception:
         pass
+    try:
+        real = os.path.realpath(device)
+    except OSError:
+        real = device
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                src, tgt = parts[0], parts[1]
+                try:
+                    src_r = os.path.realpath(src)
+                except OSError:
+                    src_r = src
+                if src == device or src_r == real:
+                    if tgt not in targets:
+                        targets.append(tgt)
+    except OSError:
+        pass
+    targets.sort(key=lambda t: t.count("/"), reverse=True)
+    for tgt in targets:
+        ok, err, _ = _run_command(
+            ["umount", tgt], f"Unmount {tgt}", progress_callback, timeout=30
+        )
+        if ok:
+            continue
+        _run_command(
+            ["umount", "-l", tgt], f"Lazy unmount {tgt}", progress_callback, timeout=30
+        )
+
+
+def _sys_block_name(device):
+    if not device:
+        return ""
+    if device.startswith("dm-") or (
+        not device.startswith("/") and os.path.isdir(f"/sys/class/block/{device}")
+    ):
+        return device
+    try:
+        real = os.path.realpath(device)
+    except OSError:
+        real = device
+    return os.path.basename(real)
+
+
+def _dm_sysfs_name(sys_name):
+    path = f"/sys/class/block/{sys_name}/dm/name"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _holder_dm_names(device):
+    names = []
+    seen = set()
+
+    def walk(sys_name):
+        if not sys_name or sys_name in seen:
+            return
+        seen.add(sys_name)
+        hdir = f"/sys/class/block/{sys_name}/holders"
+        try:
+            holders = os.listdir(hdir)
+        except OSError:
+            holders = []
+        for h in sorted(holders):
+            walk(h)
+        dm_name = _dm_sysfs_name(sys_name)
+        if dm_name:
+            names.append(dm_name)
+
+    walk(_sys_block_name(device))
+    return names
+
+
+def _clear_block_holders(device, progress_callback=None):
+    if not device:
+        return
+    if progress_callback:
+        progress_callback(f"Dropping holders of {device}...", None)
+    for _ in range(12):
+        names = _holder_dm_names(device)
+        if not names:
+            break
+        for name in names:
+            mapper = f"/dev/mapper/{name}"
+            _umount_one_device(mapper, progress_callback)
+            _sudo_run(["fuser", "-k", mapper], run_timeout=5)
+            _sudo_run(["dmsetup", "remove", "--force", name], run_timeout=10)
+        time.sleep(0.2)
+    _sudo_run(["pvremove", "-ff", "-y"] + _LVM_NOAUTO + [device], run_timeout=20)
+    _sudo_run(["wipefs", "-af", device], run_timeout=20)
+    _sudo_run(["lvmdevices", "--deldev", device], run_timeout=20)
+    _sudo_run(["pvscan", "--cache"], run_timeout=20)
+
+
+def release_block_device(device, progress_callback=None):
+    if not device:
+        return True, ""
+    if progress_callback:
+        progress_callback(f"Releasing {device}...", None)
+    swapoff_on_disk(device, progress_callback)
+    _umount_one_device(device, progress_callback)
+    _sudo_run(["fuser", "-km", device], run_timeout=10)
+    kill_lvm_dev_linkers()
+    _clear_block_holders(device, progress_callback)
+    _sudo_run(["lvmdevices", "--deldev", device], run_timeout=30)
     return True, ""
+
+
+def lvm_lv_exists(vg_name, lv_name):
+    if not vg_name or not lv_name:
+        return False
+    if os.path.exists(f"/dev/{vg_name}/{lv_name}") or os.path.exists(
+        lvm_mapper_path(vg_name, lv_name)
+    ):
+        return True
+    proc = _sudo_run(
+        [
+            "lvs",
+            "--noheadings",
+            "-o",
+            "lv_name",
+            "--nolocking",
+            "--readonly",
+        ]
+        + _LVM_DEVICES_CFG
+        + [f"{vg_name}/{lv_name}"],
+        run_timeout=15,
+    )
+    if not proc or proc.returncode != 0:
+        return False
+    return lv_name in (proc.stdout or "")
 
 
 def ensure_lvm_thin_pool_ready(vg_name, pool_name, progress_callback=None, timeout=30):
@@ -2273,7 +2567,9 @@ def ensure_lvm_thin_pool_ready(vg_name, pool_name, progress_callback=None, timeo
     def _diag():
         bits = []
         for cmd in (
-            ["lvs", "-a", "-o", "+devices,lv_attr,lv_active,pool_lv,segtype", vg_name],
+            ["lvs", "-a", "-o", "+devices,lv_attr,lv_active,pool_lv,segtype"]
+            + _LVM_DEVICES_CFG
+            + [vg_name],
             ["dmsetup", "ls"],
             ["ls", "-la", "/dev/mapper"],
         ):
@@ -2305,7 +2601,9 @@ def ensure_lvm_thin_pool_ready(vg_name, pool_name, progress_callback=None, timeo
     activated_once = False
     while time.time() < deadline:
         ok, err, out = _run_command(
-            ["lvs", "--noheadings", "-o", "lv_name,segtype,lv_active", full],
+            ["lvs", "--noheadings", "-o", "lv_name,segtype,lv_active"]
+            + _LVM_DEVICES_CFG
+            + [full],
             f"Check thin pool {full}",
             progress_callback,
             timeout=20,
@@ -2328,7 +2626,7 @@ def ensure_lvm_thin_pool_ready(vg_name, pool_name, progress_callback=None, timeo
 
         if not activated_once:
             ok_act, err_act, _ = _run_command(
-                ["lvchange", "-ay", "--monitor", "n", full],
+                ["lvchange", "-ay", "--monitor", "n"] + _LVM_DEVICES_CFG + [full],
                 f"Activate thin pool {full}",
                 progress_callback,
                 timeout=45,
@@ -2340,7 +2638,9 @@ def ensure_lvm_thin_pool_ready(vg_name, pool_name, progress_callback=None, timeo
                     if _tpool_visible():
                         return True, ""
                     ok2, _, out2 = _run_command(
-                        ["lvs", "--noheadings", "-o", "lv_active", full],
+                        ["lvs", "--noheadings", "-o", "lv_active"]
+                        + _LVM_DEVICES_CFG
+                        + [full],
                         f"Re-check active {full}",
                         progress_callback,
                         timeout=15,
@@ -2375,7 +2675,7 @@ def ensure_lvm_lv_ready(vg_name, lv_name, progress_callback=None, timeout=45):
         progress_callback(f"Activating {full}...", None)
 
     ok, err, out = _run_command(
-        ["lvs", "--noheadings", "-o", "lv_name,lv_active", full],
+        ["lvs", "--noheadings", "-o", "lv_name,lv_active"] + _LVM_DEVICES_CFG + [full],
         f"Check LV {full}",
         progress_callback,
         timeout=30,
@@ -2387,7 +2687,7 @@ def ensure_lvm_lv_ready(vg_name, lv_name, progress_callback=None, timeout=45):
         return True, ""
 
     ok, err, _ = _run_command(
-        ["lvchange", "-ay", "--monitor", "n", full],
+        ["lvchange", "-ay", "--monitor", "n"] + _LVM_DEVICES_CFG + [full],
         f"Activate LV {full}",
         progress_callback,
         timeout=60,
@@ -2422,7 +2722,9 @@ def ensure_lvm_lv_ready(vg_name, lv_name, progress_callback=None, timeout=45):
 
     bits = []
     for cmd in (
-        ["lvs", "-a", "-o", "+devices,lv_attr,lv_active,pool_lv", vg_name],
+        ["lvs", "-a", "-o", "+devices,lv_attr,lv_active,pool_lv"]
+        + _LVM_DEVICES_CFG
+        + [vg_name],
         ["dmsetup", "ls"],
         ["ls", "-la", "/dev/mapper"],
     ):
@@ -2479,11 +2781,12 @@ def release_disk_for_install(disk_device, progress_callback=None):
     if progress_callback:
         progress_callback(f"Releasing {disk_device}...", None)
 
+    kill_lvm_dev_linkers()
     umount_mounts_on_disk(disk_device, progress_callback)
     swapoff_on_disk(disk_device, progress_callback)
     ok, err, teardown_vgs = teardown_lvm_on_disk(disk_device, progress_callback)
     if not ok:
-        return False, f"Could not tear down LVM on {disk_device}: {err}", []
+        print(f"Warning: LVM teardown on {disk_device} incomplete: {err}")
     _remove_dm_mappings(disk_device, progress_callback)
     umount_mounts_on_disk(disk_device, progress_callback)
 

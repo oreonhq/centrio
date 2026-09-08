@@ -13,9 +13,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import os
+import subprocess
+
 import backend
+from utils import get_host_architecture
 
 from .base import BaseConfigurationPage
+
+
+def _detect_nvidia_gpu():
+    try:
+        for name in os.listdir("/sys/bus/pci/devices"):
+            try:
+                with open(f"/sys/bus/pci/devices/{name}/vendor", encoding="ascii") as fh:
+                    if fh.read().strip().lower() == "0x10de":
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(
+            ["lspci", "-n", "-d", "10de:"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 class PayloadPage(BaseConfigurationPage):
@@ -106,7 +135,7 @@ class PayloadPage(BaseConfigurationPage):
         ]
         for app_id, label in browser_options:
             cb = QCheckBox(label)
-            if app_id == "none":
+            if app_id == "firefox":
                 cb.setChecked(True)
             browser_layout.addWidget(cb)
             self.browser_group.addButton(cb)
@@ -163,6 +192,17 @@ class PayloadPage(BaseConfigurationPage):
         advanced_form.setHorizontalSpacing(12)
         advanced_form.setVerticalSpacing(8)
         self.nvidia_drivers = QCheckBox("Install NVIDIA drivers")
+        has_nvidia = _detect_nvidia_gpu()
+        arch = get_host_architecture().get("arch", "")
+        if arch in ("aarch64", "arm64"):
+            self.nvidia_drivers.setChecked(False)
+            self.nvidia_drivers.setEnabled(False)
+            self.nvidia_drivers.setVisible(False)
+        else:
+            self.nvidia_drivers.setChecked(has_nvidia)
+            self.nvidia_drivers.setEnabled(True)
+            if has_nvidia:
+                self.nvidia_drivers.setText("Install NVIDIA drivers (GPU detected)")
         self.keep_cache = QCheckBox("Keep package cache")
         self.custom_packages = QLineEdit()
         self.custom_packages.setPlaceholderText("custom1 custom2")

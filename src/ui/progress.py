@@ -172,6 +172,9 @@ class ProgressPage(QWidget):
                 if teardown_vgs:
                     disk_config["lvm_teardown_vgs"] = teardown_vgs
                     print(f"LVM torn down on {primary_disk}: {teardown_vgs}")
+                prev_vg = disk_config.get("lvm_vg")
+                if prev_vg:
+                    backend.purge_stale_vg_dm(prev_vg, storage_cb)
                 backend.forget_kernel_partitions(primary_disk, storage_cb)
                 backend._start_service("systemd-udevd.service")
                 try:
@@ -183,8 +186,10 @@ class ProgressPage(QWidget):
                 refresh_disk_config_lvm(disk_config)
                 commands = disk_config.get("commands", [])
                 partitions = disk_config.get("partitions", [])
+                print("STORAGE COMMANDS:")
+                for i, c in enumerate(commands):
+                    print(f"  [{i}] {c}")
                 from ui.disk import SCHEME_BTRFS, SCHEME_THIN, _vg_name_blocked
-                import storage_layout
 
                 scheme = disk_config.get("storage_scheme") or (
                     SCHEME_THIN if disk_config.get("lvm_thin") else None
@@ -205,9 +210,10 @@ class ProgressPage(QWidget):
             self._update_progress_text("Preparing storage...", 0.02)
             for idx, cmd in enumerate(commands):
                 cmd_timeout = 120
-                cmd_bin = None
-                if cmd:
-                    for t in cmd:
+                cmd_bin = cmd[0] if cmd else None
+                if cmd and cmd[0] in ("env", "sudo"):
+                    cmd_bin = None
+                    for t in cmd[1:]:
                         if (
                             t
                             and not str(t).startswith("-")
@@ -220,6 +226,21 @@ class ProgressPage(QWidget):
                         cmd_bin = cmd[0]
                 if cmd and cmd[0] == "bash" and any("sfdisk" in str(t) for t in cmd):
                     cmd_bin = "sfdisk"
+                if cmd_bin in (
+                    "pvcreate",
+                    "vgcreate",
+                    "lvcreate",
+                    "lvchange",
+                    "vgchange",
+                    "pvremove",
+                    "vgremove",
+                    "lvremove",
+                ):
+                    cmd_timeout = 300
+                pv = disk_config.get("lvm_pv")
+                is_pv_wipe = cmd_bin == "wipefs" and pv and pv in cmd
+                if pv and (is_pv_wipe or cmd_bin == "pvcreate"):
+                    backend.release_block_device(pv, storage_cb)
                 if cmd and cmd[0] == "udevadm" and "settle" in cmd:
                     cmd_timeout = 45
                     if not any(
@@ -228,13 +249,91 @@ class ProgressPage(QWidget):
                     ):
                         cmd = ["udevadm", "settle", "--timeout=30"]
 
-                ok, err, _ = backend._run_command(
-                    cmd,
-                    f"Storage step {idx + 1}",
-                    progress_callback=storage_cb,
-                    timeout=cmd_timeout,
-                )
+                if cmd_bin in ("lvcreate", "lvchange") and disk_config.get("lvm_vg"):
+                    ok, err, _ = backend.run_lvm_cmd(
+                        cmd,
+                        disk_config.get("lvm_vg"),
+                        f"Storage step {idx + 1}",
+                        progress_callback=storage_cb,
+                        timeout=cmd_timeout,
+                    )
+                elif (
+                    cmd_bin
+                    and cmd_bin.startswith("mkfs")
+                    and disk_config.get("lvm_vg")
+                    and any(
+                        backend.lvm_mapper_path(
+                            disk_config["lvm_vg"],
+                            disk_config.get("lvm_root_lv") or "root",
+                        )
+                        in str(t)
+                        or (
+                            disk_config.get("lvm_home_lv")
+                            and backend.lvm_mapper_path(
+                                disk_config["lvm_vg"], disk_config["lvm_home_lv"]
+                            )
+                            in str(t)
+                        )
+                        for t in cmd
+                    )
+                ):
+                    vg = disk_config["lvm_vg"]
+                    pool = disk_config.get("lvm_pool")
+                    print(f"ENSURE LVM before mkfs vg={vg} pool={pool} cmd={cmd}")
+                    if pool:
+                        ok_p, err_p = backend.ensure_lvm_thin_pool_ready(
+                            vg, pool, storage_cb
+                        )
+                        if not ok_p:
+                            raise RuntimeError(err_p or f"thin pool {vg}/{pool} not ready")
+                    for lv in (
+                        disk_config.get("lvm_root_lv") or "root",
+                        disk_config.get("lvm_home_lv"),
+                    ):
+                        if not lv:
+                            continue
+                        dev = backend.lvm_mapper_path(vg, lv)
+                        if dev not in cmd:
+                            continue
+                        ok_lv, err_lv = backend.ensure_lvm_lv_ready(vg, lv, storage_cb)
+                        if not ok_lv:
+                            raise RuntimeError(err_lv or f"{vg}/{lv} not ready for mkfs")
+                    ok, err, _ = backend._run_command(
+                        cmd,
+                        f"Storage step {idx + 1}",
+                        progress_callback=storage_cb,
+                        timeout=cmd_timeout,
+                    )
+                else:
+                    ok, err, _ = backend._run_command(
+                        cmd,
+                        f"Storage step {idx + 1}",
+                        progress_callback=storage_cb,
+                        timeout=cmd_timeout,
+                    )
                 if not ok:
+                    vg_dbg = disk_config.get("lvm_vg")
+                    if vg_dbg and cmd_bin in (
+                        "lvcreate",
+                        "lvchange",
+                        "mkfs.ext4",
+                        "mkfs.xfs",
+                        "mkfs.btrfs",
+                    ):
+                        for dbg in (
+                            ["lvs", "-a", "-o", "+devices,lv_active"]
+                            + backend._LVM_DEVICES_CFG
+                            + [vg_dbg],
+                            ["dmsetup", "ls"],
+                            ["ls", "-la", f"/dev/mapper", f"/dev/{vg_dbg}"],
+                        ):
+                            okd, errd, outd = backend._run_command(
+                                dbg, f"diag {' '.join(dbg[:2])}", None, timeout=20
+                            )
+                            print(
+                                f"DIAG $ {' '.join(dbg)}\n"
+                                f"{(outd or '').strip()}\n{(errd or '').strip()}"
+                            )
                     if (
                         primary_disk
                         and expect_parts
@@ -246,6 +345,43 @@ class ProgressPage(QWidget):
                         )
                         if not vis_ok:
                             raise RuntimeError(vis_err or err)
+                    elif cmd_bin in ("lvcreate", "lvchange") and any(
+                        s in (err or "").lower()
+                        for s in (
+                            "used by another device",
+                            "failed to activate thin pool",
+                            "device not cleared",
+                        )
+                    ):
+                        vg = disk_config.get("lvm_vg")
+                        lv = None
+                        if cmd and "-n" in cmd:
+                            nidx = cmd.index("-n")
+                            if nidx + 1 < len(cmd):
+                                lv = cmd[nidx + 1]
+                        if not lv and cmd and "--thinpool" in cmd:
+                            pidx = cmd.index("--thinpool")
+                            if pidx + 1 < len(cmd):
+                                lv = cmd[pidx + 1]
+                        if not lv and cmd:
+                            for t in reversed(cmd):
+                                if "/" in str(t) and not str(t).startswith("-"):
+                                    lv = str(t).split("/")[-1]
+                                    break
+                        if not lv:
+                            lv = disk_config.get("lvm_root_lv") or "root"
+                        if vg and (
+                            backend.lvm_lv_exists(vg, lv)
+                            or backend.lvm_lv_exists(vg, "root")
+                            or backend.lvm_lv_exists(vg, "pool")
+                        ):
+                            print(
+                                f"LVM {cmd_bin} raced tpool/nodes but {vg} has the LV, continuing"
+                            )
+                        else:
+                            raise RuntimeError(
+                                err or f"Storage command failed: {' '.join(cmd)}"
+                            )
                     elif (
                         primary_disk
                         and expect_parts
@@ -264,14 +400,17 @@ class ProgressPage(QWidget):
                             err or f"Storage command failed: {' '.join(cmd)}"
                         )
 
-            # Industry path: libblockdev (same stack as Anaconda/blivet)
-            import storage_layout
+            if not disk_config.get("legacy_lvm_commands"):
+                import storage_layout
 
-            self._update_progress_text("Creating root storage...", 0.08)
-            ok, err = storage_layout.apply_root_storage(disk_config, storage_cb)
-            if not ok:
-                raise RuntimeError(err or "Root storage setup failed")
-            partitions = disk_config.get("partitions", [])
+                self._update_progress_text("Creating root storage...", 0.08)
+                pv = disk_config.get("lvm_pv")
+                if pv:
+                    backend.release_block_device(pv, storage_cb)
+                ok, err = storage_layout.apply_root_storage(disk_config, storage_cb)
+                if not ok:
+                    raise RuntimeError(err or "Root storage setup failed")
+                partitions = disk_config.get("partitions", [])
 
             if not backend.ensure_directory(self.target_root):
                 raise RuntimeError(f"Could not create {self.target_root}")
