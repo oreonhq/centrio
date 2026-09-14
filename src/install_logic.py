@@ -24,6 +24,7 @@
 #   configfile $prefix/grub.cfg so the real config lives in /boot/grub2 on the root fs.
 # - No grub2-install (use distro signed binaries). NVRAM entry points to shim in vendor dir.
 
+import hashlib
 import os
 import re
 import shutil
@@ -272,7 +273,7 @@ _EFIVAR_GUID = {
 
 
 def _efi_time_bytes():
-    tm = time.gmtime(time.time() + 365 * 24 * 3600)
+    tm = time.gmtime()
     return struct.pack(
         "<HBBBBBBIhBB",
         tm.tm_year + 1900,
@@ -283,7 +284,7 @@ def _efi_time_bytes():
         tm.tm_sec,
         0,
         0,
-        0,
+        0x07FF,
         0,
         0,
     )
@@ -297,40 +298,213 @@ def _esl_to_setup_auth(esl):
     return ts + win + esl
 
 
-def _write_setup_esl(var_name, esl_path, progress_callback=None):
-    guid = _EFIVAR_GUID.get(var_name)
-    if not guid:
-        return False, f"unknown EFI variable {var_name}"
+_EFIVAR_WRITE_PY = (
+    "import os,sys\n"
+    "d,s=sys.argv[1],sys.argv[2]\n"
+    "data=open(s,'rb').read()\n"
+    "if not data: raise SystemExit('empty efivar blob')\n"
+    "flags=os.O_WRONLY\n"
+    "if not os.path.exists(d): flags|=os.O_CREAT\n"
+    "fd=os.open(d, flags, 0o644)\n"
+    "try:\n"
+    " n=os.write(fd, data)\n"
+    "except OSError as e:\n"
+    " os.close(fd)\n"
+    " raise SystemExit(e)\n"
+    "os.close(fd)\n"
+    "if n!=len(data): raise SystemExit('short efivar write %s/%s'%(n,len(data)))\n"
+)
+
+
+def _write_efivar_blob(dest, blob, progress_callback=None):
+    _run_command(
+        ["mount", "-o", "remount,rw", "efivarfs", "/sys/firmware/efi/efivars"],
+        "Remount efivarfs rw",
+        progress_callback,
+        timeout=5,
+    )
+    _run_command(["chattr", "-i", dest], f"chattr -i {os.path.basename(dest)}", progress_callback, timeout=5)
+    blob_f = tempfile.NamedTemporaryFile(prefix="centrio-efivar-", suffix=".bin", delete=False)
+    py_f = tempfile.NamedTemporaryFile(prefix="centrio-efivar-", suffix=".py", delete=False, mode="w")
     try:
-        with open(esl_path, "rb") as fh:
-            esl = fh.read()
-    except OSError as e:
-        return False, str(e)
-    if not esl:
-        return False, f"empty ESL for {var_name}"
-    blob = struct.pack("<I", _EFIVAR_NV_BS_RT_AT) + _esl_to_setup_auth(esl)
-    tmp = tempfile.NamedTemporaryFile(prefix="centrio-efivar-", suffix=".bin", delete=False)
-    try:
-        tmp.write(blob)
-        tmp.close()
-        os.chmod(tmp.name, 0o644)
-        dest = f"/sys/firmware/efi/efivars/{var_name}-{guid}"
-        _run_command(["chattr", "-i", dest], f"chattr -i {var_name}", progress_callback, timeout=5)
-        _run_command(["rm", "-f", dest], f"rm {var_name}", progress_callback, timeout=5)
+        blob_f.write(blob)
+        blob_f.close()
+        py_f.write(_EFIVAR_WRITE_PY)
+        py_f.close()
+        os.chmod(blob_f.name, 0o644)
+        os.chmod(py_f.name, 0o644)
         ok, err, _ = _run_command(
-            ["dd", f"if={tmp.name}", f"of={dest}", "bs=65536"],
-            f"Write {var_name} setup ESL",
+            ["python3", py_f.name, dest, blob_f.name],
+            f"Write {os.path.basename(dest)}",
             progress_callback,
             timeout=15,
         )
+        if ok:
+            return True, ""
+        return False, err or f"failed to write {dest}"
+    finally:
+        for p in (blob_f.name, py_f.name):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _uefi_enroll_certs(root=""):
+    pk_names = ("kernel-signing-ca.cer", "oreonsecurebootca.cer")
+    db_extra = (
+        "kernel-signing.cer",
+        "oreonsecureboot501.cer",
+        "secureboot-uki-x86_64.cer",
+        "secureboot-uki.cer",
+        "secureboot-uki-aa64.cer",
+        "secureboot-uki-aarch64.cer",
+    )
+    skip = ("ima.cer", "kernel-module-signing.cer")
+    pk = None
+    db = []
+    seen = set()
+    for key_dir in _list_kernel_key_dirs(root):
+        have = set(_listdir(key_dir))
+        for n in pk_names:
+            if n in have and pk is None:
+                pk = os.path.join(key_dir, n)
+                seen.add(n)
+        for n in db_extra:
+            if n in have and n not in seen:
+                db.append(os.path.join(key_dir, n))
+                seen.add(n)
+    if pk:
+        db = [pk] + [p for p in db if os.path.basename(p) != os.path.basename(pk)]
+    return pk, db
+
+
+def _cer_file_to_esl(cert_to_efi, cer_path, esl_path, progress_callback=None):
+    pem = esl_path + ".pem"
+    ok, err = _cer_to_pem(cer_path, pem, progress_callback)
+    if not ok:
+        return False, err
+    return _cert_to_esl(cert_to_efi, pem, esl_path, progress_callback)
+
+
+def _enroll_pk_setup_esl(esl_path, progress_callback=None, target_root=None):
+    dest = f"/sys/firmware/efi/efivars/PK-{_EFIVAR_GUID['PK']}"
+    openssl = _openssl_bin()
+    cert_to_efi = _ensure_host_tool("cert-to-efi-sig-list", target_root, progress_callback)
+    efi_updatevar = _ensure_host_tool("efi-updatevar", target_root, progress_callback)
+    signer = _ensure_host_tool("sign-efi-sig-list", target_root, progress_callback)
+    if not openssl or not os.path.isfile(openssl):
+        return False, "openssl not found"
+    if not cert_to_efi or not efi_updatevar or not signer:
+        return False, "efitools not found (efi-updatevar, cert-to-efi-sig-list, sign-efi-sig-list)"
+    work = tempfile.mkdtemp(prefix="centrio-pk-")
+    try:
+        key = os.path.join(work, "PK.key")
+        crt = os.path.join(work, "PK.crt")
+        ok, err = _run_as_user(
+            [
+                openssl, "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-days", "3650", "-keyout", key, "-out", crt,
+                "-subj", "/CN=Oreon Platform Key/",
+            ],
+            "Create platform key",
+            progress_callback,
+            timeout=30,
+        )
         if not ok:
-            return False, err or f"failed to write {var_name}"
+            return False, err or "openssl PK failed"
+        _run_command(["chmod", "644", key, crt], "chmod PK key/cert", progress_callback, timeout=5)
+        esl = os.path.join(work, "PK.esl")
+        ok, err = _cert_to_esl(cert_to_efi, crt, esl, progress_callback)
+        if not ok:
+            return False, err
+        _run_command(["chmod", "644", esl], "chmod PK.esl", progress_callback, timeout=5)
+        pk_here, _, _ = _run_command(["test", "-e", dest], "test PK exists", progress_callback, timeout=5)
+        if pk_here:
+            _run_command(["chattr", "-i", dest], "chattr -i PK", progress_callback, timeout=5)
+        ok, err, _ = _run_command(
+            [efi_updatevar, "-k", key, "-c", crt, "-e", "-f", esl, "PK"],
+            "efi-updatevar -k -c -e PK",
+            progress_callback,
+            timeout=30,
+        )
+        if ok:
+            return True, ""
+        print("efi-updatevar -k PK failed (%s), trying signed AUTH2" % err)
+        auth = os.path.join(work, "PK.auth")
+        ok, err, _ = _run_command(
+            [signer, "-k", key, "-c", crt, "PK", esl, auth],
+            "sign-efi-sig-list PK",
+            progress_callback,
+            timeout=30,
+        )
+        if not ok:
+            return False, err or "sign-efi-sig-list PK failed"
+        readable = os.path.join(work, "PK.auth.r")
+        _run_command(["cp", auth, readable], "Copy PK.auth", progress_callback, timeout=5)
+        _run_command(["chmod", "644", readable], "chmod PK.auth", progress_callback, timeout=5)
+        try:
+            with open(readable, "rb") as fh:
+                auth_bytes = fh.read()
+        except OSError as e:
+            return False, "could not read PK.auth: %s" % e
+        if not auth_bytes:
+            return False, "empty PK.auth"
+        if pk_here:
+            _run_command(["chattr", "-i", dest], "chattr -i PK", progress_callback, timeout=5)
+        blob = struct.pack("<I", _EFIVAR_NV_BS_RT_AT) + auth_bytes
+        return _write_efivar_blob(dest, blob, progress_callback)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _find_sb_auth_file(var_name, roots):
+    names = {
+        "PK": ("PK.auth", "pk.auth"),
+        "KEK": ("KEK.auth", "kek.auth"),
+        "db": ("db.auth", "DB.auth"),
+    }.get(var_name, ())
+    for root in roots:
+        for key_dir in _list_kernel_key_dirs(root):
+            have = set(_listdir(key_dir))
+            for n in names:
+                if n in have:
+                    return os.path.join(key_dir, n)
+    return None
+
+
+def _efi_updatevar_auth(efi_updatevar, auth_path, var_name, progress_callback=None):
+    dest = f"/sys/firmware/efi/efivars/{var_name}-{_EFIVAR_GUID[var_name]}"
+    _run_command(["chattr", "-i", dest], f"chattr -i {var_name}", progress_callback, timeout=5)
+    staged = auth_path
+    if not os.access(auth_path, os.R_OK):
+        tmp = tempfile.NamedTemporaryFile(prefix="centrio-%s-" % var_name, suffix=".auth", delete=False)
+        tmp.close()
+        ok, err, _ = _run_command(["cp", "-a", auth_path, tmp.name], f"Stage {var_name}.auth", progress_callback, timeout=15)
+        if not ok:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            return False, err or "could not read %s" % auth_path
+        staged = tmp.name
+        _run_command(["chmod", "644", staged], "chmod auth", progress_callback, timeout=5)
+    try:
+        ok, err, _ = _run_command(
+            [efi_updatevar, "-f", staged, var_name],
+            "efi-updatevar -f %s %s" % (os.path.basename(auth_path), var_name),
+            progress_callback,
+            timeout=60,
+        )
+        if not ok:
+            return False, err or "efi-updatevar -f failed for %s" % var_name
         return True, ""
     finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        if staged != auth_path:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
 
 
 def _efi_updatevar_esl(efi_updatevar, esl_path, var_name, progress_callback=None, append=False):
@@ -376,28 +550,14 @@ def _snapshot_efivar_esl(var_name, out_path, progress_callback=None):
     return os.path.getsize(out_path) > 0
 
 
-def _enroll_esl_list(efi_updatevar, var_name, esl_paths, progress_callback=None):
+def _enroll_replace_esl(efi_updatevar, var_name, esl_path, progress_callback=None):
     dest = f"/sys/firmware/efi/efivars/{var_name}-{_EFIVAR_GUID[var_name]}"
-    first = True
-    for esl in esl_paths:
-        _run_command(["chattr", "-i", dest], f"chattr -i {var_name}", progress_callback, timeout=5)
-        ok, err = _efi_updatevar_esl(efi_updatevar, esl, var_name, progress_callback, append=not first)
-        if not ok:
-            if first:
-                ok, err = _write_setup_esl(var_name, esl, progress_callback)
-            if not ok:
-                return False, err
-        first = False
-    return True, ""
+    _run_command(["chattr", "-i", dest], f"chattr -i {var_name}", progress_callback, timeout=5)
+    return _efi_updatevar_esl(efi_updatevar, esl_path, var_name, progress_callback, append=False)
 
 
 def _enroll_setup_esl(efi_updatevar, esl_path, var_name, progress_callback=None):
-    if var_name != "PK":
-        ok, err = _efi_updatevar_esl(efi_updatevar, esl_path, var_name, progress_callback)
-        if ok:
-            return True, ""
-        print(f"efi-updatevar -e {var_name} failed ({err}), writing AUTH2 ESL")
-    return _write_setup_esl(var_name, esl_path, progress_callback)
+    return _enroll_replace_esl(efi_updatevar, var_name, esl_path, progress_callback)
 
 
 def _efi_updatevar_binhash(efi_updatevar, efi_path, work, tag, progress_callback=None):
@@ -418,19 +578,130 @@ def _efi_updatevar_binhash(efi_updatevar, efi_path, work, tag, progress_callback
     return True, ""
 
 
-def _delete_secure_boot_vars(progress_callback=None):
+def _unlink_efivar_names(names, progress_callback=None):
+    efivars = "/sys/firmware/efi/efivars"
+    for name in names:
+        path = os.path.join(efivars, name)
+        _run_command(["chattr", "-i", path], f"chattr -i {name}", progress_callback, timeout=5)
+        _run_command(["rm", "-f", path], f"rm {name}", progress_callback, timeout=5)
+
+
+def _reclaim_efi_nvram(progress_callback=None, keep_windows=True):
+    ok, _, out = _run_command(["efibootmgr"], "List EFI boot entries", progress_callback, timeout=15)
+    current = None
+    drop = []
+    if ok and out:
+        for line in out.splitlines():
+            if line.startswith("BootCurrent:"):
+                current = line.split(":", 1)[1].strip().upper()
+                continue
+            m = re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.*)$", line)
+            if not m:
+                continue
+            num, label = m.group(1).upper(), m.group(2).strip().lower()
+            if current and num == current:
+                continue
+            if keep_windows and ("windows" in label or "microsoft" in label):
+                continue
+            drop.append(num)
+    for num in drop:
+        _run_command(
+            ["efibootmgr", "-B", "-b", num],
+            f"Remove Boot{num} to free NVRAM",
+            progress_callback,
+            timeout=15,
+        )
     efivars = "/sys/firmware/efi/efivars"
     try:
         names = os.listdir(efivars)
     except OSError:
         return
-    prefixes = ("db-", "KEK-", "PK-", "dbx-")
+    drop_vars = []
+    keep_boot = set()
+    if current:
+        keep_boot.add("Boot%s-" % current)
+    prefixes = (
+        "PK-",
+        "PKDefault-",
+        "db-",
+        "dbx-",
+        "KEK-",
+        "dbDefault-",
+        "dbxDefault-",
+        "KEKDefault-",
+        "MokList",
+        "MokListX",
+        "MokListRT",
+        "MokDeny",
+        "SbatLevel",
+        "dump-type",
+        "Driver",
+        "SysPrep",
+        "Key00",
+    )
     for name in names:
-        if not name.startswith(prefixes):
+        if any(name.startswith(p) for p in prefixes):
+            drop_vars.append(name)
             continue
-        path = os.path.join(efivars, name)
-        _run_command(["chattr", "-i", path], f"chattr -i {name}", progress_callback, timeout=5)
-        _run_command(["rm", "-f", path], f"rm {name}", progress_callback, timeout=5)
+        if re.match(r"Boot[0-9A-Fa-f]{4}-", name):
+            if any(name.startswith(k) for k in keep_boot):
+                continue
+            drop_vars.append(name)
+    _unlink_efivar_names(drop_vars, progress_callback)
+    _clear_secure_boot_efivar_immutable(progress_callback)
+
+
+def _split_disk_partition(device):
+    if not device:
+        return None, None
+    try:
+        device = os.path.realpath(device)
+    except OSError:
+        pass
+    for pat in (
+        r"^(/dev/nvme\d+n\d+)p(\d+)$",
+        r"^(/dev/mmcblk\d+)p(\d+)$",
+        r"^(/dev/loop\d+)p(\d+)$",
+        r"^(/dev/md\d+)p(\d+)$",
+        r"^(/dev/vd[a-z]+)(\d+)$",
+        r"^(/dev/xvd[a-z]+)(\d+)$",
+        r"^(/dev/[sh]d[a-z]+)(\d+)$",
+    ):
+        m = re.match(pat, device)
+        if m:
+            return m.group(1), m.group(2)
+    try:
+        r = subprocess.run(
+            ["lsblk", "-ndo", "PKNAME,PARTN", device],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = r.stdout.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                pk = parts[0]
+                if not pk.startswith("/dev/"):
+                    pk = "/dev/" + pk
+                return pk, parts[1]
+    except Exception:
+        pass
+    return None, None
+
+
+def _add_uefi_boot_entry(efi_partition_device, efi_install_id, progress_callback=None):
+    efi_disk, efi_part = _split_disk_partition(efi_partition_device)
+    if not efi_disk or not efi_part:
+        return False, "Could not parse EFI disk/partition for efibootmgr (%s)" % efi_partition_device
+    arch = get_host_architecture()
+    loader = "\\EFI\\" + efi_install_id + "\\" + arch["efi_shim"].replace("/", "\\")
+    ok, err, _ = _run_command(
+        ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", efi_install_id, "-l", loader],
+        "Add NVRAM boot entry",
+        progress_callback,
+        timeout=60,
+    )
+    if not ok:
+        return False, err or "efibootmgr -c failed"
+    return True, ""
 
 
 def _concat_files(paths, out_path):
@@ -833,11 +1104,33 @@ def _find_named_efi(filename, target_root=None):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _pe_optional_magic(data):
+    if len(data) < 64 or data[:2] != b"MZ":
+        return 0
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+        return 0
+    coff = e_lfanew + 4
+    size_opt = struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    if size_opt < 2 or opt + 2 > len(data):
+        return 0
+    return struct.unpack_from("<H", data, opt)[0]
+
+
 def _hash_efi_to_esl(hash_tool, efi_path, esl_path, work, tag, progress_callback=None):
     staged = os.path.join(work, f"hash-{tag}.efi")
     ok, err = _stage_efi_bin(efi_path, staged, progress_callback)
     if not ok:
         return False, err
+    try:
+        with open(staged, "rb") as fh:
+            raw = fh.read(8192)
+    except OSError as e:
+        return False, str(e)
+    magic = _pe_optional_magic(raw)
+    if magic == 0x10B:
+        return False, f"{os.path.basename(efi_path)} is PE32 (32-bit), skip hash"
     ok, err = _run_as_user(
         [hash_tool, staged, esl_path],
         f"hash-to-efi-sig-list {os.path.basename(efi_path)}",
@@ -957,129 +1250,85 @@ def provision_secure_boot_keys(target_root, progress_callback=None, efi_install_
         progress_callback("Checking Secure Boot Setup Mode...", None)
 
     if not _is_secure_boot_setup_mode(progress_callback):
-        print(
-            "Secure Boot not in Setup Mode. Skipping efi-updatevar key enrollment."
-        )
+        print("Secure Boot not in Setup Mode. Skipping key enrollment.")
         return True, ""
 
-    ca, uki = _oreon_sb_material("")
-    if not ca:
-        ca2, uki2 = _oreon_sb_material(target_root)
-        ca = ca or ca2
-        uki = uki or uki2
-    if not ca:
-        return False, "No kernel SB certs under /usr/share/doc/kernel-keys"
+    pk_auth = _find_sb_auth_file("PK", ("", target_root))
+    db_auth = _find_sb_auth_file("db", ("", target_root))
+    kek_auth = _find_sb_auth_file("KEK", ("", target_root))
+    pk_cer, db_cers = _uefi_enroll_certs("")
+    if not pk_cer:
+        pk2, db2 = _uefi_enroll_certs(target_root)
+        pk_cer, db_cers = pk_cer or pk2, db_cers or db2
+    if not pk_auth and not pk_cer:
+        return False, "No kernel-signing-ca.cer (or PK.auth) under /usr/share/doc/kernel-keys"
 
     efi_updatevar = _ensure_host_tool("efi-updatevar", target_root, progress_callback)
     cert_to_efi = _ensure_host_tool("cert-to-efi-sig-list", target_root, progress_callback)
-    hash_tool = _ensure_host_tool("hash-to-efi-sig-list", target_root, progress_callback)
     if not efi_updatevar or not cert_to_efi:
         return False, "efitools not found (need efi-updatevar and cert-to-efi-sig-list)"
-    if not hash_tool:
-        return False, "efitools not found (need hash-to-efi-sig-list)"
-
-    openssl = _openssl_bin()
-    if not os.path.isfile(openssl):
-        return False, "openssl not found"
 
     if progress_callback:
-        progress_callback("Enrolling Oreon kernel Secure Boot certs...", None)
+        progress_callback("Enrolling Oreon Secure Boot keys...", None)
+
+    _reclaim_efi_nvram(progress_callback, keep_windows=True)
 
     work = tempfile.mkdtemp(prefix="centrio-sb-")
     try:
-        kernel_pem = os.path.join(work, "kernel-ca.pem")
-        ok, err = _cer_to_pem(ca, kernel_pem, progress_callback)
-        if not ok:
-            return False, err
-
-        uki_pem = None
-        if uki:
-            uki_pem = os.path.join(work, "uki.pem")
-            ok, err = _cer_to_pem(uki, uki_pem, progress_callback)
+        if db_auth:
+            ok, err = _efi_updatevar_auth(efi_updatevar, db_auth, "db", progress_callback)
             if not ok:
-                return False, err
-
-        loaders = _esp_loader_paths(target_root, efi_install_id)
-        if not loaders:
-            return False, "No EFI loader on the ESP to enroll"
-
-        arch = get_host_architecture()
-        shim_esp = os.path.join(
-            target_root, "boot/efi/EFI", efi_install_id or BOOTLOADER_ID, arch["efi_shim"]
-        )
-        if shim_esp not in loaders:
-            loaders = [shim_esp] + loaders if _efi_file_readable(shim_esp) else loaders
-
-        db_esls = []
-        snap = os.path.join(work, "db-snapshot.esl")
-        if _snapshot_efivar_esl("db", snap, progress_callback):
-            db_esls.append(snap)
-            print("Kept existing firmware db")
-        kek_esls = []
-        kek_snap = os.path.join(work, "kek-snapshot.esl")
-        if _snapshot_efivar_esl("KEK", kek_snap, progress_callback):
-            kek_esls.append(kek_snap)
-
-        pk_esl = os.path.join(work, "pk.esl")
-        ok, err = _cert_to_esl(cert_to_efi, kernel_pem, pk_esl, progress_callback)
-        if not ok:
-            return False, err
-        db_esls.append(pk_esl)
-        kek_esls.append(pk_esl)
-        if uki_pem:
-            esl = os.path.join(work, "uki.esl")
-            ok, err = _cert_to_esl(cert_to_efi, uki_pem, esl, progress_callback)
+                return False, err or "failed to enroll db"
+        else:
+            if not db_cers:
+                return False, "No db certs under kernel-keys"
+            parts = []
+            for i, cer in enumerate(db_cers):
+                esl = os.path.join(work, "db-%s.esl" % i)
+                ok, err = _cer_file_to_esl(cert_to_efi, cer, esl, progress_callback)
+                if not ok:
+                    return False, err
+                parts.append(esl)
+                print("db cert %s" % os.path.basename(cer))
+            openssl = _openssl_bin()
+            for i, src in enumerate(_esp_loader_paths(target_root, efi_install_id)):
+                pems, perr = _extract_pe_signer_pems(src, work, "esp%s" % i, openssl, progress_callback)
+                if not pems:
+                    print("no PE certs in %s: %s" % (src, perr))
+                    continue
+                for j, pem in enumerate(pems):
+                    esl = os.path.join(work, "pe-%s-%s.esl" % (i, j))
+                    ok, err = _cert_to_esl(cert_to_efi, pem, esl, progress_callback)
+                    if ok:
+                        parts.append(esl)
+                        print("db PE cert from %s" % os.path.basename(src))
+            db_esl = os.path.join(work, "db.esl")
+            _concat_files(parts, db_esl)
+            ok, err = _enroll_replace_esl(efi_updatevar, "db", db_esl, progress_callback)
             if not ok:
-                return False, err
-            db_esls.append(esl)
-
-        pems, perr = _extract_pe_signer_pems(shim_esp, work, "shim", openssl, progress_callback)
-        if not pems:
-            print(f"No Authenticode certs in {shim_esp}: {perr}")
-        for j, pem in enumerate(pems or []):
-            esl = os.path.join(work, f"shim-pe-{j}.esl")
-            ok, err = _cert_to_esl(cert_to_efi, pem, esl, progress_callback)
-            if not ok:
-                return False, err
-            db_esls.append(esl)
-            print(f"db cert from shim: {os.path.basename(pem)}")
-        for i, src in enumerate(loaders):
-            if os.path.realpath(src) == os.path.realpath(shim_esp):
-                continue
-            extra, _ = _extract_pe_signer_pems(src, work, f"ldr{i}", openssl, progress_callback)
-            for j, pem in enumerate(extra or []):
-                esl = os.path.join(work, f"ldr-{i}-{j}.esl")
-                ok, err = _cert_to_esl(cert_to_efi, pem, esl, progress_callback)
-                if ok:
-                    db_esls.append(esl)
-        for i, src in enumerate(loaders):
-            esl = os.path.join(work, f"db-hash-{i}.esl")
-            ok, herr = _hash_efi_to_esl(hash_tool, src, esl, work, str(i), progress_callback)
-            if not ok:
-                return False, herr
-            db_esls.append(esl)
-
-        _delete_secure_boot_vars(progress_callback)
-        _clear_secure_boot_efivar_immutable(progress_callback)
-        ok, err = _enroll_esl_list(efi_updatevar, "db", db_esls, progress_callback)
-        if not ok:
-            return False, err or "failed to enroll db"
+                return False, err or "failed to enroll db"
         print("Enrolled db")
-        ok, err = _enroll_esl_list(efi_updatevar, "KEK", kek_esls, progress_callback)
-        if not ok:
-            return False, err or "failed to enroll KEK"
-        print("Enrolled KEK")
-        for i, src in enumerate(loaders):
-            ok, err = _efi_updatevar_binhash(efi_updatevar, src, work, str(i), progress_callback)
-            if not ok:
-                print(f"efi-updatevar -b skipped for {src}: {err}")
-        ok, err = _write_setup_esl("PK", pk_esl, progress_callback)
-        if not ok:
-            return False, err
-        print("Enrolled PK from kernel-keys")
 
+        if kek_auth:
+            ok, err = _efi_updatevar_auth(efi_updatevar, kek_auth, "KEK", progress_callback)
+            if not ok:
+                return False, err or "failed to enroll KEK"
+            print("Enrolled KEK")
+
+        if pk_auth:
+            ok, err = _efi_updatevar_auth(efi_updatevar, pk_auth, "PK", progress_callback)
+        else:
+            pk_esl = os.path.join(work, "pk.esl")
+            ok, err = _cer_file_to_esl(cert_to_efi, pk_cer, pk_esl, progress_callback)
+            if not ok:
+                return False, err
+            print("PK cert %s" % os.path.basename(pk_cer))
+            ok, err = _enroll_pk_setup_esl(pk_esl, progress_callback, target_root)
+        if not ok:
+            return False, err or "failed to enroll PK"
+        print("Enrolled PK")
         if _is_secure_boot_setup_mode(progress_callback):
-            return False, "PK enroll did not leave Setup Mode"
+            return False, "PK was written but firmware is still in Setup Mode"
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -1299,6 +1548,7 @@ def _install_efi_boot_fallback(tmp_mount, shim_src, grub_src, arch, progress_cal
     )
     if not ok:
         return False, err or "Failed to copy grub to EFI/BOOT"
+    _copy_shim_sidecars(shim_src, efi_boot, arch, None, progress_callback)
     return True, ""
 
 
@@ -1317,6 +1567,70 @@ def _get_device_uuid(device_path):
     except Exception:
         pass
     return None
+
+
+def _is_separate_boot(target_root):
+    boot = os.path.join(target_root, "boot")
+    try:
+        return os.path.ismount(boot)
+    except OSError:
+        return False
+
+
+def _grub_esp_stub(root_uuid, boot_uuid, separate_boot):
+    lines = [
+        "search --no-floppy --file --set=cfg1 /boot/grub2/grub.cfg",
+        "search --no-floppy --file --set=cfg2 /grub2/grub.cfg",
+    ]
+    if boot_uuid:
+        lines.append("search --no-floppy --fs-uuid --set=bootfs %s" % boot_uuid)
+    if root_uuid:
+        lines.append("search --no-floppy --fs-uuid --set=rootfs %s" % root_uuid)
+    lines.extend([
+        "if [ -n \"$cfg1\" ]; then",
+        "  set root=$cfg1",
+        "  set prefix=($root)/boot/grub2",
+        "elif [ -n \"$cfg2\" ]; then",
+        "  set root=$cfg2",
+        "  set prefix=($root)/grub2",
+        "elif [ -n \"$bootfs\" ]; then",
+        "  set root=$bootfs",
+        "  set prefix=($root)%s" % ("/grub2" if separate_boot else "/boot/grub2"),
+        "elif [ -n \"$rootfs\" ]; then",
+        "  set root=$rootfs",
+        "  set prefix=($root)/boot/grub2",
+        "fi",
+        "configfile $prefix/grub.cfg",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _copy_shim_sidecars(shim_src, dest_dir, arch, target_root, progress_callback=None):
+    suf = arch.get("efi_suffix") or "x64"
+    names = ("mm%s.efi" % suf, "fb%s.efi" % suf, "MokManager.efi")
+    if suf == "x64":
+        names = names + ("mmx64.efi", "fbx64.efi")
+    seen = set()
+    for n in names:
+        if n.lower() in seen:
+            continue
+        seen.add(n.lower())
+        src = os.path.join(os.path.dirname(shim_src), n)
+        if not _efi_file_readable(src):
+            src = _find_named_efi(n, target_root) or _find_named_efi(n, None)
+        if not src:
+            continue
+        dest_name = n
+        if n.lower() == "mokmanager.efi":
+            dest_name = "mm%s.efi" % suf
+        ok, err, _ = _run_command(
+            ["cp", src, os.path.join(dest_dir, dest_name)],
+            "Copy %s to EFI" % dest_name,
+            progress_callback,
+        )
+        if not ok:
+            print("Warning: could not copy %s: %s" % (src, err))
 
 
 def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False):
@@ -1361,6 +1675,7 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             if not ok:
                 _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
                 return False, err or "Failed to copy shim/grub", None
+        _copy_shim_sidecars(shim_src, efi_dir, arch, target_root, progress_callback)
         ok, err, _ = _run_command(
             ["cp", shim_src, os.path.join(efi_dir, "bootx64.efi")],
             "Copy shim as bootx64.efi",
@@ -1375,33 +1690,15 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             return False, err, None
 
         # When boot_partition_device given (separate /boot), use its UUID so GRUB reads from /boot partition
+        boot_dir = os.path.join(target_root, "boot")
+        separate_boot = bool(boot_partition_device) or _is_separate_boot(target_root)
+        root_uuid = _get_root_uuid(target_root)
+        boot_uuid = None
         if boot_partition_device:
-            uuid = _get_device_uuid(boot_partition_device)
-            if not uuid:
-                uuid = _get_boot_uuid(target_root)
-            prefix_path = "/grub2"  # /boot partition root has grub2/
-        else:
-            uuid = _get_root_uuid(target_root)
-            prefix_path = "/boot/grub2"
-        cfg_hint = "/grub2/grub.cfg" if prefix_path == "/grub2" else "/boot/grub2/grub.cfg"
-        # Robust stub: prefer fs_uuid when available, but always include a file-based
-        # fallback so installation remains bootable even when UUID detection is flaky in
-        # installer mount states.
-        if uuid:
-            stub_cfg = (
-                "search --no-floppy --fs-uuid --set=root %s\n"
-                "if [ -z \"$root\" ]; then\n"
-                "  search --no-floppy --file --set=root %s\n"
-                "fi\n"
-                "set prefix=($root)%s\n"
-                "configfile $prefix/grub.cfg\n"
-            ) % (uuid, cfg_hint, prefix_path)
-        else:
-            stub_cfg = (
-                "search --no-floppy --file --set=root %s\n"
-                "set prefix=($root)%s\n"
-                "configfile $prefix/grub.cfg\n"
-            ) % (cfg_hint, prefix_path)
+            boot_uuid = _get_device_uuid(boot_partition_device)
+        if not boot_uuid:
+            boot_uuid = _get_boot_uuid(target_root)
+        stub_cfg = _grub_esp_stub(root_uuid, boot_uuid, separate_boot)
         efi_grub_cfg = os.path.join(efi_dir, "grub.cfg")
         if not _write_file_as_root(efi_grub_cfg, stub_cfg, progress_callback):
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
@@ -1419,19 +1716,6 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             os.rmdir(tmp_mount)
         except Exception:
             pass
-
-    # NVRAM: point to shim in vendor dir
-    match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
-            re.match(r"(/dev/nvme\d+n\d+)p(\d+)", efi_partition_device) or
-            re.match(r"(/dev/mmcblk\d+)p(\d+)", efi_partition_device))
-    if match:
-        efi_disk, efi_part = match.group(1), match.group(2)
-        arch = get_host_architecture()
-        loader = "\\EFI\\" + efi_install_id + "\\" + arch["efi_shim"].replace("/", "\\")
-        _run_command(
-            ["efibootmgr", "-c", "-d", efi_disk, "-p", efi_part, "-L", efi_install_id, "-l", loader],
-            "Add NVRAM boot entry", progress_callback, timeout=60
-        )
 
     return True, "", efi_install_id
 
@@ -1683,20 +1967,25 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if uefi and efi_partition_device:
         _efi_partition_ensure_mounted(target_root, efi_partition_device, progress_callback)
 
-    ok, err = _generate_grub_cfg(
-        target_root, primary_disk, uefi, progress_callback, dual_boot=dual_boot
-    )
-    if not ok:
-        return False, err, None
-
     if uefi:
         if progress_callback:
-            progress_callback("Enrolling Secure Boot keys (efi-updatevar)...", None)
+            progress_callback("Enrolling Secure Boot keys...", None)
         ok_sb, err_sb = provision_secure_boot_keys(
             target_root, progress_callback=progress_callback, efi_install_id=efi_install_id
         )
         if not ok_sb:
             return False, err_sb or "Secure Boot key enrollment failed", None
+        ok_nv, err_nv = _add_uefi_boot_entry(
+            efi_partition_device, efi_install_id, progress_callback
+        )
+        if not ok_nv:
+            return False, err_nv, None
+
+    ok, err = _generate_grub_cfg(
+        target_root, primary_disk, uefi, progress_callback, dual_boot=dual_boot
+    )
+    if not ok:
+        return False, err, None
 
     verification = {
         "uefi": uefi,

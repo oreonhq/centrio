@@ -149,7 +149,7 @@ class PayloadPage(BaseConfigurationPage):
         flatpak_layout.setContentsMargins(14, 10, 14, 12)
         flatpak_layout.setSpacing(6)
         self.flatpak_enabled = QCheckBox("Enable Flatpak support")
-        self.flatpak_enabled.setChecked(False)
+        self.flatpak_enabled.setChecked(True)
         flatpak_layout.addWidget(self.flatpak_enabled)
         self.flatpak_checks = {}
         for app_id, app_name in self.flatpak_catalog.items():
@@ -320,7 +320,7 @@ class PayloadPage(BaseConfigurationPage):
             "packages":        selected_packages,
             "flatpak_packages": flatpak_packages,
             "repositories":    repos,
-            "flatpak_enabled": bool(has_network and (self.flatpak_enabled.isChecked() or flatpak_needed)),
+            "flatpak_enabled": bool(self.flatpak_enabled.isChecked() or flatpak_needed),
             "nvidia_drivers":  self.nvidia_drivers.isChecked(),
             "server_install":  self.server_install.isChecked(),
             "custom_packages": custom,

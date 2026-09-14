@@ -75,7 +75,7 @@ class ProgressPage(QWidget):
 
         packages = payload_cfg.get("packages", [])
         repositories = payload_cfg.get("repositories", [])
-        flatpak_enabled = payload_cfg.get("flatpak_enabled", False)
+        flatpak_enabled = payload_cfg.get("flatpak_enabled", True)
         flatpak_packages = payload_cfg.get("flatpak_packages", [])
         nvidia_drivers = bool(payload_cfg.get("nvidia_drivers", False))
 
@@ -93,7 +93,7 @@ class ProgressPage(QWidget):
             return True, ""
 
         needs_network = bool(
-            extra_packages or repositories or flatpak_enabled or flatpak_packages
+            extra_packages or repositories or flatpak_packages
             or (nvidia_drivers and not offline_install)
         )
         if needs_network and not offline_install:
@@ -146,7 +146,10 @@ class ProgressPage(QWidget):
 
     def _run_installation_steps(self, config_data):
         udisks_stopped_for_storage = False
+        wakelock = False
         try:
+            backend.start_install_wakelock()
+            wakelock = True
             offline_install = backend.install_skipped_network(config_data)
             disk_config = config_data.get("disk", {})
             commands = disk_config.get("commands", [])
@@ -537,6 +540,8 @@ class ProgressPage(QWidget):
             self.installation_error = str(e)
             self.signals.done.emit(False, self.installation_error)
         finally:
+            if wakelock:
+                backend.stop_install_wakelock()
             if udisks_stopped_for_storage:
                 backend._start_service("udisks2.service")
 

@@ -279,6 +279,72 @@ def create_btrfs_subvolumes(root_device, progress_callback=None):
             pass
 
 
+_SLEEP_UNITS = [
+    "sleep.target",
+    "suspend.target",
+    "hibernate.target",
+    "hybrid-sleep.target",
+    "suspend-then-hibernate.target",
+]
+_SLEEP_INHIBIT = {"proc": None, "masked": False}
+
+
+def start_install_wakelock():
+    if not _SLEEP_INHIBIT["masked"]:
+        ok, _, _ = _run_command(
+            ["systemctl", "mask", "--runtime"] + _SLEEP_UNITS,
+            "Keep machine awake (mask sleep)",
+            timeout=15,
+        )
+        _SLEEP_INHIBIT["masked"] = bool(ok)
+    if _SLEEP_INHIBIT["proc"] is None:
+        inhibit = shutil.which("systemd-inhibit")
+        if inhibit:
+            try:
+                _SLEEP_INHIBIT["proc"] = subprocess.Popen(
+                    [
+                        inhibit,
+                        "--what=idle:sleep:handle-lid-switch:handle-suspend-key:handle-hibernate-key",
+                        "--who=Centrio",
+                        "--why=Installing operating system",
+                        "--mode=block",
+                        "sleep",
+                        "infinity",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as e:
+                print(f"systemd-inhibit failed: {e}")
+    for cmd in (["xset", "s", "off"], ["xset", "-dpms"]):
+        try:
+            subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+def stop_install_wakelock():
+    p = _SLEEP_INHIBIT.get("proc")
+    if p is not None:
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                p.kill()
+        except Exception:
+            pass
+        _SLEEP_INHIBIT["proc"] = None
+    if _SLEEP_INHIBIT.get("masked"):
+        _run_command(
+            ["systemctl", "unmask", "--runtime"] + _SLEEP_UNITS,
+            "Restore sleep targets",
+            timeout=15,
+        )
+        _SLEEP_INHIBIT["masked"] = False
+
+
 def ensure_directory(path, progress_callback=None):
     """Create directory, using sudo if not root. Use for paths under target_root etc."""
     if os.geteuid() == 0:
@@ -1092,7 +1158,7 @@ def install_packages_enhanced(target_root, package_config, progress_callback=Non
     # Get configuration
     packages = package_config.get("packages", [])
     repositories = package_config.get("repositories", [])
-    flatpak_enabled = package_config.get("flatpak_enabled", False)
+    flatpak_enabled = package_config.get("flatpak_enabled", True)
     flatpak_packages = package_config.get("flatpak_packages", [])
     minimal_install = package_config.get("minimal_install", False)
     keep_cache = package_config.get("keep_cache", True)
@@ -1434,6 +1500,11 @@ def setup_flatpak(target_root, progress_callback=None, offline_install=False):
             if not success:
                 return False, f"Failed to install {package}: {err}"
     
+    if offline_install:
+        print("Offline install: Flatpak RPMs only, skipping Flathub.")
+        print("Flatpak setup completed successfully.")
+        return True, ""
+
     if progress_callback:
         progress_callback("Adding Flathub repository...", 0.5)
     
@@ -3815,7 +3886,7 @@ def install_packages_on_live_copy(target_root, package_config, progress_callback
     # Get configuration
     packages = package_config.get("packages", [])
     repositories = package_config.get("repositories", [])
-    flatpak_enabled = package_config.get("flatpak_enabled", False)
+    flatpak_enabled = package_config.get("flatpak_enabled", True)
     flatpak_packages = package_config.get("flatpak_packages", [])
     
     print(f"Additional packages to install: {len(packages)}")
