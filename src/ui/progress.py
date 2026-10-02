@@ -165,9 +165,12 @@ class ProgressPage(QWidget):
                 else:
                     print("Stopped udisks2 temporarily for storage setup.")
                     udisks_stopped_for_storage = True
-                rel_ok, rel_err, teardown_vgs = backend.release_disk_for_install(
-                    primary_disk, storage_cb
-                )
+                if disk_config.get("dual_boot"):
+                    rel_ok, rel_err, teardown_vgs = True, "", []
+                else:
+                    rel_ok, rel_err, teardown_vgs = backend.release_disk_for_install(
+                        primary_disk, storage_cb
+                    )
                 if not rel_ok:
                     raise RuntimeError(
                         f"Could not release target disk. Details: {rel_err}"
@@ -178,7 +181,8 @@ class ProgressPage(QWidget):
                 prev_vg = disk_config.get("lvm_vg")
                 if prev_vg:
                     backend.purge_stale_vg_dm(prev_vg, storage_cb)
-                backend.forget_kernel_partitions(primary_disk, storage_cb)
+                if not disk_config.get("dual_boot"):
+                    backend.forget_kernel_partitions(primary_disk, storage_cb)
                 backend._start_service("systemd-udevd.service")
                 try:
                     subprocess.run(["udevadm", "settle"], check=False, timeout=15)
@@ -344,7 +348,8 @@ class ProgressPage(QWidget):
                         and backend.table_written_kernel_busy(err)
                     ):
                         vis_ok, vis_err = backend.ensure_partitions_visible(
-                            primary_disk, expect_parts, storage_cb
+                            primary_disk, expect_parts, storage_cb,
+                            release=not disk_config.get("dual_boot"),
                         )
                         if not vis_ok:
                             raise RuntimeError(vis_err or err)
@@ -394,7 +399,8 @@ class ProgressPage(QWidget):
                             primary_disk, expect_parts
                         ):
                             vis_ok, vis_err = backend.ensure_partitions_visible(
-                                primary_disk, expect_parts, storage_cb
+                                primary_disk, expect_parts, storage_cb,
+                                release=not disk_config.get("dual_boot"),
                             )
                             if not vis_ok:
                                 raise RuntimeError(err)

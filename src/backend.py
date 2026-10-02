@@ -2432,6 +2432,31 @@ def forget_kernel_partitions(disk_device, progress_callback=None):
     return True, ""
 
 
+def disk_is_portable(disk_device):
+    name = os.path.basename(os.path.realpath(disk_device or ""))
+    if not name:
+        return False
+    for rel, want in (("removable", "1"), ("device/type", "SD")):
+        try:
+            with open(f"/sys/block/{name}/{rel}", encoding="utf-8") as fh:
+                if fh.read().strip() == want:
+                    return True
+        except OSError:
+            pass
+    try:
+        r = subprocess.run(
+            ["lsblk", "-dn", "-o", "HOTPLUG,TRAN", disk_device],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    tags = (r.stdout or "").split()
+    return bool(tags) and (tags[0] == "1" or "usb" in tags[1:])
+
+
 def partition_nodes_ready(disk_device, expect_count):
     if not disk_device or not expect_count:
         return False
@@ -2442,10 +2467,11 @@ def partition_nodes_ready(disk_device, expect_count):
     return True
 
 
-def ensure_partitions_visible(disk_device, expect_count, progress_callback=None):
+def ensure_partitions_visible(disk_device, expect_count, progress_callback=None, release=True):
     if partition_nodes_ready(disk_device, expect_count):
         return True, ""
-    release_disk_for_install(disk_device, progress_callback)
+    if release:
+        release_disk_for_install(disk_device, progress_callback)
     ok, err = reread_partition_table(disk_device, progress_callback)
     if partition_nodes_ready(disk_device, expect_count):
         return True, ""
@@ -3789,9 +3815,8 @@ def generate_fstab_for_target(target_root, progress_callback=None):
             uuid = None
             if source.startswith("/dev/"):
                 try:
-                    uuid_res = subprocess.run(["blkid", "-o", "value", "-s", "UUID", source],
-                                              capture_output=True, text=True, check=False, timeout=5)
-                    if uuid_res.returncode == 0 and uuid_res.stdout.strip():
+                    uuid_res = _sudo_run(["blkid", "-o", "value", "-s", "UUID", source], run_timeout=5)
+                    if uuid_res and uuid_res.returncode == 0 and uuid_res.stdout.strip():
                         uuid = uuid_res.stdout.strip()
                 except Exception as e:
                     print(f"Warning: blkid failed for {source}: {e}")

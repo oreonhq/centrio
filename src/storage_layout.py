@@ -205,7 +205,7 @@ def _umount_src(src):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def release_pv(part):
+def release_pv(part, whole_disk=True):
     disk = _parent_disk(part)
     _umount_src(part)
     subprocess.run(["fuser", "-km", part], check=False,
@@ -226,7 +226,7 @@ def release_pv(part):
         except OSError:
             same = pv == part
             on_disk = pv.startswith(disk)
-        if vg and (same or on_disk):
+        if vg and (same or (whole_disk and on_disk)):
             owners.add(vg)
     for old in sorted(owners):
         subprocess.run(["lvm", "vgchange", "--config", _LVM_CFG, "-an", old], check=False,
@@ -368,7 +368,7 @@ def main():
         if not os.path.exists(part):
             die("PV partition missing: %s" % part)
 
-        release_pv(part)
+        release_pv(part, not cfg.get("dual_boot"))
         clear_failed_target_layout(vg, part)
         subprocess.run(["wipefs", "-a", "-f", part], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -521,18 +521,23 @@ def apply_root_storage(disk_config, progress_callback=None):
         "separate_home": separate_home,
         "root_virt_bytes": int(root_virt),
         "home_virt_bytes": int(home_virt),
+        "dual_boot": bool(disk_config.get("dual_boot")),
     }
 
     if progress_callback:
         progress_callback(f"Creating {scheme} root storage with LVM CLI...", None)
 
     primary_disk = (disk_config.get("target_disks") or [None])[0]
+    if primary_disk and not os.path.exists(root_part):
+        backend.reread_partition_table(primary_disk, progress_callback)
+        _wait_path(root_part, 30)
     if primary_disk and scheme in (SCHEME_THIN, SCHEME_LVM):
-        ok_td, err_td, _ = backend.teardown_lvm_on_disk(
-            primary_disk, progress_callback
-        )
-        if not ok_td:
-            return False, err_td or f"could not tear down LVM on {primary_disk}"
+        if not disk_config.get("dual_boot"):
+            ok_td, err_td, _ = backend.teardown_lvm_on_disk(
+                primary_disk, progress_callback
+            )
+            if not ok_td:
+                return False, err_td or f"could not tear down LVM on {primary_disk}"
         backend.release_block_device(root_part, progress_callback)
 
     fd, script_path = tempfile.mkstemp(prefix="centrio_bd_", suffix=".py")

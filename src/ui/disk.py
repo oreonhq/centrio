@@ -5,7 +5,22 @@ import re
 import shlex
 import subprocess
 
-from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QPushButton
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QBrush, QPainter, QPalette, QPen
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QToolTip,
+    QVBoxLayout,
+    QWidget,
+)
+
+import backend
 
 from .base import BaseConfigurationPage
 
@@ -79,6 +94,89 @@ def _is_live_install_env():
     return False
 
 
+def _mount_source(path):
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    lines = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 or not lines:
+        return ""
+    return lines[0].split("[", 1)[0].strip()
+
+
+def _whole_disks_of(dev, seen=None):
+    seen = set() if seen is None else seen
+    if not dev:
+        return set()
+    name = os.path.basename(os.path.realpath(dev)) if dev.startswith("/dev/") else dev
+    sysp = os.path.realpath(f"/sys/class/block/{name}")
+    if name in seen or not os.path.isdir(sysp):
+        return set()
+    seen.add(name)
+    if os.path.isfile(os.path.join(sysp, "partition")):
+        return {"/dev/" + os.path.basename(os.path.dirname(sysp))}
+    found = set()
+    try:
+        slaves = os.listdir(os.path.join(sysp, "slaves"))
+    except OSError:
+        slaves = []
+    for slave in slaves:
+        found |= _whole_disks_of(slave, seen)
+    backing = ""
+    try:
+        with open(os.path.join(sysp, "loop", "backing_file"), encoding="utf-8") as fh:
+            backing = fh.read().strip()
+    except OSError:
+        pass
+    if backing:
+        found |= _whole_disks_of(_mount_source(backing), seen)
+    if not slaves and not backing and not name.startswith(("loop", "dm-", "zram", "ram")):
+        found.add("/dev/" + name)
+    return found
+
+
+def _live_medium_disks():
+    sources = []
+    if _is_live_install_env():
+        sources.append(_mount_source("/"))
+    for mnt in ("/run/initramfs/live", "/run/initramfs/isoscan", "/run/rootfsbase"):
+        if os.path.ismount(mnt):
+            sources.append(_mount_source(mnt))
+    if os.path.exists("/run/initramfs/livedev"):
+        sources.append(os.path.realpath("/run/initramfs/livedev"))
+    try:
+        with open("/proc/cmdline", encoding="utf-8") as f:
+            cmdline = f.read().split()
+    except OSError:
+        cmdline = []
+    links = {
+        "CDLABEL": "by-label",
+        "LABEL": "by-label",
+        "UUID": "by-uuid",
+        "PARTUUID": "by-partuuid",
+        "PARTLABEL": "by-partlabel",
+    }
+    for tok in cmdline:
+        if not tok.startswith("root=live:"):
+            continue
+        spec = tok[len("root=live:"):]
+        key, _, value = spec.partition("=")
+        if spec.startswith("/dev/"):
+            sources.append(spec)
+        elif value and key.upper() in links:
+            sources.append(f"/dev/disk/{links[key.upper()]}/{value}")
+    disks = set()
+    for src in sources:
+        disks |= _whole_disks_of(src)
+    return disks
+
+
 def _disk_vg_suffix(disk_path):
     raw = disk_path or ""
     try:
@@ -135,12 +233,12 @@ def _clean_install_sfdisk_script(is_uefi, root_part_type=PART_TYPE_LVM):
     )
 
 
-def _dual_boot_sfdisk_append(disk, start_mib, boot_end_mib, end_mib, root_part_type=PART_TYPE_LVM):
+def _dual_boot_sfdisk_append(disk, boot_num, root_num, start_mib, boot_end_mib, end_mib, root_part_type=PART_TYPE_LVM):
     root_name = "root" if root_part_type == PART_TYPE_LINUX else "lvm"
     script = (
-        f"name=boot, start={int(start_mib)}MiB, size={BOOT_SIZE_MIB}MiB, "
+        f"{_part(disk, boot_num)} : name=boot, start={int(start_mib)}MiB, size={BOOT_SIZE_MIB}MiB, "
         f"type={PART_TYPE_LINUX}\n"
-        f"name={root_name}, start={int(boot_end_mib)}MiB, "
+        f"{_part(disk, root_num)} : name={root_name}, start={int(boot_end_mib)}MiB, "
         f"size={int(end_mib - boot_end_mib)}MiB, "
         f"type={root_part_type}\n"
     )
@@ -730,68 +828,56 @@ def _dev_path(dev):
     return (dev.get("path") or dev.get("name") or "").strip()
 
 
-def _blkid_type(path):
+def _probe_signature(path):
     try:
-        r = subprocess.run(
-            ["blkid", "-o", "value", "-s", "TYPE", path],
-            capture_output=True, text=True, timeout=5,
-        )
-        return (r.stdout or "").strip().lower()
-    except Exception:
-        return ""
+        proc = backend._sudo_run(["blkid", "-p", "-o", "export", path], run_timeout=10)
+    except OSError:
+        return None
+    if proc is None or proc.returncode not in (0, 2):
+        return None
+    tags = dict(line.split("=", 1) for line in (proc.stdout or "").splitlines() if "=" in line)
+    return (tags.get("TYPE") or tags.get("PTTYPE") or "").lower()
+
+
+def _partition_reuse_block_reason(path, device, size):
+    if not device:
+        return "no partition information"
+    if size < 9 * 1024**3:
+        return "too small"
+    if device.get("mountpoint"):
+        return "mounted"
+    if device.get("children"):
+        return "in use"
+    if (device.get("parttype") or "").lower() in _UNTOUCHABLE_PARTTYPES:
+        return "system partition"
+    if "efi" in (device.get("partlabel") or "").lower():
+        return "EFI partition"
+    fstype = (device.get("fstype") or "").lower()
+    if fstype:
+        return f"contains {fstype}"
+    probed = _probe_signature(path)
+    if probed is None:
+        return "could not verify that it is empty"
+    if probed:
+        return f"contains {probed}"
+    return None
 
 
 def get_empty_partition(disk_path):
     if not disk_path or not os.path.exists(disk_path):
         return None
-    try:
-        result = subprocess.run(
-            ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,TYPE,FSTYPE,SIZE,MOUNTPOINT,PARTTYPE,PARTLABEL"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10, check=True,
-        )
-        data = json.loads(result.stdout or "{}")
-        candidates = []
-        def scan(device):
-            path = _dev_path(device)
-            fstype = (device.get("fstype") or "").lower()
-            parttype = (device.get("parttype") or "").lower()
-            label = (device.get("partlabel") or "").lower()
-            size = int(device.get("size", 0) or 0)
-            if device.get("type") != "part" or not path.startswith(disk_path) or path == disk_path:
-                for child in device.get("children") or []:
-                    scan(child)
-                return
-            skip = None
-            if size < 9 * 1024**3:
-                skip = "too small"
-            elif device.get("mountpoint"):
-                skip = "mounted"
-            elif parttype in _UNTOUCHABLE_PARTTYPES:
-                skip = f"protected type {parttype}"
-            elif "efi" in label:
-                skip = "efi label"
-            elif fstype in ("ntfs", "vfat", "fat32", "exfat", "bitlocker", "hpfs", "crypto_luks"):
-                skip = f"fstype {fstype}"
-            else:
-                probed = _blkid_type(path)
-                if probed in ("ntfs", "vfat", "fat32", "exfat", "bitlocker", "hpfs", "crypto_luks", "ext4", "ext3", "xfs", "btrfs", "swap", "lvm2_member"):
-                    skip = f"blkid {probed}"
-            if skip:
-                print(f"  skip empty-part {path}: {skip}")
-            else:
-                print(f"  empty-part candidate {path} size={size}")
-                candidates.append((size, path))
-            for child in device.get("children") or []:
-                scan(child)
-        for device in data.get("blockdevices") or []:
-            scan(device)
-        picked = max(candidates)[1] if candidates else None
-        print(f"get_empty_partition({disk_path}) -> {picked}")
-        return picked
-    except Exception as e:
-        print(f"get_empty_partition failed for {disk_path}: {e}")
-        return None
+    candidates = []
+    for seg in get_disk_layout(disk_path)["segments"]:
+        if seg["kind"] != "part":
+            continue
+        if seg["selectable"]:
+            print(f"  empty-part candidate {seg['path']} size={seg['size']}")
+            candidates.append((seg["size"], seg["path"]))
+        else:
+            print(f"  skip empty-part {seg['path']}: {seg['reason']}")
+    picked = max(candidates)[1] if candidates else None
+    print(f"get_empty_partition({disk_path}) -> {picked}")
+    return picked
 
 
 def _start_to_bytes(start, disk_size):
@@ -1003,7 +1089,7 @@ def get_free_space_region(disk_path):
         return None
 
 
-def get_next_partition_device(disk_path):
+def get_next_partition_device(disk_path, after=0):
     if not disk_path:
         return None
     try:
@@ -1015,7 +1101,7 @@ def get_next_partition_device(disk_path):
         )
         if r.returncode != 0:
             return None
-        max_num = 0
+        used = set()
         base = disk_path.rsplit("/", 1)[-1]
         for line in (r.stdout or "").splitlines():
             name = line.strip()
@@ -1025,11 +1111,98 @@ def get_next_partition_device(disk_path):
                 continue
             suffix = name[len(base) :].lstrip("p")
             if suffix.isdigit():
-                max_num = max(max_num, int(suffix))
-        next_num = max_num + 1
+                used.add(int(suffix))
+        next_num = int(after) + 1
+        while next_num in used:
+            next_num += 1
         return f"{disk_path}{_partition_prefix(disk_path)}{next_num}"
     except Exception:
         return None
+
+
+_MIN_FREE_SHOWN_MIB = 16
+
+
+def get_disk_layout(disk_path):
+    layout = {"disk": disk_path, "size": 0, "pttype": "", "segments": []}
+    base = os.path.basename(disk_path or "")
+    sysdir = f"/sys/block/{base}"
+    if not base or not os.path.isdir(sysdir):
+        return layout
+    try:
+        disk_size = _sysfs_read_int(os.path.join(sysdir, "size")) * 512
+        names = sorted(os.listdir(sysdir))
+    except Exception as e:
+        print(f"get_disk_layout({disk_path}) sysfs failed: {e}")
+        return layout
+    layout["size"] = disk_size
+    meta = {}
+    try:
+        r = subprocess.run(
+            ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,TYPE,FSTYPE,LABEL,PARTTYPE,PARTTYPENAME,PARTLABEL,MOUNTPOINT,PTTYPE", disk_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, check=True,
+        )
+        for dev in json.loads(r.stdout or "{}").get("blockdevices") or []:
+            if _dev_path(dev) == disk_path:
+                layout["pttype"] = (dev.get("pttype") or "").lower()
+            for child in dev.get("children") or []:
+                meta[_dev_path(child)] = child
+    except Exception as e:
+        print(f"get_disk_layout({disk_path}) lsblk failed: {e}")
+    mib = 1024 * 1024
+    parts = []
+    for name in names:
+        pdir = os.path.join(sysdir, name)
+        if not os.path.isfile(os.path.join(pdir, "partition")):
+            continue
+        try:
+            number = _sysfs_read_int(os.path.join(pdir, "partition"))
+            start = _sysfs_read_int(os.path.join(pdir, "start")) * 512
+            size = _sysfs_read_int(os.path.join(pdir, "size")) * 512
+        except Exception:
+            continue
+        if size < mib:
+            continue
+        path = f"/dev/{name}"
+        dev = meta.get(path) or {}
+        reason = _partition_reuse_block_reason(path, dev, size)
+        parts.append({
+            "kind": "part",
+            "path": path,
+            "number": number,
+            "start": start,
+            "size": size,
+            "fstype": (dev.get("fstype") or "").strip(),
+            "label": (dev.get("label") or dev.get("partlabel") or "").strip(),
+            "typename": (dev.get("parttypename") or "").strip(),
+            "selectable": reason is None,
+            "reason": reason,
+        })
+    parts.sort(key=lambda p: p["start"])
+    segments = []
+    cursor = mib
+    for part in parts + [None]:
+        end = part["start"] if part else disk_size
+        start_mib = (cursor + mib - 1) // mib
+        end_mib = end // mib
+        if end_mib - start_mib >= _MIN_FREE_SHOWN_MIB:
+            usable = end_mib - start_mib >= 9216
+            segments.append({
+                "kind": "free",
+                "path": None,
+                "start": start_mib * mib,
+                "size": (end_mib - start_mib) * mib,
+                "start_mib": start_mib,
+                "end_mib": end_mib,
+                "selectable": usable,
+                "reason": None if usable else "too small",
+            })
+        if part:
+            segments.append(part)
+            cursor = max(cursor, part["start"] + part["size"])
+    layout["segments"] = segments
+    return layout
 
 
 def detect_existing_efi_partitions(disk_path=None):
@@ -1140,6 +1313,201 @@ def storage_scheme_for_fs(fs):
     return SCHEME_LVM
 
 
+def _human_size(num_bytes):
+    value = float(num_bytes or 0)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def _segment_key(seg):
+    if seg["kind"] == "free":
+        return ("free", seg["start_mib"], seg["end_mib"])
+    return ("part", seg["path"])
+
+
+def _segment_name(seg):
+    if seg["kind"] == "free":
+        return "Free space"
+    return os.path.basename(seg["path"])
+
+
+def _segment_desc(seg):
+    if seg["kind"] == "free":
+        return "Unallocated"
+    bits = [b for b in (seg["fstype"], seg["label"] or seg["typename"]) if b]
+    return ", ".join(bits) or "No filesystem"
+
+
+def _segment_tooltip(seg):
+    lines = [seg["path"] or "Free space", _human_size(seg["size"])]
+    if seg["kind"] == "part":
+        lines.append(f"Filesystem: {seg['fstype'] or 'none'}")
+        if seg["label"]:
+            lines.append(f"Label: {seg['label']}")
+        if seg["typename"]:
+            lines.append(f"Type: {seg['typename']}")
+    if not seg["selectable"]:
+        lines.append(f"Cannot be used: {seg['reason']}")
+    elif seg["kind"] == "part":
+        lines.append("Can be used. Its contents will be erased.")
+    else:
+        lines.append("Can be used.")
+    return "\n".join(lines)
+
+
+class DiskLayoutBar(QWidget):
+    selectionChanged = Signal()
+    segmentRejected = Signal(object)
+
+    MIN_SEGMENT_PX = 56
+    BAR_HEIGHT = 72
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.segments = []
+        self.selected_index = -1
+        self._hover_index = -1
+        self._rects = []
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(self.BAR_HEIGHT)
+
+    def sizeHint(self):
+        return QSize(max(1, len(self.segments)) * self.MIN_SEGMENT_PX * 2, self.BAR_HEIGHT)
+
+    def minimumSizeHint(self):
+        return QSize(self.MIN_SEGMENT_PX, self.BAR_HEIGHT)
+
+    def set_layout(self, layout, preselect=None):
+        self.segments = list(layout.get("segments") or [])
+        self.selected_index = -1
+        self._hover_index = -1
+        self.updateGeometry()
+        for i, seg in enumerate(self.segments):
+            if seg["selectable"] and preselect is not None and _segment_key(seg) == preselect:
+                self.selected_index = i
+        self.update()
+        self.selectionChanged.emit()
+
+    def selected_segment(self):
+        if 0 <= self.selected_index < len(self.segments):
+            return self.segments[self.selected_index]
+        return None
+
+    def _segment_rects(self):
+        area = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        count = len(self.segments)
+        if not count or area.width() <= 0:
+            return []
+        total = sum(max(0, seg["size"]) for seg in self.segments) or 1
+        min_w = min(float(self.MIN_SEGMENT_PX), area.width() / count)
+        spare = max(0.0, area.width() - min_w * count)
+        rects = []
+        x = area.left()
+        for seg in self.segments:
+            w = min_w + spare * max(0, seg["size"]) / total
+            rects.append(QRectF(x, area.top(), w, area.height()))
+            x += w
+        return rects
+
+    def _index_at(self, pos):
+        for i, rect in enumerate(self._rects):
+            if rect.contains(pos):
+                return i
+        return -1
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        pal = self.palette()
+        self._rects = self._segment_rects()
+        if not self._rects:
+            painter.setPen(pal.color(QPalette.ColorRole.PlaceholderText))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No partition information")
+            return
+        fm = painter.fontMetrics()
+        line_h = fm.height()
+        for i, (seg, rect) in enumerate(zip(self.segments, self._rects)):
+            if i == self.selected_index:
+                fill = pal.color(QPalette.ColorRole.Highlight)
+                text = pal.color(QPalette.ColorRole.HighlightedText)
+            elif seg["kind"] == "free":
+                fill = pal.color(QPalette.ColorRole.Base)
+                text = pal.color(QPalette.ColorRole.Text)
+            elif seg["selectable"]:
+                fill = pal.color(QPalette.ColorRole.Button)
+                text = pal.color(QPalette.ColorRole.ButtonText)
+            else:
+                fill = pal.color(QPalette.ColorRole.Mid)
+                text = pal.color(QPalette.ColorRole.ButtonText)
+            painter.setPen(QPen(pal.color(QPalette.ColorRole.Dark), 1))
+            painter.setBrush(fill)
+            painter.drawRect(rect)
+            if seg["kind"] == "free" and i != self.selected_index:
+                painter.fillRect(rect, QBrush(pal.color(QPalette.ColorRole.Mid), Qt.BrushStyle.BDiagPattern))
+            if i == self._hover_index and seg["selectable"] and i != self.selected_index:
+                painter.setPen(QPen(pal.color(QPalette.ColorRole.Highlight), 2))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(rect.adjusted(1, 1, -1, -1))
+            inner = rect.adjusted(4, 4, -4, -4)
+            if inner.width() < 8:
+                continue
+            width = int(inner.width())
+            lines = [t for t in (_segment_name(seg), _human_size(seg["size"])) if fm.horizontalAdvance(t) <= width]
+            desc = fm.elidedText(_segment_desc(seg), Qt.TextElideMode.ElideRight, width)
+            if lines and width >= fm.horizontalAdvance("M" * 8):
+                lines.append(desc)
+            lines = lines[:max(0, int(inner.height() // line_h))]
+            top = inner.top() + (inner.height() - len(lines) * line_h) / 2
+            painter.setPen(text)
+            for n, label in enumerate(lines):
+                painter.drawText(
+                    QRectF(inner.left(), top + n * line_h, inner.width(), line_h),
+                    Qt.AlignmentFlag.AlignCenter,
+                    label,
+                )
+
+    def mouseMoveEvent(self, event):
+        i = self._index_at(event.position())
+        if i != self._hover_index:
+            self._hover_index = i
+            self.update()
+        if i < 0:
+            QToolTip.hideText()
+            self.unsetCursor()
+            return
+        seg = self.segments[i]
+        if seg["selectable"]:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.unsetCursor()
+        QToolTip.showText(event.globalPosition().toPoint(), _segment_tooltip(seg), self)
+
+    def leaveEvent(self, event):
+        self._hover_index = -1
+        self.unsetCursor()
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        i = self._index_at(event.position())
+        if i < 0:
+            return
+        seg = self.segments[i]
+        if not seg["selectable"]:
+            self.segmentRejected.emit(seg)
+            return
+        if i != self.selected_index:
+            self.selected_index = i
+            self.update()
+            self.selectionChanged.emit()
+
+
 
 class DiskPage(BaseConfigurationPage):
     def __init__(self, main_window, overlay_widget, **kwargs):
@@ -1150,16 +1518,32 @@ class DiskPage(BaseConfigurationPage):
             overlay_widget=overlay_widget,
             **kwargs,
         )
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("scrollContent")
+        scroll.setWidget(content)
+        self.page_layout.addWidget(scroll)
+        self.page_layout = QVBoxLayout(content)
+        self.page_layout.setContentsMargins(0, 0, 6, 0)
+        self.page_layout.setSpacing(10)
         self.disks = self._list_disks()
         self.disk_combo = QComboBox()
-        for d in self.disks:
-            self.disk_combo.addItem(d)
+        for path, text in self.disks:
+            self.disk_combo.addItem(text, path)
+        self.refresh_disks_btn = QPushButton("Refresh Disks")
         self.fs_combo = QComboBox()
         self.fs_combo.addItems(["ext4", "xfs", "btrfs"])
         self.dual_boot = QCheckBox("Dual boot mode (use free space, keep other OS)")
         self.preserve_efi = QCheckBox("Preserve existing EFI partition")
         self.preserve_efi.setChecked(True)
         self.separate_home = QCheckBox("Separate /home LV")
+        self.layout_label = QLabel("Install location (click free space or an unused partition)")
+        self.layout_bar = DiskLayoutBar()
+        self._layout_disk = None
+        self._efi_status = ""
         self.efi_combo = QComboBox()
         self.efi_label = QLabel("Existing EFI partition")
         self.status_label = QLabel("")
@@ -1167,10 +1551,15 @@ class DiskPage(BaseConfigurationPage):
         self.status_label.setObjectName("pageSubtitle")
 
         self.page_layout.addWidget(QLabel("Target disk"))
-        self.page_layout.addWidget(self.disk_combo)
+        disk_row = QHBoxLayout()
+        disk_row.addWidget(self.disk_combo, 1)
+        disk_row.addWidget(self.refresh_disks_btn)
+        self.page_layout.addLayout(disk_row)
         self.page_layout.addWidget(QLabel("Root filesystem"))
         self.page_layout.addWidget(self.fs_combo)
         self.page_layout.addWidget(self.dual_boot)
+        self.page_layout.addWidget(self.layout_label)
+        self.page_layout.addWidget(self.layout_bar)
         self.page_layout.addWidget(self.preserve_efi)
         self.page_layout.addWidget(self.efi_label)
         self.page_layout.addWidget(self.efi_combo)
@@ -1185,12 +1574,34 @@ class DiskPage(BaseConfigurationPage):
         self.dual_boot.toggled.connect(self._on_dual_boot_toggled)
         self.preserve_efi.toggled.connect(self._refresh_dual_boot_ui)
         self.disk_combo.currentTextChanged.connect(self._refresh_dual_boot_ui)
+        self.refresh_disks_btn.clicked.connect(self._reload_disks)
         self.fs_combo.currentTextChanged.connect(self._on_fs_changed)
+        self.layout_bar.selectionChanged.connect(self._update_dual_boot_status)
+        self.layout_bar.segmentRejected.connect(self._on_layout_segment_rejected)
         self._on_dual_boot_toggled(self.dual_boot.isChecked())
         self._on_fs_changed(self.fs_combo.currentText())
 
     def refresh_for_network(self):
         return
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reload_disks()
+
+    def _current_disk(self):
+        return (self.disk_combo.currentData() or self.disk_combo.currentText()).strip()
+
+    def _reload_disks(self, *_args):
+        current = self._current_disk()
+        self.disks = self._list_disks()
+        self.disk_combo.blockSignals(True)
+        self.disk_combo.clear()
+        for path, text in self.disks:
+            self.disk_combo.addItem(text, path)
+        idx = self.disk_combo.findData(current)
+        self.disk_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.disk_combo.blockSignals(False)
+        self._refresh_dual_boot_ui()
 
     def _on_fs_changed(self, *_args):
         fs = (self.fs_combo.currentText() or "ext4").strip().lower()
@@ -1209,9 +1620,13 @@ class DiskPage(BaseConfigurationPage):
             self.status_label.setText("")
 
     def _list_disks(self):
+        live = _live_medium_disks()
+        if live:
+            print(f"Hiding live boot medium: {sorted(live)}")
+        fallback = [] if "/dev/sda" in live else [("/dev/sda", "/dev/sda")]
         try:
             r = subprocess.run(
-                ["lsblk", "-J", "-b", "-d", "-o", "PATH,NAME,TYPE,SIZE,RM,RO"],
+                ["lsblk", "-J", "-b", "-d", "-o", "PATH,NAME,TYPE,SIZE,RO,MODEL,TRAN"],
                 capture_output=True,
                 text=True,
                 timeout=8,
@@ -1226,8 +1641,6 @@ class DiskPage(BaseConfigurationPage):
                     continue
                 if int(dev.get("ro", 0) or 0) != 0:
                     continue
-                if int(dev.get("rm", 0) or 0) != 0:
-                    continue
                 name = str(dev.get("name", "")).strip()
                 if not name or name.startswith(skip_prefixes):
                     continue
@@ -1235,11 +1648,19 @@ class DiskPage(BaseConfigurationPage):
                 if size < min_size_bytes:
                     continue
                 path = str(dev.get("path", "")).strip()
-                if path and path.startswith("/dev/"):
-                    disks.append(path)
-            return disks or ["/dev/sda"]
+                if not path.startswith("/dev/") or os.path.realpath(path) in live:
+                    continue
+                model = " ".join(str(dev.get("model") or "").split())
+                desc = ", ".join(b for b in (model, _human_size(size)) if b)
+                text = f"{path} ({desc})"
+                if str(dev.get("tran") or "").lower() == "usb":
+                    text += " (USB)"
+                elif backend.disk_is_portable(path):
+                    text += " (removable)"
+                disks.append((path, text))
+            return disks or fallback
         except Exception:
-            return ["/dev/sda"]
+            return fallback
 
     def _on_dual_boot_toggled(self, checked):
         if checked:
@@ -1253,36 +1674,64 @@ class DiskPage(BaseConfigurationPage):
         self.preserve_efi.setEnabled(dual)
         self.efi_label.setVisible(dual and self.preserve_efi.isChecked())
         self.efi_combo.setVisible(dual and self.preserve_efi.isChecked())
+        self.layout_label.setVisible(dual)
+        self.layout_bar.setVisible(dual)
 
         if not dual:
             self.status_label.setText("")
             return
 
-        disk = self.disk_combo.currentText().strip()
-        free = get_free_space_region(disk) if disk else None
-        empty = get_empty_partition(disk) if disk else None
-        efi_list = detect_existing_efi_partitions(None)
+        disk = self._current_disk()
+        previous = self.layout_bar.selected_segment()
+        preselect = _segment_key(previous) if previous and self._layout_disk == disk else None
+        layout = get_disk_layout(disk) if disk else {"segments": []}
+        if preselect is None and disk:
+            empty = get_empty_partition(disk)
+            free = [s for s in layout["segments"] if s["kind"] == "free" and s["selectable"]]
+            if empty:
+                preselect = ("part", empty)
+            elif free:
+                preselect = _segment_key(max(free, key=lambda s: s["size"]))
+        self._layout_disk = disk
+
+        efi_list = detect_existing_efi_partitions(
+            disk if disk and backend.disk_is_portable(disk) else None
+        )
         self.efi_combo.clear()
         for e in efi_list:
             extra = " ".join(x for x in (e.get("label"), e.get("parent")) if x)
             text = e["path"] if not extra else f"{e['path']}  ({extra})"
             self.efi_combo.addItem(text, e["path"])
-
-        msgs = []
-        if not free and not empty:
-            msgs.append("No usable free space (>= 9 GiB). Shrink a partition first.")
-        elif empty and not free:
-            msgs.append(f"Unused partition: {empty}")
-        else:
-            msgs.append(f"Free space: {free[0]} - {free[1]}")
         if self.preserve_efi.isChecked() and not efi_list:
-            msgs.append("No EFI partition found.")
+            self._efi_status = "No EFI partition found."
         elif efi_list:
-            msgs.append(f"Found {len(efi_list)} EFI partition(s).")
+            self._efi_status = f"Found {len(efi_list)} EFI partition(s)."
+        else:
+            self._efi_status = ""
+        self.layout_bar.set_layout(layout, preselect)
+
+    def _update_dual_boot_status(self):
+        if not self.dual_boot.isChecked():
+            return
+        seg = self.layout_bar.selected_segment()
+        if seg is None:
+            if any(s["selectable"] for s in self.layout_bar.segments):
+                msgs = ["Select free space or an unused partition in the disk layout."]
+            else:
+                msgs = ["No usable free space or unused partition (>= 9 GiB). Shrink a partition first."]
+        elif seg["kind"] == "free":
+            msgs = [f"Install into free space: {_human_size(seg['size'])} at {seg['start_mib']} MiB."]
+        else:
+            msgs = [f"Install into {seg['path']} ({_human_size(seg['size'])}). Its contents will be erased."]
+        if self._efi_status:
+            msgs.append(self._efi_status)
         self.status_label.setText(" ".join(msgs))
 
+    def _on_layout_segment_rejected(self, seg):
+        self.show_toast(f"{_segment_name(seg)} cannot be used: {seg['reason']}")
+
     def apply_settings_and_return(self, _button=None):
-        primary_disk = self.disk_combo.currentText().strip()
+        primary_disk = self._current_disk()
         if not primary_disk:
             self.show_toast("Please select a disk.")
             return
@@ -1311,18 +1760,29 @@ class DiskPage(BaseConfigurationPage):
             if not is_uefi:
                 self.show_toast("Dual boot currently requires UEFI firmware.")
                 return
-            region = get_free_space_region(primary_disk)
-            empty = get_empty_partition(primary_disk)
-            if not region and not empty:
+            layout = get_disk_layout(primary_disk)
+            chosen = self.layout_bar.selected_segment()
+            if chosen and self._layout_disk == primary_disk:
+                current = {_segment_key(s): s for s in layout["segments"]}
+                chosen = current.get(_segment_key(chosen))
+            else:
+                chosen = None
+            if not chosen or not chosen["selectable"]:
+                self._refresh_dual_boot_ui()
                 self.show_toast(
-                    "Dual boot needs unallocated space (>= 9 GiB) on the selected disk."
+                    "Dual boot needs free space or an unused partition (>= 9 GiB). Select one in the disk layout."
                 )
                 return
-            efi_list = detect_existing_efi_partitions(None)
+            empty = chosen["path"] if chosen["kind"] == "part" else None
+            region = None if empty else (f"{chosen['start_mib']}MiB", f"{chosen['end_mib']}MiB")
+            portable = backend.disk_is_portable(primary_disk)
+            efi_list = detect_existing_efi_partitions(primary_disk if portable else None)
             selected_efi = self.efi_combo.currentData()
             if not selected_efi:
                 raw = self.efi_combo.currentText().strip()
                 selected_efi = raw.split()[0] if raw else None
+            if portable and selected_efi not in {e["path"] for e in efi_list}:
+                selected_efi = None
             if not selected_efi and efi_list:
                 selected_efi = efi_list[0]["path"]
             if not selected_efi:
@@ -1365,6 +1825,9 @@ class DiskPage(BaseConfigurationPage):
                             }
                         )
             else:
+                if layout["pttype"] != "gpt":
+                    self.show_toast("Installing into free space requires a GPT partition table.")
+                    return
                 boot_part = get_next_partition_device(primary_disk)
                 if not boot_part:
                     self.show_toast("Could not determine the next partition device.")
@@ -1373,7 +1836,11 @@ class DiskPage(BaseConfigurationPage):
                     self.show_toast("Refusing to format an existing partition for dual boot.")
                     return
                 boot_num = int(re.search(r"(\d+)$", boot_part).group(1))
-                root_part = _part(primary_disk, boot_num + 1)
+                root_part = get_next_partition_device(primary_disk, boot_num)
+                if not root_part:
+                    self.show_toast("Could not determine the next partition device.")
+                    return
+                root_num = int(re.search(r"(\d+)$", root_part).group(1))
                 if os.path.exists(root_part):
                     self.show_toast("Refusing to format an existing partition for dual boot.")
                     return
@@ -1384,11 +1851,13 @@ class DiskPage(BaseConfigurationPage):
                     self.show_toast("Free space is too small for /boot + root.")
                     return
                 boot_end_mib = start_mib + BOOT_SIZE_MIB
-                expect_parts = boot_num + 1
+                expect_parts = root_num
                 commands.extend(
                     [
                         _dual_boot_sfdisk_append(
                             primary_disk,
+                            boot_num,
+                            root_num,
                             start_mib,
                             boot_end_mib,
                             end_mib,

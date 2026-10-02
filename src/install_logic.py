@@ -1633,7 +1633,7 @@ def _copy_shim_sidecars(shim_src, dest_dir, arch, target_root, progress_callback
             print("Warning: could not copy %s: %s" % (src, err))
 
 
-def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False):
+def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False, portable=False):
     """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
     signed shim+grub from host, stub grub.cfg on ESP.
     Mounts the target ESP to a private temp dir so we always write to the correct partition."""
@@ -1703,6 +1703,16 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
         if not _write_file_as_root(efi_grub_cfg, stub_cfg, progress_callback):
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
             return False, "Failed to write stub grub.cfg on ESP", None
+        if portable:
+            efi_boot = os.path.join(tmp_mount, "EFI", "BOOT")
+            if not _write_file_as_root(os.path.join(efi_boot, "grub.cfg"), stub_cfg, progress_callback):
+                _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
+                return False, "Failed to write stub grub.cfg to EFI/BOOT", None
+            _run_command(
+                ["rm", "-f", os.path.join(efi_boot, "fb%s.efi" % (arch.get("efi_suffix") or "x64"))],
+                "Remove shim fallback from EFI/BOOT",
+                progress_callback,
+            )
 
         try:
             os.sync()
@@ -1947,6 +1957,8 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if progress_callback:
         progress_callback("Installing bootloader (%s)..." % ("UEFI" if uefi else "BIOS"), None)
 
+    from backend import disk_is_portable
+    portable = disk_is_portable(primary_disk)
     efi_install_id = BOOTLOADER_ID
     if uefi:
         ok, err, efi_install_id = _install_uefi_bootloader(
@@ -1955,6 +1967,7 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
             offline_install=offline_install,
             dual_boot=dual_boot,
             preserve_efi=preserve_efi,
+            portable=portable,
         )
         if efi_install_id is None:
             efi_install_id = BOOTLOADER_ID
@@ -1967,7 +1980,9 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if uefi and efi_partition_device:
         _efi_partition_ensure_mounted(target_root, efi_partition_device, progress_callback)
 
-    if uefi:
+    if uefi and portable:
+        print("Removable target: skipping Secure Boot key enrollment and NVRAM boot entry.")
+    elif uefi:
         if progress_callback:
             progress_callback("Enrolling Secure Boot keys...", None)
         ok_sb, err_sb = provision_secure_boot_keys(
