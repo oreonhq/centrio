@@ -30,7 +30,8 @@ LVM_POOL = "pool"
 LVM_ROOT = "root"
 LVM_HOME = "home"
 ESP_END_MIB = 513
-BOOT_SIZE_MIB = 1024
+BOOT_SIZE_MIB = 2048
+MIN_FREE_MIB = BOOT_SIZE_MIB + 8192
 
 PART_TYPE_LINUX = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
 PART_TYPE_LVM = "E6D6D379-F507-44C2-A23C-238F2A3DF928"
@@ -939,7 +940,7 @@ def _best_gap_from_parts(disk_path, disk_size, parts, source):
     end_mib = int(best[1] // (1024 * 1024))
     size_mib = end_mib - start_mib
     print(f"{source} free space on {disk_path}: {size_mib} MiB at {start_mib}MiB-{end_mib}MiB")
-    if size_mib < 9216:
+    if size_mib < MIN_FREE_MIB:
         return None, size_mib
     return (f"{start_mib}MiB", f"{end_mib}MiB"), size_mib
 
@@ -1039,7 +1040,7 @@ def _free_region_from_lsblk(disk_path):
         used = sum(p[2] for p in parts) + 2 * 1024 * 1024
         free = disk_size - used
         print(f"lsblk has no START offsets on {disk_path}, estimated free {free // (1024**2)} MiB")
-        if free < 9216 * 1024 * 1024:
+        if free < MIN_FREE_MIB * 1024 * 1024:
             return None, free // (1024 * 1024)
         start_mib = int((used + 1024 * 1024 - 1) // (1024 * 1024))
         end_mib = int(disk_size // (1024 * 1024))
@@ -1080,7 +1081,7 @@ def get_free_space_region(disk_path):
                 continue
             start_s, end_s, size_s = fields[1], fields[2], fields[3]
             num = _parse_mib(size_s) or 0
-            if num > best_size_mb and num >= 9216:
+            if num > best_size_mb and num >= MIN_FREE_MIB:
                 best_start, best_end, best_size_mb = start_s, end_s, num
         if best_start and best_end:
             return (best_start, best_end)
@@ -1187,7 +1188,7 @@ def get_disk_layout(disk_path):
         start_mib = (cursor + mib - 1) // mib
         end_mib = end // mib
         if end_mib - start_mib >= _MIN_FREE_SHOWN_MIB:
-            usable = end_mib - start_mib >= 9216
+            usable = end_mib - start_mib >= MIN_FREE_MIB
             segments.append({
                 "kind": "free",
                 "path": None,
@@ -1718,7 +1719,7 @@ class DiskPage(BaseConfigurationPage):
             if any(s["selectable"] for s in self.layout_bar.segments):
                 msgs = ["Select free space or an unused partition in the disk layout."]
             else:
-                msgs = ["No usable free space or unused partition (>= 9 GiB). Shrink a partition first."]
+                msgs = [f"No usable free space (>= {MIN_FREE_MIB // 1024} GiB) or unused partition (>= 9 GiB). Shrink a partition first."]
         elif seg["kind"] == "free":
             msgs = [f"Install into free space: {_human_size(seg['size'])} at {seg['start_mib']} MiB."]
         else:
@@ -1770,7 +1771,7 @@ class DiskPage(BaseConfigurationPage):
             if not chosen or not chosen["selectable"]:
                 self._refresh_dual_boot_ui()
                 self.show_toast(
-                    "Dual boot needs free space or an unused partition (>= 9 GiB). Select one in the disk layout."
+                    f"Dual boot needs free space (>= {MIN_FREE_MIB // 1024} GiB) or an unused partition (>= 9 GiB). Select one in the disk layout."
                 )
                 return
             empty = chosen["path"] if chosen["kind"] == "part" else None
@@ -1847,7 +1848,7 @@ class DiskPage(BaseConfigurationPage):
 
                 start_mib = _parse_mib(region[0])
                 end_mib = _parse_mib(region[1])
-                if start_mib is None or end_mib is None or (end_mib - start_mib) < 9216:
+                if start_mib is None or end_mib is None or (end_mib - start_mib) < MIN_FREE_MIB:
                     self.show_toast("Free space is too small for /boot + root.")
                     return
                 boot_end_mib = start_mib + BOOT_SIZE_MIB
@@ -1894,8 +1895,8 @@ class DiskPage(BaseConfigurationPage):
                         )
         else:
             disk_mib = _disk_size_mib(primary_disk)
-            if disk_mib < 10240:
-                self.show_toast("Disk is too small (need at least ~10 GiB).")
+            if disk_mib < 11264:
+                self.show_toast("Disk is too small (need at least ~11 GiB).")
                 return
 
             if is_uefi:

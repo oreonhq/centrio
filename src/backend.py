@@ -1293,7 +1293,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         "--exclude=libreoffice*",
         "--exclude=oreon-*",
         "--exclude=centrio-installer",
-        "--setopt=installonly_limit=0",  # Don't limit kernel installations
+        "--setopt=installonly_limit=3",
         "--setopt=keepcache=1" if keep_cache else "--setopt=keepcache=0",
     ])
     if not enable_scriptlets:
@@ -3304,7 +3304,7 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, offline_install=False, lvm_root=None, separate_boot=False):
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, offline_install=False, lvm_root=None, separate_boot=False, portable=False):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -3517,7 +3517,7 @@ GRUB_ENABLE_BLSCFG=true
                 quote_char, args = match.group(1), match.group(2)
                 args_list = [p for p in args.split() if p and p != "nomodeset"]
                 # Drop stale live LVM refs then add ours if needed
-                args_list = [p for p in args_list if not p.startswith("rd.lvm.lv=")]
+                args_list = [p for p in args_list if not p.startswith(("rd.lvm.lv=", "resume="))]
                 for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
                     if param not in args_list:
                         args_list.append(param)
@@ -3643,7 +3643,15 @@ GRUB_ENABLE_BLSCFG=true
     if progress_callback:
         progress_callback("Regenerating initramfs...", None)
     arch = get_host_architecture()
-    if arch["arch"] == "aarch64":
+    if portable:
+        portable_conf = 'hostonly="no"\nhostonly_cmdline="no"\nadd_drivers+=" usb_storage uas sd_mod xhci_pci ehci_pci "\n'
+        if lvm_root:
+            portable_conf += 'add_dracutmodules+=" dm lvm "\n'
+        if btrfs_subvolumes:
+            portable_conf += 'add_dracutmodules+=" btrfs "\n'
+        if not write_file_as_root(os.path.join(target_root, "etc/dracut.conf.d/90-portable.conf"), portable_conf, progress_callback):
+            return False, "Failed to write portable dracut configuration"
+    if arch["arch"] == "aarch64" or portable:
         dracut_cmd = ["dracut", "--regenerate-all", "--force", "--no-hostonly", "-v"]
     else:
         dracut_cmd = ["dracut", "--regenerate-all", "--force", "-v"]

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -124,6 +125,7 @@ class PayloadPage(BaseConfigurationPage):
         browser_layout.setContentsMargins(14, 10, 14, 12)
         browser_layout.setSpacing(6)
         self.browser_group = QButtonGroup(self)
+        self.browser_group.setExclusive(True)
         self.browser_checks = {}
         browser_options = [
             ("firefox",                "Firefox (DNF)"),
@@ -134,13 +136,12 @@ class PayloadPage(BaseConfigurationPage):
             ("none",                   "No browser preinstalled"),
         ]
         for app_id, label in browser_options:
-            cb = QCheckBox(label)
+            cb = QRadioButton(label)
             if app_id == "firefox":
                 cb.setChecked(True)
             browser_layout.addWidget(cb)
             self.browser_group.addButton(cb)
             self.browser_checks[app_id] = cb
-            cb.toggled.connect(lambda checked, b=app_id: self._enforce_single_browser(b, checked))
         content_layout.addWidget(self.browser_box)
 
         # --- Flatpak ---
@@ -227,17 +228,6 @@ class PayloadPage(BaseConfigurationPage):
         self.page_layout.addWidget(btn)
 
         self._apply_desktop_sensitivity(desktop_active=True)
-
-    def _enforce_single_browser(self, browser_key, checked):
-        if not checked:
-            if not any(cb.isChecked() for cb in self.browser_checks.values()):
-                self.browser_checks["none"].setChecked(True)
-            return
-        for key, cb in self.browser_checks.items():
-            if key != browser_key:
-                cb.blockSignals(True)
-                cb.setChecked(False)
-                cb.blockSignals(False)
 
     def _on_server_mode_toggled(self, checked):
         if checked:

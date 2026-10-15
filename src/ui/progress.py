@@ -521,6 +521,7 @@ class ProgressPage(QWidget):
                 offline_install=offline_install,
                 lvm_root=lvm_root,
                 separate_boot=bool(disk_cfg.get("separate_boot", False)),
+                portable=backend.disk_is_portable(primary_disk),
             )
             if not post_ok:
                 raise RuntimeError(post_err or "Post-copy system finalization failed")

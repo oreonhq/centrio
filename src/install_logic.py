@@ -16,13 +16,6 @@
 #
 # centrio_installer/install_logic.py
 # Backend for bootloader installation (UEFI and BIOS).
-#
-# UEFI flow (Anaconda / Oreon layout):
-# - Use EFI/<vendor> (e.g. almalinux) to match Anaconda-installed systems. Copy signed
-#   shim and grub from host /boot/efi/EFI/<vendor>/ to target ESP. Write a stub grub.cfg
-#   on the ESP that does search.fs_uuid <root_uuid> root; set prefix=($root)/boot/grub2;
-#   configfile $prefix/grub.cfg so the real config lives in /boot/grub2 on the root fs.
-# - No grub2-install (use distro signed binaries). NVRAM entry points to shim in vendor dir.
 
 import hashlib
 import os
@@ -1587,18 +1580,18 @@ def _grub_esp_stub(root_uuid, boot_uuid, separate_boot):
     if root_uuid:
         lines.append("search --no-floppy --fs-uuid --set=rootfs %s" % root_uuid)
     lines.extend([
-        "if [ -n \"$cfg1\" ]; then",
-        "  set root=$cfg1",
-        "  set prefix=($root)/boot/grub2",
-        "elif [ -n \"$cfg2\" ]; then",
-        "  set root=$cfg2",
-        "  set prefix=($root)/grub2",
-        "elif [ -n \"$bootfs\" ]; then",
+        "if [ -n \"$bootfs\" ]; then",
         "  set root=$bootfs",
         "  set prefix=($root)%s" % ("/grub2" if separate_boot else "/boot/grub2"),
         "elif [ -n \"$rootfs\" ]; then",
         "  set root=$rootfs",
         "  set prefix=($root)/boot/grub2",
+        "elif [ -n \"$cfg1\" ]; then",
+        "  set root=$cfg1",
+        "  set prefix=($root)/boot/grub2",
+        "elif [ -n \"$cfg2\" ]; then",
+        "  set root=$cfg2",
+        "  set prefix=($root)/grub2",
         "fi",
         "configfile $prefix/grub.cfg",
         "",
@@ -1634,9 +1627,6 @@ def _copy_shim_sidecars(shim_src, dest_dir, arch, target_root, progress_callback
 
 
 def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, offline_install=False, dual_boot=False, preserve_efi=False, portable=False):
-    """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
-    signed shim+grub from host, stub grub.cfg on ESP.
-    Mounts the target ESP to a private temp dir so we always write to the correct partition."""
     if not efi_partition_device:
         return False, "UEFI install requires the EFI partition device (e.g. /dev/sda1).", None
     if not os.path.exists(efi_partition_device):
