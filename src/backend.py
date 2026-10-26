@@ -24,6 +24,8 @@ from utils import get_os_release_info, get_host_architecture
 import errno # For checking mount errors
 import time   # For delays
 import shutil # For copying bootloader files
+import glob
+import signal
 
 
 def _run_command(command_list, description, progress_callback=None, timeout=None, pipe_input=None):
@@ -41,12 +43,12 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
         execution_method = "directly as root"
         print(f"Executing Backend Step ({execution_method}): {description} -> {' '.join(shlex.quote(c) for c in final_command_list)}")
     else:
-        final_command_list = ["sudo"] + command_list
+        final_command_list = ["sudo", "-n"] + command_list
         execution_method = "via sudo"
         cmd_str = ' '.join(shlex.quote(c) for c in final_command_list)
         print(f"Executing Backend Step ({execution_method}): {description} -> {cmd_str}")
         if progress_callback:
-            progress_callback(f"Requesting privileges for: {description}...")
+            progress_callback(f"{description}...")
 
     stderr_output = ""
     stdout_output = ""
@@ -57,7 +59,8 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE if pipe_input is not None else None,
-            text=True
+            text=True,
+            start_new_session=True,
         )
         
         stdout_output, stderr_output = process.communicate(input=pipe_input, timeout=timeout)
@@ -128,8 +131,14 @@ def _run_command(command_list, description, progress_callback=None, timeout=None
     except subprocess.TimeoutExpired:
         err = f"Timeout expired after {timeout}s for {description} ({execution_method})."
         try:
-            process.kill()
-            process.wait()
+            os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=3)
         except Exception as kill_e:
             print(f"Warning: Error trying to kill timed out process: {kill_e}")
         return False, err, stdout_output.strip() 
@@ -242,6 +251,68 @@ def write_file_as_root(path, content, progress_callback=None):
             os.unlink(tmp)
         except OSError:
             pass
+
+
+CHROOT_UMOUNT_TIMEOUT = 20
+
+_KILL_CHROOT_SCRIPT = r'''
+r="$1"
+sig="$2"
+for p in /proc/[0-9]*; do
+    l=$(readlink "$p/root" 2>/dev/null) || continue
+    case "$l" in
+        "$r"|"$r"/*) kill "-$sig" "${p#/proc/}" 2>/dev/null && echo "${p#/proc/}" ;;
+    esac
+done
+exit 0
+'''
+
+
+def _kill_chroot_processes(target_root):
+    root_real = os.path.realpath(target_root)
+    if root_real == "/":
+        return
+    gpgconf = os.path.join(root_real, "usr/bin/gpgconf")
+    if os.path.exists(gpgconf):
+        _run_command(["chroot", root_real, "gpgconf", "--kill", "all"], "Stop gpg agents in target", None, timeout=15)
+    for sig in ("TERM", "KILL"):
+        ok, _, out = _run_command(["sh", "-c", _KILL_CHROOT_SCRIPT, "sh", root_real, sig], f"Stop leftover processes in target ({sig})", None, timeout=15)
+        pids = (out or "").split() if ok else []
+        if not pids:
+            break
+        print(f"  Sent SIG{sig} to leftover processes in {root_real}: {' '.join(pids)}")
+        time.sleep(1)
+
+
+def _unmount_with_fallback(mount_target, timeout=CHROOT_UMOUNT_TIMEOUT):
+    ok, err, _ = _run_command(["umount", "-R", mount_target], f"Unmount {mount_target}", None, timeout=timeout)
+    if ok:
+        return True
+    if "not mounted" in (err or "").lower():
+        return True
+    print(f"WARNING: Unmount of {mount_target} failed ({err}). Using lazy unmount.")
+    ok, err, _ = _run_command(["umount", "-R", "-l", mount_target], f"Lazy unmount {mount_target}", None, timeout=timeout)
+    if ok:
+        print(f"WARNING: Lazy unmount used for {mount_target}")
+    else:
+        print(f"WARNING: Lazy unmount of {mount_target} failed: {err}")
+    return ok
+
+
+def _teardown_chroot(target_root, mounted_paths):
+    print("Cleaning up chroot environment...")
+    try:
+        _kill_chroot_processes(target_root)
+    except Exception as e:
+        print(f"Warning: Could not stop leftover chroot processes: {e}")
+    for mount_target, mount_name in reversed(mounted_paths):
+        if mount_name == "boot_efi":
+            print(f"  Preserving EFI mount for bootloader installation: {mount_target}")
+            continue
+        try:
+            _unmount_with_fallback(mount_target)
+        except Exception as e:
+            print(f"Warning: Error unmounting {mount_target}: {e}")
 
 
 # --- New _run_in_chroot function ---
@@ -401,6 +472,8 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                 if not ok:
                     raise RuntimeError(err or f"Failed to mount {source} to {target}")
                 mounted_paths.append((target, name))
+                if name == "dev":
+                    _run_command(["mount", "--make-rslave", target], "Isolate dev mount", None, timeout=15)
             except FileNotFoundError:
                  raise RuntimeError("Mount command failed: 'mount' executable not found.")
             except RuntimeError:
@@ -425,32 +498,7 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
         return success, err, stdout
         
     finally:
-        # --- Unmount in reverse order ---
-        try:
-            print("Cleaning up chroot environment...")
-            for mount_info in reversed(mounted_paths):
-                 mount_target, mount_name = mount_info
-                 
-                 # Skip unmounting /boot/efi if we're in the middle of installation
-                 # It should remain mounted for bootloader installation
-                 if mount_name == "boot_efi":
-                     print(f"  Preserving EFI mount for bootloader installation: {mount_target}")
-                     continue
-                 
-                 try:
-                     print(f"  Unmounting {mount_target}...")
-                     ok, err, _ = _run_command(["umount", mount_target], f"Unmount {mount_target}", progress_callback, timeout=30)
-                     if ok:
-                         print(f"    Successfully unmounted {mount_target}")
-                     else:
-                         raise RuntimeError(err or f"Failed to unmount {mount_target}")
-                 except subprocess.CalledProcessError as e:
-                     print(f"    Failed to unmount {mount_target}: {e.stderr.strip()}")
-                     raise
-                 except Exception as e:
-                     print(f"    Warning: Error unmounting {mount_target}: {e}")
-        except Exception as e:
-            print(f"Warning: Error during chroot cleanup: {e}")
+        _teardown_chroot(target_root, mounted_paths)
 
 # --- Configuration Functions ---
 
@@ -590,6 +638,69 @@ def create_user_in_container(target_root, user_config, progress_callback=None):
          print(f"Warning: No password provided for user {username}. Account created without password set.")
         
     return True, "", None
+
+
+SERVER_ROOT_SSH_CONF = "etc/ssh/sshd_config.d/50-centrio-root-login.conf"
+
+
+def configure_server_accounts(target_root, accounts, progress_callback=None):
+    accounts = accounts or {}
+    user = accounts.get("user") or None
+    root = accounts.get("root") or None
+    if not user and not root:
+        return False, "A server install needs a user account, a root password, or both."
+    if progress_callback:
+        progress_callback("Creating accounts...", None)
+    entries = []
+    if user:
+        username = user.get("username") or ""
+        if not username or not user.get("password_hash"):
+            return False, "User account details are incomplete."
+        useradd_cmd = ["useradd", "-m", "-s", "/bin/bash", "-U"]
+        if user.get("real_name"):
+            useradd_cmd.extend(["-c", user["real_name"]])
+        if user.get("is_admin"):
+            useradd_cmd.extend(["-G", "wheel"])
+        useradd_cmd.append(username)
+        ok, err, _ = _run_in_chroot(target_root, useradd_cmd, f"Create user {username}", progress_callback, timeout=60)
+        if not ok:
+            return False, f"Could not create user {username}: {err}"
+        entries.append(f"{username}:{user['password_hash']}")
+    if root:
+        if not root.get("password_hash"):
+            return False, "Root password is missing."
+        entries.append(f"root:{root['password_hash']}")
+    ok, err, _ = _run_command(
+        ["chpasswd", "-e", "-R", target_root],
+        "Set account passwords",
+        progress_callback,
+        timeout=30,
+        pipe_input="\n".join(entries) + "\n",
+    )
+    if not ok:
+        return False, "Could not set account passwords."
+    if not root:
+        _run_command(["usermod", "-R", target_root, "-L", "root"], "Lock root account", progress_callback, timeout=30)
+    conf_path = os.path.join(target_root, SERVER_ROOT_SSH_CONF)
+    if accounts.get("root_ssh_password_login"):
+        if not write_file_as_root(conf_path, "PermitRootLogin yes\n", progress_callback):
+            return False, "Could not enable root SSH login."
+        if os.path.exists(os.path.join(target_root, "usr/lib/systemd/system/sshd.service")):
+            _run_command(["systemctl", "--root", target_root, "enable", "sshd.service"], "Enable sshd", progress_callback, timeout=30)
+    for svc in ("gnome-initial-setup.service", "display-manager.service", "gdm.service"):
+        if os.path.lexists(os.path.join(target_root, "etc/systemd/system", svc)) or os.path.exists(os.path.join(target_root, "usr/lib/systemd/system", svc)):
+            _run_command(["systemctl", "--root", target_root, "disable", svc], f"Disable {svc}", progress_callback, timeout=30)
+    write_file_as_root(os.path.join(target_root, "var/lib/gnome-initial-setup-done"), "", progress_callback)
+    ok, err, _ = _run_command(
+        ["systemctl", "--root", target_root, "set-default", "multi-user.target"],
+        "Boot to multi-user target",
+        progress_callback,
+        timeout=30,
+    )
+    if not ok:
+        return False, f"Could not set the default boot target: {err}"
+    print("Server accounts configured.")
+    return True, ""
 
 
 # Live users to remove from installed system (live environment accounts)
@@ -872,7 +983,6 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         f"--setopt=install_weak_deps=False",
         "--setopt=max_parallel_downloads=10",
         "--setopt=fastestmirror=True",
-        "--exclude=firefox",
         "--exclude=redhat-flatpak-repo", 
         "--exclude=almalinux-*",
         "--exclude=steam",
@@ -880,7 +990,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         "--exclude=libreoffice*",
         "--exclude=oreon-*",
         "--exclude=centrio-installer",
-        "--setopt=installonly_limit=0",  # Don't limit kernel installations
+        "--setopt=installonly_limit=3",
         "--setopt=keepcache=1" if keep_cache else "--setopt=keepcache=0"
     ]
     if not enable_scriptlets:
@@ -1399,191 +1509,639 @@ def swapoff_on_disk(disk_device, progress_callback=None):
     return (len(errors) == 0, "\n".join(errors))
 
 
-# --- LVM Deactivation Helper --- 
+def _sudo_run(args, run_timeout=30):
+    cmd = list(args)
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=run_timeout,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+_LVM_PROBE = [
+    "--nolocking",
+    "--readonly",
+    "--config",
+    "devices { use_devicesfile = 0 } "
+    "global { event_activation = 0 use_lvmlockd = 0 }",
+]
+_LVM_TEARDOWN = [
+    "--config",
+    "devices { use_devicesfile = 0 } "
+    "global { event_activation=0 wait_for_locks=0 use_lvmlockd=0 } "
+    "activation { udev_sync = 0 auto_activation_volume_list = [] }",
+]
+_LVM_NOAUTO = [
+    "--config",
+    "global { event_activation=0 use_lvmlockd=0 } "
+    "activation { auto_activation_volume_list = [] } "
+    "devices { use_devicesfile = 0 }",
+]
+_LVM_STRAY = (
+    "lvcreate",
+    "lvremove",
+    "lvchange",
+    "vgcreate",
+    "vgremove",
+    "vgchange",
+    "pvcreate",
+    "pvremove",
+    "dmsetup",
+)
+
+
+def kill_lvm_dev_linkers():
+    mypid = os.getpid()
+    needle = b"lvmdevlink"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == mypid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if needle not in raw:
+            continue
+        print(f"Killing leftover lvmdevlink pid {pid}")
+        _sudo_run(["kill", "-9", str(pid)], run_timeout=5)
+
+
+def _clear_vg_lock(vg_name):
+    if not vg_name:
+        return
+    for path in glob.glob(f"/run/lock/lvm/V_{vg_name}") + glob.glob(
+        f"/run/lock/lvm/V_{vg_name}:*"
+    ):
+        _sudo_run(["fuser", "-k", path], run_timeout=5)
+
+
+def _kill_stray_lvm_for_vg(vg_name):
+    if not vg_name:
+        return
+    needle = vg_name.encode("utf-8", "replace")
+    mypid = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == mypid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if needle not in raw and b"lvmdevlink" not in raw:
+            continue
+        parts = raw.split(b"\0")
+        if not parts or not parts[0]:
+            continue
+        base = os.path.basename(parts[0].decode("utf-8", "replace"))
+        if base not in _LVM_STRAY and b"lvmdevlink" not in raw:
+            continue
+        print(f"Killing leftover {base} pid {pid} for VG {vg_name}")
+        _sudo_run(["kill", "-9", str(pid)], run_timeout=5)
+    _clear_vg_lock(vg_name)
+
+
+def _disk_member_devices(disk_device, progress_callback=None):
+    devices = {disk_device}
+    ok, _, out = _run_command(
+        ["lsblk", "-n", "-o", "PATH", "--raw", disk_device],
+        f"List partitions on {disk_device}",
+        progress_callback,
+        timeout=15,
+    )
+    if ok:
+        for line in (out or "").splitlines():
+            path = line.strip()
+            if path and path != disk_device:
+                devices.add(path)
+    return devices
+
+
+def _vgs_on_disk(disk_device, progress_callback=None):
+    vgs = set()
+    devices = [
+        d
+        for d in sorted(_disk_member_devices(disk_device, progress_callback))
+        if d and d != disk_device
+    ]
+    if not devices:
+        return vgs
+    if progress_callback:
+        progress_callback(f"Find VGs on {disk_device}...", None)
+    proc = _sudo_run(
+        ["pvs", "--noheadings", "-o", "pv_name,vg_name"] + _LVM_PROBE + devices
+    )
+    if not proc or proc.returncode != 0:
+        err = (proc.stderr if proc else "pvs probe failed") or ""
+        print(f"Warning: pvs probe failed for {disk_device}: {err.strip()}")
+        return vgs
+    want = set(devices)
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        pv_name, vg_name = fields[0], fields[1]
+        if vg_name and (pv_name in want or os.path.realpath(pv_name) in want):
+            vgs.add(vg_name)
+    return vgs
+
+
+def _pvs_on_devices(devices, progress_callback=None):
+    found = []
+    devices = [d for d in sorted(devices or []) if d]
+    if not devices:
+        return found
+    if progress_callback:
+        progress_callback("List PVs on target devices...", None)
+    proc = _sudo_run(
+        ["pvs", "--noheadings", "-o", "pv_name"] + _LVM_PROBE + devices
+    )
+    if not proc or proc.returncode != 0:
+        return found
+    want = set(devices)
+    for line in (proc.stdout or "").splitlines():
+        pv_name = line.split()[0] if line.split() else ""
+        if pv_name and (pv_name in want or os.path.realpath(pv_name) in want):
+            found.append(pv_name)
+    return found
+
+
+def _remove_vg_dm_stack(vg_name, progress_callback=None):
+    if not vg_name:
+        return True, ""
+    if progress_callback:
+        progress_callback(f"Removing leftover LVM VG {vg_name}...", None)
+
+    _kill_stray_lvm_for_vg(vg_name)
+    _sudo_run(["vgchange", "-an"] + _LVM_TEARDOWN + [vg_name])
+    _sudo_run(["lvremove", "-ff", "-y"] + _LVM_TEARDOWN + [vg_name])
+    _sudo_run(["vgremove", "-ff", "-y"] + _LVM_TEARDOWN + [vg_name])
+
+    proc = _sudo_run(["dmsetup", "ls"])
+    maps_out = proc.stdout if proc else ""
+    leaf = str(vg_name).replace("-", "--")
+    prefix = leaf + "-"
+    names = [
+        (line.split() or [""])[0]
+        for line in (maps_out or "").splitlines()
+        if (line.split() or [""])[0] == leaf
+        or (line.split() or [""])[0].startswith(prefix)
+    ]
+
+    def _remove_priority(name):
+        if "-tpool" in name:
+            return 1
+        if any(token in name for token in ("_tdata", "_tmeta", "-tdata", "-tmeta")):
+            return 2
+        if "pmspare" in name:
+            return 3
+        return 0
+
+    for name in sorted(names, key=lambda n: (_remove_priority(n), -len(n), n)):
+        mapper = f"/dev/mapper/{name}"
+        _umount_one_device(mapper, progress_callback)
+        _sudo_run(["fuser", "-k", mapper], run_timeout=5)
+        _sudo_run(["dmsetup", "remove", "--force", name], run_timeout=10)
+    return True, ""
+
+
+def teardown_lvm_on_disk(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, "", []
+    if progress_callback:
+        progress_callback(f"Tearing down LVM on {disk_device}...", None)
+    vgs = _vgs_on_disk(disk_device, progress_callback)
+    errors = []
+    for vg_name in sorted(vgs):
+        ok, err = _remove_vg_dm_stack(vg_name, progress_callback)
+        if not ok:
+            errors.append(err or f"could not deactivate {vg_name}")
+    for device in _pvs_on_devices(
+        [
+            d
+            for d in _disk_member_devices(disk_device, progress_callback)
+            if d != disk_device
+        ],
+        progress_callback,
+    ):
+        _run_command(
+            ["pvremove", "-ff", "-y"] + _LVM_NOAUTO + [device],
+            f"pvremove {device}",
+            progress_callback,
+            timeout=30,
+        )
+        _sudo_run(["lvmdevices", "--deldev", device], run_timeout=30)
+    if errors:
+        return False, "\n".join(errors), sorted(vgs)
+    return True, "", sorted(vgs)
+
+
 def _deactivate_lvm_on_disk(disk_device, progress_callback=None):
-    """Attempts to find and deactivate LVM VGs associated with a disk and its partitions."""
-    print(f"Checking for and deactivating LVM on {disk_device} and its partitions...")
-    if progress_callback:
-        progress_callback(f"Checking LVM on {disk_device}...", None) # Text only update
+    ok, err, _vgs = teardown_lvm_on_disk(disk_device, progress_callback)
+    if not ok:
+        print(f"LVM teardown on {disk_device} failed: {err}")
+    return ok, err
 
-    devices_to_check = set([disk_device])
-    vg_names_found = set()
-    all_success = True
-    errors = []
 
-    # 1. Find partitions of the main disk
-    try:
-        lsblk_cmd = ["lsblk", "-n", "-o", "PATH", "--raw", disk_device]
-        print(f"  Running: {' '.join(shlex.quote(c) for c in lsblk_cmd)}")
-        lsblk_result = subprocess.run(lsblk_cmd, capture_output=True, text=True, check=False, timeout=10)
-        if lsblk_result.returncode == 0:
-            found_paths = [line.strip() for line in lsblk_result.stdout.split('\n') if line.strip() and line.strip() != disk_device]
-            print(f"  Found potential partition paths via lsblk: {found_paths}")
-            devices_to_check.update(found_paths)
-        else:
-            print(f"  Warning: lsblk failed for {disk_device} (rc={lsblk_result.returncode}), checking only base device for PVs.")
-    except Exception as e:
-        print(f"  Warning: Error running lsblk to find partitions for {disk_device}: {e}")
-        # Continue with just the base disk_device
-
-    # 2. Find VGs associated with each device (disk + partitions)
-    print(f"  Checking devices for LVM PVs: {list(devices_to_check)}")
-    for device in devices_to_check:
-        try:
-            pvs_cmd = ["pvs", "--noheadings", "-o", "vg_name", "--select", f"pv_name={device}"]
-            # Use subprocess directly here as _run_command adds too much noise for non-errors
-            print(f"    Checking PV on {device}...")
-            result = subprocess.run(pvs_cmd, capture_output=True, text=True, check=False, timeout=10)
-            
-            if result.returncode == 0:
-                vgs = set(line.strip() for line in result.stdout.splitlines() if line.strip())
-                if vgs:
-                     print(f"      Found VGs on {device}: {vgs}")
-                     vg_names_found.update(vgs)
-            elif "No physical volume found" in result.stderr or "No PVs found" in result.stdout:
-                # This is expected if the device isn't an LVM PV
-                pass
-            else:
-                 # Real error running pvs
-                 err_msg = f"Failed to run pvs for {device}: {result.stderr.strip()}"
-                 print(f"    Warning: {err_msg}")
-                 errors.append(err_msg)
-                 all_success = False # Mark as potentially incomplete
-                 
-        except Exception as e:
-             err_msg = f"Unexpected error checking PV on {device}: {e}"
-             print(f"    ERROR: {err_msg}")
-             errors.append(err_msg)
-             all_success = False
-             
-    if not vg_names_found:
-         print(f"  No LVM Volume Groups found associated with {disk_device} or its partitions.")
-         return True, "" # Not an error if no VGs found
-
-    # 3. Deactivate all found VGs
-    print(f"  Found unique LVM VGs to deactivate: {vg_names_found}. Attempting deactivation...")
-    for vg_name in vg_names_found:
-         vgchange_cmd = ["vgchange", "-an", vg_name]
-         # Use _run_command here as deactivation failure is important
-         vg_success, vg_err, _ = _run_command(vgchange_cmd, f"Deactivate VG {vg_name}")
-         if not vg_success:
-             print(f"    Warning: Failed to deactivate VG {vg_name}: {vg_err}")
-             errors.append(f"Failed to deactivate VG {vg_name}: {vg_err}")
-             all_success = False
-         else:
-              print(f"    Successfully deactivated VG {vg_name}.")
-              time.sleep(0.5) # Small delay after deactivation
-              
-    if progress_callback:
-         status = "Deactivation complete." if all_success and not errors else "Deactivation attempted, some errors occurred."
-         progress_callback(f"LVM Check on {disk_device}: {status}", None)
-         
-    final_error_str = "\n".join(errors)
-    return all_success, final_error_str
-
-# --- Device Mapper Removal Helper --- 
 def _remove_dm_mappings(disk_device, progress_callback=None):
-    """Attempts to find and remove device-mapper mappings for LVM LVs on a disk."""
-    print(f"Checking for and removing LVM device-mapper mappings associated with {disk_device}...")
-    if progress_callback:
-        progress_callback(f"Removing DM mappings for {disk_device}...", None)
+    return teardown_lvm_on_disk(disk_device, progress_callback)[:2]
 
-    devices_to_check = set([disk_device])
-    vg_names_found = set()
-    lvs_to_remove = set() # Store LV paths like /dev/vg/lv or /dev/mapper/vg-lv
-    all_success = True
-    errors = []
 
-    # 1. Find partitions (same logic as _deactivate_lvm_on_disk)
+def _disk_member_paths(disk_device):
+    paths = set()
+    if not disk_device:
+        return paths
     try:
-        lsblk_cmd = ["lsblk", "-n", "-o", "PATH", "--raw", disk_device]
-        lsblk_result = subprocess.run(lsblk_cmd, capture_output=True, text=True, check=False, timeout=10)
-        if lsblk_result.returncode == 0:
-            devices_to_check.update([p.strip() for p in lsblk_result.stdout.split('\n') if p.strip()])
+        paths.add(os.path.realpath(disk_device))
+    except OSError:
+        paths.add(disk_device)
+    try:
+        r = subprocess.run(
+            ["lsblk", "-n", "-o", "PATH", "--paths", disk_device],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            for line in (r.stdout or "").splitlines():
+                p = (line or "").strip()
+                if not p:
+                    continue
+                try:
+                    paths.add(os.path.realpath(p))
+                except OSError:
+                    paths.add(p)
     except Exception:
-        pass # Ignore errors, just use base disk device
+        pass
+    return paths
 
-    # 2. Find VGs associated with each device
-    for device in devices_to_check:
+
+def _source_on_disk(source, disk_paths):
+    if not source or not disk_paths:
+        return False
+    src = str(source).strip()
+    if not src:
+        return False
+    if src.startswith("UUID=") or src.startswith("PARTUUID=") or src.startswith("LABEL="):
         try:
-            pvs_cmd = ["pvs", "--noheadings", "-o", "vg_name", "--select", f"pv_name={device}"]
-            result = subprocess.run(pvs_cmd, capture_output=True, text=True, check=False, timeout=10)
-            if result.returncode == 0:
-                vg_names_found.update(line.strip() for line in result.stdout.splitlines() if line.strip())
-        except Exception as e:
-            errors.append(f"Error finding VGs on {device}: {e}")
-            all_success = False
-            
-    if not vg_names_found:
-         print(f"  No LVM Volume Groups found for {disk_device}, skipping dmsetup removal.")
-         return True, ""
+            r = subprocess.run(
+                ["findfs", src],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                src = r.stdout.strip()
+        except Exception:
+            return False
+    if "[" in src:
+        src = src.split("[", 1)[0]
+    try:
+        src_r = os.path.realpath(src)
+    except OSError:
+        src_r = src
+    if src_r in disk_paths:
+        return True
+    try:
+        r = subprocess.run(
+            ["lsblk", "-s", "-n", "-o", "PATH", "--paths", src_r],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            for line in (r.stdout or "").splitlines():
+                p = (line or "").strip()
+                if not p:
+                    continue
+                try:
+                    if os.path.realpath(p) in disk_paths:
+                        return True
+                except OSError:
+                    if p in disk_paths:
+                        return True
+    except Exception:
+        pass
+    return False
 
-    # 3. Find LVs within those VGs
-    print(f"  Found VGs: {vg_names_found}. Checking for associated LVs...")
-    for vg_name in vg_names_found:
-        try:
-             # Get LV paths, prefer /dev/mapper/ format if possible, else /dev/vg/lv
-             lvs_cmd = ["lvs", "--noheadings", "-o", "lv_path", vg_name]
-             result = subprocess.run(lvs_cmd, capture_output=True, text=True, check=False, timeout=10)
-             if result.returncode == 0:
-                 lv_paths = set(line.strip() for line in result.stdout.splitlines() if line.strip())
-                 if lv_paths:
-                      print(f"    Found LVs in VG {vg_name}: {lv_paths}")
-                      lvs_to_remove.update(lv_paths)
-             else:
-                 err_msg = f"Failed to list LVs for VG {vg_name}: {result.stderr.strip()}"
-                 print(f"    Warning: {err_msg}")
-                 errors.append(err_msg)
-                 all_success = False
-        except Exception as e:
-             err_msg = f"Unexpected error listing LVs for VG {vg_name}: {e}"
-             print(f"    ERROR: {err_msg}")
-             errors.append(err_msg)
-             all_success = False
-             
-    if not lvs_to_remove:
-        print(f"  No active LVs found in VGs {vg_names_found}.")
-        return True, "\n".join(errors) # Return success even if LVs couldn't be listed, but include errors
 
-    # 4. Remove DM mappings for found LVs
-    print(f"  Attempting to remove DM mappings for LVs: {lvs_to_remove}")
-    for lv_path in lvs_to_remove:
-        # Need the mapper name (e.g., vg--name-lv--name) which might differ from lv_path (/dev/vg_name/lv_name)
-        # We can try removing both common forms: /dev/mapper/vg-lv and the lv_path directly
-        # dmsetup usually works with the name in /dev/mapper
-        mapper_name = os.path.basename(lv_path)
-        # Attempt removal using the basename (common case)
-        dmsetup_cmd = ["dmsetup", "remove", mapper_name]
-        dm_success, dm_err, _ = _run_command(dmsetup_cmd, f"Remove DM mapping {mapper_name}")
-        
-        if dm_success:
-            print(f"    Successfully removed DM mapping {mapper_name}.")
-            time.sleep(0.5) # Small delay
-        else:
-            # If basename fails, try the full path (less common for dmsetup remove)
-            if "No such device or address" not in dm_err:
-                print(f"    Attempting removal using full path {lv_path}...")
-                dmsetup_cmd_fullpath = ["dmsetup", "remove", lv_path]
-                dm_success_fp, dm_err_fp, _ = _run_command(dmsetup_cmd_fullpath, f"Remove DM mapping {lv_path}")
-                if dm_success_fp:
-                     print(f"    Successfully removed DM mapping using full path {lv_path}.")
-                     time.sleep(0.5) # Small delay
-                elif "No such device or address" not in dm_err_fp:
-                    # Only report error if it wasn't already gone
-                    err_msg = f"Failed to remove DM mapping {mapper_name} (and {lv_path}): {dm_err_fp}"
-                    print(f"    Warning: {err_msg}")
-                    errors.append(err_msg)
-                    all_success = False # Mark as failure if any removal fails
-                # else: Ignore "No such device" error on second attempt too
-            # else: Ignore "No such device" error on first attempt
+def live_root_on_disk(disk_device):
+    disk_paths = _disk_member_paths(disk_device)
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "/"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return _source_on_disk(r.stdout.strip(), disk_paths)
+    except Exception:
+        pass
+    return False
 
+
+def umount_mounts_on_disk(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
     if progress_callback:
-        status = "DM removal complete." if all_success and not errors else "DM removal attempted, some errors occurred."
-        progress_callback(f"DM Check on {disk_device}: {status}", None)
+        progress_callback(f"Unmounting filesystems on {disk_device}...", None)
+    disk_paths = _disk_member_paths(disk_device)
+    mounts = []
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                src, tgt = parts[0], parts[1]
+                if tgt in ("/", "/proc", "/sys", "/dev", "/run", "/dev/pts", "/dev/shm"):
+                    continue
+                if _source_on_disk(src, disk_paths):
+                    mounts.append((src, tgt))
+    except Exception as e:
+        return False, f"Could not read mounts: {e}"
 
-    final_error_str = "\n".join(errors)
-    # Return success overall unless a removal failed with an error other than "No such device"
-    return all_success, final_error_str 
+    mounts.sort(key=lambda x: x[1].count("/"), reverse=True)
+    errors = []
+    for src, tgt in mounts:
+        print(f"  Unmounting {tgt} (from {src})")
+        ok, err, _ = _run_command(["umount", tgt], f"Unmount {tgt}", progress_callback, timeout=30)
+        if ok:
+            continue
+        ok2, err2, _ = _run_command(
+            ["umount", "-l", tgt], f"Lazy unmount {tgt}", progress_callback, timeout=30
+        )
+        if not ok2:
+            errors.append(f"{tgt}: {err2 or err}")
+    return (len(errors) == 0), "\n".join(errors)
+
+
+def reread_partition_table(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
+    if progress_callback:
+        progress_callback(f"Rereading partition table on {disk_device}...", None)
+    last_err = ""
+    for cmd in (
+        ["partprobe", disk_device],
+        ["blockdev", "--rereadpt", disk_device],
+        ["partx", "-u", disk_device],
+    ):
+        ok, err, _ = _run_command(
+            cmd, f"Reread PT ({cmd[0]})", progress_callback, timeout=30
+        )
+        if ok:
+            try:
+                subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+            except Exception:
+                pass
+            return True, ""
+        last_err = err or last_err
+    return False, last_err or "partition table reread failed"
+
+
+def forget_kernel_partitions(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
+    proc = _sudo_run(["partx", "-d", disk_device], run_timeout=15)
+    if proc and proc.returncode != 0:
+        print(f"Warning: partx -d {disk_device}: {(proc.stderr or proc.stdout or '').strip()}")
+    try:
+        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+    except Exception:
+        pass
+    return True, ""
+
+
+def disk_is_portable(disk_device):
+    name = os.path.basename(os.path.realpath(disk_device or ""))
+    if not name:
+        return False
+    for rel, want in (("removable", "1"), ("device/type", "SD")):
+        try:
+            with open(f"/sys/block/{name}/{rel}", encoding="utf-8") as fh:
+                if fh.read().strip() == want:
+                    return True
+        except OSError:
+            pass
+    try:
+        r = subprocess.run(
+            ["lsblk", "-dn", "-o", "HOTPLUG,TRAN", disk_device],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    tags = (r.stdout or "").split()
+    return bool(tags) and (tags[0] == "1" or "usb" in tags[1:])
+
+
+def partition_nodes_ready(devices):
+    devices = [d for d in (devices or []) if d]
+    if not devices:
+        return False
+    return all(os.path.exists(d) for d in devices)
+
+
+def ensure_partitions_visible(disk_device, devices, progress_callback=None, release=True):
+    if partition_nodes_ready(devices):
+        return True, ""
+    if release:
+        release_disk_for_install(disk_device, progress_callback)
+    ok, err = reread_partition_table(disk_device, progress_callback)
+    if partition_nodes_ready(devices):
+        return True, ""
+    missing = ", ".join(d for d in devices if not os.path.exists(d))
+    return False, err or f"kernel still does not see {missing} on {disk_device}"
+
+
+def table_written_kernel_busy(err_text):
+    t = (err_text or "").lower()
+    return "unable to inform the kernel" in t or (
+        "have been written" in t and "in use" in t
+    )
+
+
+def _umount_one_device(device, progress_callback=None):
+    if not device:
+        return
+    targets = []
+    try:
+        r = subprocess.run(
+            ["findmnt", "-nr", "-o", "TARGET", "-S", device],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if r.returncode == 0:
+            targets.extend(t.strip() for t in (r.stdout or "").splitlines() if t.strip())
+    except Exception:
+        pass
+    try:
+        real = os.path.realpath(device)
+    except OSError:
+        real = device
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                src, tgt = parts[0], parts[1]
+                try:
+                    src_r = os.path.realpath(src)
+                except OSError:
+                    src_r = src
+                if src == device or src_r == real:
+                    if tgt not in targets:
+                        targets.append(tgt)
+    except OSError:
+        pass
+    targets.sort(key=lambda t: t.count("/"), reverse=True)
+    for tgt in targets:
+        ok, err, _ = _run_command(
+            ["umount", tgt], f"Unmount {tgt}", progress_callback, timeout=30
+        )
+        if ok:
+            continue
+        _run_command(
+            ["umount", "-l", tgt], f"Lazy unmount {tgt}", progress_callback, timeout=30
+        )
+
+
+def _sys_block_name(device):
+    if not device:
+        return ""
+    if device.startswith("dm-") or (
+        not device.startswith("/") and os.path.isdir(f"/sys/class/block/{device}")
+    ):
+        return device
+    try:
+        real = os.path.realpath(device)
+    except OSError:
+        real = device
+    return os.path.basename(real)
+
+
+def _dm_sysfs_name(sys_name):
+    path = f"/sys/class/block/{sys_name}/dm/name"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _holder_dm_names(device):
+    names = []
+    seen = set()
+
+    def walk(sys_name):
+        if not sys_name or sys_name in seen:
+            return
+        seen.add(sys_name)
+        hdir = f"/sys/class/block/{sys_name}/holders"
+        try:
+            holders = os.listdir(hdir)
+        except OSError:
+            holders = []
+        for h in sorted(holders):
+            walk(h)
+        dm_name = _dm_sysfs_name(sys_name)
+        if dm_name:
+            names.append(dm_name)
+
+    walk(_sys_block_name(device))
+    return names
+
+
+def _clear_block_holders(device, progress_callback=None):
+    if not device:
+        return
+    if progress_callback:
+        progress_callback(f"Dropping holders of {device}...", None)
+    for _ in range(12):
+        names = _holder_dm_names(device)
+        if not names:
+            break
+        for name in names:
+            mapper = f"/dev/mapper/{name}"
+            _umount_one_device(mapper, progress_callback)
+            _sudo_run(["fuser", "-k", mapper], run_timeout=5)
+            _sudo_run(["dmsetup", "remove", "--force", name], run_timeout=10)
+        time.sleep(0.2)
+    _sudo_run(["pvremove", "-ff", "-y"] + _LVM_NOAUTO + [device], run_timeout=20)
+    _sudo_run(["wipefs", "-af", device], run_timeout=20)
+    _sudo_run(["lvmdevices", "--deldev", device], run_timeout=20)
+    _sudo_run(["pvscan", "--cache"], run_timeout=20)
+
+
+def release_block_device(device, progress_callback=None):
+    if not device:
+        return True, ""
+    if progress_callback:
+        progress_callback(f"Releasing {device}...", None)
+    swapoff_on_disk(device, progress_callback)
+    _umount_one_device(device, progress_callback)
+    _sudo_run(["fuser", "-km", device], run_timeout=10)
+    kill_lvm_dev_linkers()
+    _clear_block_holders(device, progress_callback)
+    _sudo_run(["lvmdevices", "--deldev", device], run_timeout=30)
+    return True, ""
+
+
+def release_disk_for_install(disk_device, progress_callback=None):
+    if not disk_device:
+        return True, ""
+    if live_root_on_disk(disk_device):
+        return False, (
+            f"Refusing to wipe {disk_device}: the running system root is on this disk."
+        )
+    if progress_callback:
+        progress_callback(f"Releasing {disk_device}...", None)
+
+    kill_lvm_dev_linkers()
+    umount_mounts_on_disk(disk_device, progress_callback)
+    swapoff_on_disk(disk_device, progress_callback)
+    ok, err, _vgs = teardown_lvm_on_disk(disk_device, progress_callback)
+    if not ok:
+        print(f"Warning: LVM teardown on {disk_device} incomplete: {err}")
+    _remove_dm_mappings(disk_device, progress_callback)
+    umount_mounts_on_disk(disk_device, progress_callback)
+
+    members = sorted(_disk_member_paths(disk_device))
+    if members:
+        _sudo_run(["fuser", "-km"] + members, run_timeout=15)
+
+    try:
+        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    return True, ""
 
 # Enhanced GRUB package verification with distribution-specific handling
 def verify_grub_packages(target_root):
@@ -1957,7 +2515,7 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False):
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, separate_boot=False, portable=False):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -2133,7 +2691,7 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
     # On aarch64, skip -R (initramfs rebuild) here; we run dracut --no-hostonly later to avoid host-only initramfs.
     _arch = get_host_architecture()
     plymouth_rebuild = ["plymouth-set-default-theme", "-R"] if _arch["arch"] != "aarch64" else ["plymouth-set-default-theme"]
-    for theme in ["spinner", "bgrt", "spin-gdm", "details"]:
+    for theme in ["bgrt", "spinner", "spin-gdm", "details"]:
         try:
             ok, _, _ = _run_in_chroot(target_root, plymouth_rebuild + [theme], "Set Plymouth theme", progress_callback, timeout=120)
             if ok:
@@ -2170,7 +2728,7 @@ GRUB_ENABLE_BLSCFG=true
             match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
                 quote_char, args = match.group(1), match.group(2)
-                args_list = [p for p in args.split() if p and p != "nomodeset"]
+                args_list = [p for p in args.split() if p and p != "nomodeset" and not p.startswith(("rd.lvm.lv=", "resume="))]
                 for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
                     if param not in args_list:
                         args_list.append(param)
@@ -2225,7 +2783,7 @@ GRUB_ENABLE_BLSCFG=true
                         try:
                             new_lines = []
                             for line in content.splitlines():
-                                if btrfs_subvolumes and (line.startswith("linux ") or line.startswith("initrd ")):
+                                if (btrfs_subvolumes or separate_boot) and (line.startswith("linux ") or line.startswith("initrd ")):
                                     # Separate /boot: GRUB root is /boot partition; paths need leading /
                                     # /boot/vmlinuz-xxx -> /vmlinuz-xxx (partition root = /boot)
                                     idx = 6 if line.startswith("linux ") else 7
@@ -2263,7 +2821,13 @@ GRUB_ENABLE_BLSCFG=true
     if progress_callback:
         progress_callback("Regenerating initramfs...", None)
     arch = get_host_architecture()
-    if arch["arch"] == "aarch64":
+    if portable:
+        portable_conf = 'hostonly="no"\nhostonly_cmdline="no"\nadd_drivers+=" usb_storage uas sd_mod xhci_pci ehci_pci "\n'
+        if btrfs_subvolumes:
+            portable_conf += 'add_dracutmodules+=" btrfs "\n'
+        if not write_file_as_root(os.path.join(target_root, "etc/dracut.conf.d/90-portable.conf"), portable_conf, progress_callback):
+            return False, "Failed to write portable dracut configuration"
+    if arch["arch"] == "aarch64" or portable:
         dracut_cmd = ["dracut", "--regenerate-all", "--force", "--no-hostonly", "-v"]
     else:
         dracut_cmd = ["dracut", "--regenerate-all", "--force", "-v"]
@@ -2389,9 +2953,8 @@ def generate_fstab_for_target(target_root, progress_callback=None):
             uuid = None
             if source.startswith("/dev/"):
                 try:
-                    uuid_res = subprocess.run(["blkid", "-o", "value", "-s", "UUID", source],
-                                              capture_output=True, text=True, check=False, timeout=5)
-                    if uuid_res.returncode == 0 and uuid_res.stdout.strip():
+                    uuid_res = _sudo_run(["blkid", "-o", "value", "-s", "UUID", source], run_timeout=5)
+                    if uuid_res and uuid_res.returncode == 0 and uuid_res.stdout.strip():
                         uuid = uuid_res.stdout.strip()
                 except Exception as e:
                     print(f"Warning: blkid failed for {source}: {e}")
@@ -2658,7 +3221,29 @@ gpgcheck=0
         if not success:
             print(f"Warning: NVIDIA driver installation failed: {err}")
             # Non-fatal; base system is already installed
-    
+
+    browser_rpm = package_config.get("browser_rpm")
+    if browser_rpm == "firefox":
+        if progress_callback:
+            progress_callback("Installing Firefox from Mozilla's repository...", 0.7)
+        mozilla_repo_path = os.path.join(target_root, "etc/yum.repos.d/mozilla.repo")
+        mozilla_key = "https://packages.mozilla.org/rpm/firefox/signing-key.gpg"
+        repo_content = f"""[mozilla]
+name=Mozilla Packages
+baseurl=https://packages.mozilla.org/rpm/firefox
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey={mozilla_key}
+"""
+        if not write_file_as_root(mozilla_repo_path, repo_content, progress_callback):
+            print(f"Warning: Failed to write Mozilla repo file {mozilla_repo_path}")
+        else:
+            _run_command(["rpm", f"--root={target_root}", "--import", mozilla_key], "Import Mozilla signing key", progress_callback, timeout=60)
+            success, err = _install_packages_dnf_impl(target_root, ["firefox"], progress_callback, keep_cache=True)
+            if not success:
+                print(f"Warning: Firefox installation failed: {err}")
+
     # --- Setup Flatpak if enabled ---
     if flatpak_enabled:
         if progress_callback:

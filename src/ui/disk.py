@@ -28,6 +28,7 @@ from gi.repository import Gtk, Adw, GLib
 
 from .base import BaseConfigurationPage
 import backend
+import disk_filter
 # D-Bus imports are no longer needed here
 # from ..utils import dasbus, DBusError, dbus_available 
 # from ..constants import (...) 
@@ -43,117 +44,378 @@ def format_bytes(size_bytes):
         return f"{mb:.1f} MiB"
     return f"{gb:.1f} GiB"
 
-# --- Enhanced Partitioning Command Generators ---
+ESP_END_MIB = 513
+BOOT_SIZE_MIB = 2048
+MIN_FREE_MIB = BOOT_SIZE_MIB + 8192
 
-def generate_wipefs_command(disk_path):
-    """Generates the wipefs command for a disk."""
-    return ["wipefs", "-a", disk_path]
+PART_TYPE_LINUX = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+PART_TYPE_ESP = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+PART_TYPE_BIOS_BOOT = "21686148-6449-6E6F-744E-656564454649"
 
-def generate_gpt_commands(disk_path, efi_size_mb=512, filesystem="ext4", dual_boot=False, preserve_efi=False, bios_mode=False, btrfs_subvolumes=False):
-    """Generates parted commands for GPT layout.
-    - UEFI (bios_mode=False): creates EFI System Partition + [optional /boot] + root
-    - BIOS (bios_mode=True): creates BIOS Boot Partition + [optional /boot] + root
-    - When btrfs_subvolumes: add separate ext4 /boot so GRUB can read kernel (GRUB can't read BTRFS subvols)
-    """
-    commands = []
-    if not disk_path:
-        print("ERROR: generate_gpt_commands called without disk_path")
-        return []
 
-    first_start = "1MiB"
-    boot_size_mb = 1024  # 1GB for /boot when separate
-    if bios_mode:
-        bios_end = "3MiB"
-        boot_start = "4MiB"
-        boot_end = f"{4 + boot_size_mb}MiB"
-        root_start = boot_end
-        root_end = "100%"
+def _partition_prefix(disk_path):
+    if "nvme" in disk_path or "mmcblk" in disk_path:
+        return "p"
+    return ""
+
+
+def _part(disk_path, num):
+    return f"{disk_path}{_partition_prefix(disk_path)}{num}"
+
+
+def _sfdisk_cmd(disk, script):
+    return [
+        "bash",
+        "-c",
+        f"sfdisk --wipe always --force {shlex.quote(disk)} <<'EOF'\n{script}EOF",
+    ]
+
+
+def _clean_install_sfdisk_script(is_uefi, efi_size_mib=512):
+    if is_uefi:
+        boot_start = 1 + efi_size_mib
+        return (
+            "label: gpt\n"
+            f"name=ESP, start=1MiB, size={efi_size_mib}MiB, type={PART_TYPE_ESP}\n"
+            f"name=boot, start={boot_start}MiB, size={BOOT_SIZE_MIB}MiB, "
+            f"type={PART_TYPE_LINUX}\n"
+            f"name=root, start={boot_start + BOOT_SIZE_MIB}MiB, "
+            f"type={PART_TYPE_LINUX}\n"
+        )
+    return (
+        "label: gpt\n"
+        f"name=biosboot, start=1MiB, size=2MiB, type={PART_TYPE_BIOS_BOOT}\n"
+        f"name=boot, start=3MiB, size={BOOT_SIZE_MIB}MiB, "
+        f"type={PART_TYPE_LINUX}\n"
+        f"name=root, start={3 + BOOT_SIZE_MIB}MiB, "
+        f"type={PART_TYPE_LINUX}\n"
+    )
+
+
+def _dual_boot_sfdisk_append(disk, boot_num, root_num, start_mib, boot_end_mib, end_mib):
+    script = (
+        f"{_part(disk, boot_num)} : name=boot, start={int(start_mib)}MiB, size={BOOT_SIZE_MIB}MiB, "
+        f"type={PART_TYPE_LINUX}\n"
+        f"{_part(disk, root_num)} : name=root, start={int(boot_end_mib)}MiB, "
+        f"size={int(end_mib - boot_end_mib)}MiB, "
+        f"type={PART_TYPE_LINUX}\n"
+    )
+    return [
+        "bash",
+        "-c",
+        f"sfdisk --append --force {shlex.quote(disk)} <<'EOF'\n{script}EOF",
+    ]
+
+
+def _mkfs_root_command(filesystem, device):
+    if filesystem == "btrfs":
+        return ["mkfs.btrfs", "-f", device]
+    if filesystem == "xfs":
+        return ["mkfs.xfs", "-f", device]
+    return ["mkfs.ext4", "-F", device]
+
+
+def _is_live_install_env():
+    try:
+        with open("/proc/cmdline", encoding="utf-8") as f:
+            cmdline = f.read().lower()
+        if any(
+            tok in cmdline
+            for tok in (
+                "rd.live",
+                "root=live",
+                " liveimg",
+                " boot=live",
+                "oreon.live",
+            )
+        ):
+            return True
+    except OSError:
+        pass
+    for path in (
+        "/run/initramfs/live",
+        "/run/live",
+        "/lib/live/mount",
+        "/.live",
+    ):
+        if os.path.exists(path):
+            return True
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "FSTYPE", "/"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        fstype = (r.stdout or "").strip().lower()
+        if fstype in ("overlay", "overlayfs"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _mount_source(path):
+    try:
+        r = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    lines = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 or not lines:
+        return ""
+    return lines[0].split("[", 1)[0].strip()
+
+
+def _whole_disks_of(dev, seen=None):
+    seen = set() if seen is None else seen
+    if not dev:
+        return set()
+    name = os.path.basename(os.path.realpath(dev)) if dev.startswith("/dev/") else dev
+    sysp = os.path.realpath(f"/sys/class/block/{name}")
+    if name in seen or not os.path.isdir(sysp):
+        return set()
+    seen.add(name)
+    if os.path.isfile(os.path.join(sysp, "partition")):
+        return {"/dev/" + os.path.basename(os.path.dirname(sysp))}
+    found = set()
+    try:
+        slaves = os.listdir(os.path.join(sysp, "slaves"))
+    except OSError:
+        slaves = []
+    for slave in slaves:
+        found |= _whole_disks_of(slave, seen)
+    backing = ""
+    try:
+        with open(os.path.join(sysp, "loop", "backing_file"), encoding="utf-8") as fh:
+            backing = fh.read().strip()
+    except OSError:
+        pass
+    if backing:
+        found |= _whole_disks_of(_mount_source(backing), seen)
+    if not slaves and not backing and not name.startswith(("loop", "dm-", "zram", "ram")):
+        found.add("/dev/" + name)
+    return found
+
+
+def _live_medium_disks():
+    sources = []
+    if _is_live_install_env():
+        sources.append(_mount_source("/"))
+    for mnt in ("/run/initramfs/live", "/run/initramfs/isoscan", "/run/rootfsbase"):
+        if os.path.ismount(mnt):
+            sources.append(_mount_source(mnt))
+    if os.path.exists("/run/initramfs/livedev"):
+        sources.append(os.path.realpath("/run/initramfs/livedev"))
+    try:
+        with open("/proc/cmdline", encoding="utf-8") as f:
+            cmdline = f.read().split()
+    except OSError:
+        cmdline = []
+    links = {
+        "CDLABEL": "by-label",
+        "LABEL": "by-label",
+        "UUID": "by-uuid",
+        "PARTUUID": "by-partuuid",
+        "PARTLABEL": "by-partlabel",
+    }
+    for tok in cmdline:
+        if not tok.startswith("root=live:"):
+            continue
+        spec = tok[len("root=live:"):]
+        key, _, value = spec.partition("=")
+        if spec.startswith("/dev/"):
+            sources.append(spec)
+        elif value and key.upper() in links:
+            sources.append(f"/dev/disk/{links[key.upper()]}/{value}")
+    disks = set()
+    for src in sources:
+        disks |= _whole_disks_of(src)
+    return disks
+
+
+_UNTOUCHABLE_PARTTYPES = {
+    "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+    "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+    "de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+    "5808c8aa-7e8f-42e0-85d2-e1e90434cfb3",
+    "af9b60a0-1431-4f62-bc68-3311714a69ad",
+}
+
+
+def _dev_path(dev):
+    return (dev.get("path") or dev.get("name") or "").strip()
+
+
+def _sysfs_read_int(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return int((f.read() or "0").strip() or "0")
+
+
+def _probe_signature(path):
+    try:
+        proc = backend._sudo_run(["blkid", "-p", "-o", "export", path], run_timeout=10)
+    except OSError:
+        return None
+    if proc is None or proc.returncode not in (0, 2):
+        return None
+    tags = dict(line.split("=", 1) for line in (proc.stdout or "").splitlines() if "=" in line)
+    return (tags.get("TYPE") or tags.get("PTTYPE") or "").lower()
+
+
+def _partition_reuse_block_reason(path, device, size):
+    if not device:
+        return "no partition information"
+    if size < 9 * 1024**3:
+        return "too small"
+    if device.get("mountpoint"):
+        return "mounted"
+    if device.get("children"):
+        return "in use"
+    if (device.get("parttype") or "").lower() in _UNTOUCHABLE_PARTTYPES:
+        return "system partition"
+    if "efi" in (device.get("partlabel") or "").lower():
+        return "EFI partition"
+    fstype = (device.get("fstype") or "").lower()
+    if fstype:
+        return f"contains {fstype}"
+    probed = _probe_signature(path)
+    if probed is None:
+        return "could not verify that it is empty"
+    if probed:
+        return f"contains {probed}"
+    return None
+
+
+_MIN_FREE_SHOWN_MIB = 16
+
+
+def get_disk_layout(disk_path):
+    layout = {"disk": disk_path, "size": 0, "pttype": "", "segments": []}
+    base = os.path.basename(disk_path or "")
+    sysdir = f"/sys/block/{base}"
+    if not base or not os.path.isdir(sysdir):
+        return layout
+    try:
+        disk_size = _sysfs_read_int(os.path.join(sysdir, "size")) * 512
+        names = sorted(os.listdir(sysdir))
+    except Exception as e:
+        print(f"get_disk_layout({disk_path}) sysfs failed: {e}")
+        return layout
+    layout["size"] = disk_size
+    meta = {}
+    try:
+        r = subprocess.run(
+            ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,TYPE,FSTYPE,LABEL,PARTTYPE,PARTTYPENAME,PARTLABEL,MOUNTPOINT,PTTYPE", disk_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, check=True,
+        )
+        for dev in json.loads(r.stdout or "{}").get("blockdevices") or []:
+            if _dev_path(dev) == disk_path:
+                layout["pttype"] = (dev.get("pttype") or "").lower()
+            for child in dev.get("children") or []:
+                meta[_dev_path(child)] = child
+    except Exception as e:
+        print(f"get_disk_layout({disk_path}) lsblk failed: {e}")
+    mib = 1024 * 1024
+    parts = []
+    for name in names:
+        pdir = os.path.join(sysdir, name)
+        if not os.path.isfile(os.path.join(pdir, "partition")):
+            continue
+        try:
+            number = _sysfs_read_int(os.path.join(pdir, "partition"))
+            start = _sysfs_read_int(os.path.join(pdir, "start")) * 512
+            size = _sysfs_read_int(os.path.join(pdir, "size")) * 512
+        except Exception:
+            continue
+        if size < mib:
+            continue
+        path = f"/dev/{name}"
+        dev = meta.get(path) or {}
+        reason = _partition_reuse_block_reason(path, dev, size)
+        parts.append({
+            "kind": "part",
+            "path": path,
+            "number": number,
+            "start": start,
+            "size": size,
+            "fstype": (dev.get("fstype") or "").strip(),
+            "label": (dev.get("label") or dev.get("partlabel") or "").strip(),
+            "typename": (dev.get("parttypename") or "").strip(),
+            "selectable": reason is None,
+            "reason": reason,
+        })
+    parts.sort(key=lambda p: p["start"])
+    segments = []
+    cursor = mib
+    for part in parts + [None]:
+        end = part["start"] if part else disk_size
+        start_mib = (cursor + mib - 1) // mib
+        end_mib = end // mib
+        if end_mib - start_mib >= _MIN_FREE_SHOWN_MIB:
+            usable = end_mib - start_mib >= MIN_FREE_MIB
+            reason = None if usable else "too small"
+            if usable and layout["pttype"] != "gpt":
+                usable = False
+                reason = "requires a GPT partition table"
+            segments.append({
+                "kind": "free",
+                "path": None,
+                "start": start_mib * mib,
+                "size": (end_mib - start_mib) * mib,
+                "start_mib": start_mib,
+                "end_mib": end_mib,
+                "selectable": usable,
+                "reason": reason,
+            })
+        if part:
+            segments.append(part)
+            cursor = max(cursor, part["start"] + part["size"])
+    layout["segments"] = segments
+    return layout
+
+
+def _human_size(num_bytes):
+    value = float(num_bytes or 0)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def _segment_key(seg):
+    if seg["kind"] == "free":
+        return ("free", seg["start_mib"], seg["end_mib"])
+    return ("part", seg["path"])
+
+
+def _segment_name(seg):
+    if seg["kind"] == "free":
+        return "Free space"
+    return os.path.basename(seg["path"])
+
+
+def _segment_tooltip(seg):
+    lines = [seg["path"] or "Free space", _human_size(seg["size"])]
+    if seg["kind"] == "part":
+        lines.append(f"Filesystem: {seg['fstype'] or 'none'}")
+        if seg["label"]:
+            lines.append(f"Label: {seg['label']}")
+        if seg["typename"]:
+            lines.append(f"Type: {seg['typename']}")
+    if not seg["selectable"]:
+        lines.append(f"Cannot be used: {seg['reason']}")
+    elif seg["kind"] == "part":
+        lines.append("Can be used. Its contents will be erased.")
     else:
-        efi_end = f"{efi_size_mb + 1}MiB"
-        boot_start = efi_end
-        boot_end = f"{efi_size_mb + 1 + boot_size_mb}MiB"
-        root_start = boot_end
-        root_end = "100%"
-
-    if dual_boot and preserve_efi and not bios_mode:
-        region = get_free_space_region(disk_path)
-        if not region:
-            print("ERROR: Dual boot requires free space but none found on disk.")
-            return []
-        root_start, root_end = region
-        commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, root_start, root_end])
-        return commands
-
-    if bios_mode:
-        commands.append(["parted", "-s", disk_path, "mklabel", "gpt"])
-        commands.append(["parted", "-s", disk_path, "mkpart", "\"BIOS boot\"", "", first_start, bios_end])
-        commands.append(["parted", "-s", disk_path, "set", "1", "bios_grub", "on"])
-        if btrfs_subvolumes and filesystem == "btrfs":
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Boot\"", "ext4", boot_start, boot_end])
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", "btrfs", root_start, root_end])
-        else:
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, boot_start, root_end])
-    else:
-        commands.append(["parted", "-s", disk_path, "mklabel", "gpt"])
-        commands.append(["parted", "-s", disk_path, "mkpart", "\"EFI System Partition\"", "fat32", first_start, efi_end])
-        commands.append(["parted", "-s", disk_path, "set", "1", "boot", "on"])
-        commands.append(["parted", "-s", disk_path, "set", "1", "esp", "on"])
-        if btrfs_subvolumes and filesystem == "btrfs":
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Boot\"", "ext4", boot_start, boot_end])
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", "btrfs", root_start, root_end])
-        else:
-            commands.append(["parted", "-s", disk_path, "mkpart", "\"Linux filesystem\"", filesystem, boot_start, root_end])
-    return commands
-
-def generate_mkfs_commands(disk_path, filesystem="ext4", partition_prefix="", dual_boot=False, preserve_efi=False, include_efi=True, bios_mode=False, root_part_override=None, btrfs_subvolumes=False):
-    """Generates mkfs commands for partitions.
-    - When btrfs_subvolumes: part2=/boot (ext4), part3=root (btrfs); else part2=root
-    """
-    commands = []
-    if root_part_override:
-        root_part = root_part_override
-        if filesystem == "ext4":
-            commands.append(["mkfs.ext4", "-F", root_part])
-        elif filesystem == "btrfs":
-            commands.append(["mkfs.btrfs", "-f", root_part])
-        elif filesystem == "xfs":
-            commands.append(["mkfs.xfs", "-f", root_part])
-        return commands
-    if btrfs_subvolumes and filesystem == "btrfs":
-        boot_part = f"{disk_path}{partition_prefix}2"
-        root_part = f"{disk_path}{partition_prefix}3"
-        if include_efi and not (dual_boot and preserve_efi):
-            commands.append(["mkfs.vfat", "-F32", f"{disk_path}{partition_prefix}1"])
-        commands.append(["mkfs.ext4", "-F", boot_part])
-        commands.append(["mkfs.btrfs", "-f", root_part])
-    elif bios_mode:
-        root_part = f"{disk_path}{partition_prefix}2"
-        if filesystem == "ext4":
-            commands.append(["mkfs.ext4", "-F", root_part])
-        elif filesystem == "btrfs":
-            commands.append(["mkfs.btrfs", "-f", root_part])
-        elif filesystem == "xfs":
-            commands.append(["mkfs.xfs", "-f", root_part])
-    elif include_efi:
-        efi_part = f"{disk_path}{partition_prefix}1"
-        root_part = f"{disk_path}{partition_prefix}2"
-        if not (dual_boot and preserve_efi):
-            commands.append(["mkfs.vfat", "-F32", efi_part])
-        if filesystem == "ext4":
-            commands.append(["mkfs.ext4", "-F", root_part])
-        elif filesystem == "btrfs":
-            commands.append(["mkfs.btrfs", "-f", root_part])
-        elif filesystem == "xfs":
-            commands.append(["mkfs.xfs", "-f", root_part])
-    else:
-        root_part = f"{disk_path}{partition_prefix}1"
-        if filesystem == "ext4":
-            commands.append(["mkfs.ext4", "-F", root_part])
-        elif filesystem == "btrfs":
-            commands.append(["mkfs.btrfs", "-f", root_part])
-        elif filesystem == "xfs":
-            commands.append(["mkfs.xfs", "-f", root_part])
-    return commands
+        lines.append("Can be used.")
+    return "\n".join(lines)
 
 # --- Helper Functions to Check Host Usage ---
 
@@ -197,73 +459,37 @@ def get_host_lvm_pvs():
         return set()
 
 def disk_has_unallocated_space(disk_path):
-    """Check if a disk has unallocated (free) space for dual boot. Returns True if yes."""
-    return get_free_space_region(disk_path) is not None
+    """Check if a disk has usable free space or an unused partition for dual boot."""
+    return any(s["selectable"] for s in get_disk_layout(disk_path)["segments"])
 
 
-def get_free_space_region(disk_path):
-    """Get the (start, end) of the largest free space region on disk for dual boot.
-    Returns (start_str, end_str) e.g. ('256GiB', '500GiB') or None if no free space."""
-    if not disk_path or not os.path.exists(disk_path):
-        return None
-    try:
-        r = subprocess.run(
-            ["parted", "-s", disk_path, "unit", "MiB", "print", "free"],
-            capture_output=True, text=True, timeout=10
-        )
-        if r.returncode != 0:
-            return None
-        # Parse lines like "       262144MiB  512000MiB  249856MiB   Free Space"
-        lines = r.stdout.strip().split("\n")
-        best_start, best_end, best_size_mb = None, None, 0
-        for line in lines:
-            if "Free Space" not in line and "free" not in line.lower():
-                continue
-            parts = line.split()
-            if len(parts) >= 3:
-                start_s, end_s, size_s = parts[0], parts[1], parts[2]
-                try:
-                    s = size_s.upper().replace("GIB", "").replace("MIB", "").replace("KB", "").replace("B", "").strip()
-                    num = float(s) if s else 0
-                    if "GIB" in size_s.upper() or "GB" in size_s.upper():
-                        num *= 1024  # to MiB
-                    if num > best_size_mb and num >= 9216:
-                        best_start, best_end, best_size_mb = start_s, end_s, num
-                except (ValueError, IndexError):
-                    pass
-        if best_start and best_end:
-            return (best_start, best_end)
-        return None
-    except Exception:
-        return None
-
-
-def get_next_partition_device(disk_path, partition_prefix=""):
-    """Return the device path for the next partition to be created (e.g. /dev/sda3).
-    Used for dual boot where we add one partition to existing layout."""
+def get_next_partition_device(disk_path, after=0):
     if not disk_path:
         return None
     try:
         r = subprocess.run(
             ["lsblk", "-n", "-o", "NAME", "-l", disk_path],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if r.returncode != 0:
             return None
-        max_num = 0
-        base = disk_path.split("/")[-1]  # e.g. sda or nvme0n1
-        for line in r.stdout.strip().split("\n"):
+        used = set()
+        base = disk_path.rsplit("/", 1)[-1]
+        for line in (r.stdout or "").splitlines():
             name = line.strip()
             if not name or name == base:
                 continue
-            # sda1, sda2 or nvme0n1p1, nvme0n1p2
-            suffix = name[len(base):].lstrip("p")
+            if not name.startswith(base):
+                continue
+            suffix = name[len(base) :].lstrip("p")
             if suffix.isdigit():
-                max_num = max(max_num, int(suffix))
-        next_num = max_num + 1
-        if "nvme" in disk_path or "mmcblk" in disk_path:
-            return f"{disk_path}p{next_num}"
-        return f"{disk_path}{next_num}"
+                used.add(int(suffix))
+        next_num = int(after) + 1
+        while next_num in used:
+            next_num += 1
+        return f"{disk_path}{_partition_prefix(disk_path)}{next_num}"
     except Exception:
         return None
 
@@ -332,6 +558,9 @@ def detect_existing_efi_partitions(disk_path=None):
     return efi_partitions
 
 class DiskPage(BaseConfigurationPage):
+    LAYOUT_MIN_SEGMENT_PX = 56
+    LAYOUT_BAR_HEIGHT = 72
+
     def __init__(self, main_window, overlay_widget, **kwargs):
         super().__init__(title="Installation Destination", subtitle="Configure disk partitioning and filesystem", main_window=main_window, overlay_widget=overlay_widget, **kwargs)
         
@@ -349,6 +578,9 @@ class DiskPage(BaseConfigurationPage):
         self.disk_list_rows = []  # Track rows for proper cleanup on rescan
         self.efi_partitions = []
         self.disks_with_free_space = set()
+        self.layout_segments = []
+        self.layout_selected = -1
+        self._layout_disk = None
         
         self._build_ui()
             
@@ -369,6 +601,11 @@ class DiskPage(BaseConfigurationPage):
         self.scan_button.add_css_class("compact")
         self.scan_button.connect("clicked", self.scan_for_disks)
         scan_row.add_suffix(self.scan_button)
+        self.refresh_disks_button = Gtk.Button(label="Refresh Disks")
+        self.refresh_disks_button.set_valign(Gtk.Align.CENTER)
+        self.refresh_disks_button.add_css_class("compact")
+        self.refresh_disks_button.connect("clicked", lambda _b: self.scan_for_disks(self.scan_button))
+        scan_row.add_suffix(self.refresh_disks_button)
         info_group.add(scan_row)
 
         # Disk selection section
@@ -405,6 +642,31 @@ class DiskPage(BaseConfigurationPage):
         self.dual_boot_row.add_suffix(self.dual_boot_radio)
         self.dual_boot_row.set_activatable_widget(self.dual_boot_radio)
         self.mode_group.add(self.dual_boot_row)
+
+        self.layout_group = Adw.PreferencesGroup(
+            title="Install Location",
+            description="Click free space or an unused partition"
+        )
+        self.layout_group.set_visible(False)
+        self.add(self.layout_group)
+        self.layout_area = Gtk.DrawingArea()
+        self.layout_area.set_content_height(self.LAYOUT_BAR_HEIGHT)
+        self.layout_area.set_hexpand(True)
+        self.layout_area.set_draw_func(self._draw_layout)
+        self.layout_area.set_has_tooltip(True)
+        self.layout_area.connect("query-tooltip", self._on_layout_query_tooltip)
+        layout_click = Gtk.GestureClick()
+        layout_click.connect("pressed", self._on_layout_pressed)
+        self.layout_area.add_controller(layout_click)
+        layout_scroller = Gtk.ScrolledWindow()
+        layout_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        layout_scroller.set_min_content_height(self.LAYOUT_BAR_HEIGHT + 16)
+        layout_scroller.set_child(self.layout_area)
+        self.layout_group.add(layout_scroller)
+        self.layout_status = Gtk.Label(xalign=0)
+        self.layout_status.set_wrap(True)
+        self.layout_status.set_margin_top(6)
+        self.layout_group.add(self.layout_status)
         
         # EFI partition selection (for dual boot) - placed right after mode so it's visible when dual boot selected
         self.efi_group = Adw.PreferencesGroup(
@@ -496,6 +758,10 @@ class DiskPage(BaseConfigurationPage):
 
     def _check_dual_boot_available(self):
         """Check if dual boot is possible: EFI partitions exist and at least one disk has unallocated space."""
+        if not os.path.exists("/sys/firmware/efi"):
+            self.dual_boot_row.set_sensitive(False)
+            self.dual_boot_row.set_subtitle("Dual boot requires UEFI firmware.")
+            return False
         selected = next(iter(self.selected_disks), None)
         self.efi_partitions = detect_existing_efi_partitions(selected)
         self.disks_with_free_space = self._get_disks_with_free_space()
@@ -524,6 +790,7 @@ class DiskPage(BaseConfigurationPage):
             self.dual_boot_enabled = False
             self.preserve_efi = False
             self.efi_group.set_visible(False)
+            self.layout_group.set_visible(False)
             self._update_btrfs_snapshots_for_mode()
             for disk_path, widget_info in self.disk_widgets.items():
                 disk = next((d for d in self.detected_disks if d["path"] == disk_path), None)
@@ -537,6 +804,8 @@ class DiskPage(BaseConfigurationPage):
                 self._update_disk_list_for_dual_boot()
                 self._populate_efi_partitions()
                 self.efi_group.set_visible(True)
+                self._refresh_layout()
+                self.layout_group.set_visible(True)
                 if self.efi_partitions and not self.selected_efi_partition:
                     self.selected_efi_partition = self.efi_partitions[0].get("path")
                     self.preserve_efi = True
@@ -603,10 +872,10 @@ class DiskPage(BaseConfigurationPage):
             size_str = format_bytes(disk["size"]) if disk else "N/A"
             if disk_path in self.disks_with_free_space:
                 row.set_sensitive(True)
-                row.set_subtitle(f"{size_str} — has free space")
+                row.set_subtitle(f"{size_str}, has free space or an unused partition")
             else:
                 row.set_sensitive(False)
-                row.set_subtitle(f"{size_str} — no free space (shrink a partition first)")
+                row.set_subtitle(f"{size_str}, no usable space (shrink a partition first)")
                 if radio.get_active():
                     radio.set_active(False)
                     self.selected_disks.discard(disk_path)
@@ -617,6 +886,124 @@ class DiskPage(BaseConfigurationPage):
                 w["radio"].set_active(True)
                 self.selected_disks.add(first_valid)
             self.show_toast("Select a disk with free space for dual boot")
+
+    def _selected_segment(self):
+        if 0 <= self.layout_selected < len(self.layout_segments):
+            return self.layout_segments[self.layout_selected]
+        return None
+
+    def _refresh_layout(self):
+        disk = next(iter(self.selected_disks), None)
+        previous = self._selected_segment()
+        preselect = _segment_key(previous) if previous and self._layout_disk == disk else None
+        segments = get_disk_layout(disk)["segments"] if disk else []
+        if preselect is None:
+            parts = [s for s in segments if s["kind"] == "part" and s["selectable"]]
+            free = [s for s in segments if s["kind"] == "free" and s["selectable"]]
+            if parts:
+                preselect = _segment_key(max(parts, key=lambda s: s["size"]))
+            elif free:
+                preselect = _segment_key(max(free, key=lambda s: s["size"]))
+        self.layout_segments = segments
+        self.layout_selected = next(
+            (i for i, s in enumerate(segments) if s["selectable"] and _segment_key(s) == preselect), -1
+        )
+        self._layout_disk = disk
+        self.layout_area.set_content_width(max(1, len(segments)) * self.LAYOUT_MIN_SEGMENT_PX * 2)
+        self.layout_area.queue_draw()
+        self._update_layout_status()
+
+    def _update_layout_status(self):
+        seg = self._selected_segment()
+        if seg is None:
+            if any(s["selectable"] for s in self.layout_segments):
+                msg = "Select free space or an unused partition in the disk layout."
+            else:
+                msg = f"No usable free space (at least {MIN_FREE_MIB // 1024} GiB) or unused partition (at least 9 GiB). Shrink a partition first."
+        elif seg["kind"] == "free":
+            msg = f"Install into free space: {_human_size(seg['size'])} at {seg['start_mib']} MiB."
+        else:
+            msg = f"Install into {seg['path']} ({_human_size(seg['size'])}). Its contents will be erased."
+        self.layout_status.set_text(msg)
+
+    def _layout_rects(self, width, height):
+        count = len(self.layout_segments)
+        width -= 2
+        if not count or width <= 0:
+            return []
+        total = sum(max(0, seg["size"]) for seg in self.layout_segments) or 1
+        min_w = min(float(self.LAYOUT_MIN_SEGMENT_PX), width / count)
+        spare = max(0.0, width - min_w * count)
+        rects = []
+        x = 1.0
+        for seg in self.layout_segments:
+            w = min_w + spare * max(0, seg["size"]) / total
+            rects.append((x, 1.0, w, height - 2.0))
+            x += w
+        return rects
+
+    def _layout_index_at(self, x, y):
+        rects = self._layout_rects(self.layout_area.get_width(), self.layout_area.get_height())
+        for i, (rx, ry, rw, rh) in enumerate(rects):
+            if rx <= x < rx + rw and ry <= y < ry + rh:
+                return i
+        return -1
+
+    def _draw_layout(self, area, cr, width, height):
+        rects = self._layout_rects(width, height)
+        cr.set_font_size(11)
+        if not rects:
+            cr.set_source_rgb(0.5, 0.5, 0.5)
+            cr.move_to(8, height / 2)
+            cr.show_text("No partition information")
+            return
+        for i, (seg, (x, y, w, h)) in enumerate(zip(self.layout_segments, rects)):
+            if i == self.layout_selected:
+                fill, text = (0.21, 0.52, 0.89), (1, 1, 1)
+            elif seg["kind"] == "free":
+                fill, text = (0.92, 0.92, 0.92), (0.1, 0.1, 0.1)
+            elif seg["selectable"]:
+                fill, text = (0.75, 0.75, 0.75), (0.1, 0.1, 0.1)
+            else:
+                fill, text = (0.45, 0.45, 0.45), (1, 1, 1)
+            cr.rectangle(x, y, w, h)
+            cr.set_source_rgb(*fill)
+            cr.fill_preserve()
+            cr.set_source_rgb(0.3, 0.3, 0.3)
+            cr.set_line_width(1)
+            cr.stroke()
+            if w < 16:
+                continue
+            cr.save()
+            cr.rectangle(x + 4, y, w - 8, h)
+            cr.clip()
+            cr.set_source_rgb(*text)
+            ty = y + h / 2 - 4
+            for line in (_segment_name(seg), _human_size(seg["size"])):
+                cr.move_to(x + 6, ty)
+                cr.show_text(line)
+                ty += 16
+            cr.restore()
+
+    def _on_layout_pressed(self, gesture, n_press, x, y):
+        idx = self._layout_index_at(x, y)
+        if idx < 0:
+            return
+        seg = self.layout_segments[idx]
+        if not seg["selectable"]:
+            self.show_toast(f"{_segment_name(seg)} cannot be used: {seg['reason']}")
+            return
+        self.layout_selected = idx
+        self.layout_area.queue_draw()
+        self._update_layout_status()
+        self.update_complete_button_state()
+
+    def _on_layout_query_tooltip(self, area, x, y, keyboard_mode, tooltip):
+        idx = self._layout_index_at(x, y)
+        if idx < 0:
+            return False
+        tooltip.set_text(_segment_tooltip(self.layout_segments[idx]))
+        return True
 
     def on_efi_partition_selected(self, button, partition_path):
         """Handle EFI partition selection for dual boot."""
@@ -825,6 +1212,10 @@ class DiskPage(BaseConfigurationPage):
         self.mode_group.set_visible(False)
         self.fs_group.set_visible(False)
         self.efi_group.set_visible(False)
+        self.layout_group.set_visible(False)
+        self.layout_segments = []
+        self.layout_selected = -1
+        self._layout_disk = None
         self.complete_button.set_sensitive(False)
         
         # Reset radio buttons
@@ -834,6 +1225,7 @@ class DiskPage(BaseConfigurationPage):
         try:
             # Run lsblk directly because disk discovery does not require privileges
             commands = [
+                ["lsblk", "-J", "-b", "-p", "-o", disk_filter.LSBLK_COLUMNS],
                 ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT,TRAN,RO"],
                 ["lsblk", "-J", "-b", "-p", "-o", "NAME,PATH,SIZE,MODEL,TYPE,PKNAME,MOUNTPOINT"],
             ]
@@ -898,29 +1290,14 @@ class DiskPage(BaseConfigurationPage):
             # --- Finished searching for live OS disk ---
 
             # --- Process all detected physical disks ---
+            live_medium = _live_medium_disks()
+            if live_medium:
+                print(f"Hiding live boot medium: {sorted(live_medium)}")
             print("--- Processing detected disks ---")
-            for device in all_block_devices:
-                if (
-                    device.get("type") == "disk"
-                    and int(device.get("ro", 0) or 0) == 0
-                    and not any(s in (device.get("model") or "").upper() for s in ["CD", "DVD"])
-                ):
-                    disk_path = device.get("path")
-                    if not disk_path: continue
-
-                    # Mark disk as unusable only if it's the one hosting the live OS
-                    is_live_os_disk = (disk_path == live_os_disk_path)
-                    
-                    print(f"  Processing disk: {disk_path}, Is Live OS Disk? {is_live_os_disk}")
-
-                    disk_info = {
-                        "name": device.get("name") or "N/A",
-                        "path": disk_path,
-                        "size": device.get("size"),
-                        "model": (device.get("model") or "Unknown Model").strip(),
-                        "is_live_os_disk": is_live_os_disk # Changed flag name
-                    }
-                    self.detected_disks.append(disk_info)
+            for disk_info in disk_filter.installable_disks(all_block_devices, live_medium):
+                disk_info["is_live_os_disk"] = disk_info["path"] == live_os_disk_path
+                print(f"  Processing disk: {disk_info['path']}, Is Live OS Disk? {disk_info['is_live_os_disk']}, Portable? {disk_info['portable']}")
+                self.detected_disks.append(disk_info)
 
             print(f"Detected disks list: {self.detected_disks}")
             self._populate_disk_list()
@@ -980,12 +1357,15 @@ class DiskPage(BaseConfigurationPage):
 
         disk_radio_group = None
         found_usable_disk = False
+        default_path = disk_filter.default_disk(self.detected_disks)
         
         for i, disk in enumerate(self.detected_disks):
             disk_path = disk["path"]
             disk_size_str = format_bytes(disk["size"])
             title = f"{disk['model']} ({disk_path})"
             subtitle = f"Size: {disk_size_str}"
+            if disk.get("portable"):
+                subtitle += " (Removable)"
             
             row = Adw.ActionRow(title=title, subtitle=subtitle)
             
@@ -1001,7 +1381,8 @@ class DiskPage(BaseConfigurationPage):
                  radio = Gtk.CheckButton() if disk_radio_group is None else Gtk.CheckButton(group=disk_radio_group)
                  if disk_radio_group is None:
                      disk_radio_group = radio
-                     radio.set_active(True)  # Select first usable disk by default
+                 if disk_path == default_path:
+                     radio.set_active(True)
                      self.selected_disks.add(disk_path)
                  
                  radio.set_valign(Gtk.Align.CENTER)
@@ -1015,6 +1396,8 @@ class DiskPage(BaseConfigurationPage):
             
         if not found_usable_disk:
              print("Warning: No usable disks detected (only Live OS disk found?).")
+        elif default_path is None:
+             print("No internal disk found. Waiting for the user to pick a disk.")
 
     def on_disk_toggled(self, radio_button, disk_path):
         """Handle disk selection toggle."""
@@ -1024,6 +1407,8 @@ class DiskPage(BaseConfigurationPage):
             print(f"  Adding {disk_path} to selected_disks.")
             self.selected_disks.clear()  # Only one disk at a time for now
             self.selected_disks.add(disk_path)
+            if self.dual_boot_enabled:
+                self._refresh_layout()
         
         self.update_complete_button_state()
 
@@ -1036,7 +1421,8 @@ class DiskPage(BaseConfigurationPage):
         selected_disk = next(iter(self.selected_disks), None) if self.selected_disks else None
         dual_boot_ok = (
             selected_disk in self.disks_with_free_space and
-            self.selected_efi_partition is not None
+            self.selected_efi_partition is not None and
+            self._selected_segment() is not None
         )
         can_proceed = (
             self.scan_completed and 
@@ -1090,127 +1476,88 @@ class DiskPage(BaseConfigurationPage):
 
         if self.partitioning_method in ["normal", "dual_boot"]:
             print(f"  Generating partitioning commands for: {primary_disk}")
-            btrfs_subvolumes = (
-                self.filesystem_type == "btrfs"
-                and self.btrfs_snapshots_row.get_sensitive()
-                and getattr(self, "btrfs_snapshots_enabled", False)
-            )
-            # Detect firmware type to decide partition layout
             is_uefi = os.path.exists("/sys/firmware/efi")
-
-            # Get EFI size if custom formatting is enabled
             efi_size = int(self.efi_size_row.get_value()) if self.custom_format_enabled else 512
-            
-            # Generate the command lists
-            partition_prefix = "p" if "nvme" in primary_disk else ""
-            
-            print(f"=== DISK CONFIGURATION DEBUG ===")
-            print(f"Primary disk: {primary_disk}")
-            print(f"Partition prefix: '{partition_prefix}'")
-            print(f"EFI size: {efi_size} MB")
-            print(f"Filesystem: {self.filesystem_type}")
-            print(f"Dual boot: {self.dual_boot_enabled}")
-            print(f"Preserve EFI: {self.preserve_efi}")
-            print(f"=== GENERATING COMMANDS ===")
-            
-            if not (self.dual_boot_enabled and self.preserve_efi):
-                wipe_cmd = generate_wipefs_command(primary_disk)
-                config_values["commands"].append(wipe_cmd)
-                print(f"Wipe command: {wipe_cmd}")
-            
-            parted_cmds = generate_gpt_commands(
-                primary_disk,
-                efi_size_mb=efi_size,
-                filesystem=self.filesystem_type,
-                dual_boot=self.dual_boot_enabled,
-                preserve_efi=self.preserve_efi if is_uefi else False,
-                bios_mode=not is_uefi,
-                btrfs_subvolumes=btrfs_subvolumes,
-            )
-            config_values["commands"].extend(parted_cmds)
-            print(f"Parted commands: {parted_cmds}")
-            
-            include_efi = is_uefi and not (self.dual_boot_enabled and self.preserve_efi)
-            root_part_override = None
-            if self.dual_boot_enabled and self.preserve_efi:
-                root_part_override = get_next_partition_device(primary_disk, partition_prefix)
-                if not root_part_override:
-                    self.show_toast("Could not determine new partition device for dual boot.")
-                    return
-            mkfs_cmds = generate_mkfs_commands(
-                primary_disk,
-                filesystem=self.filesystem_type,
-                partition_prefix=partition_prefix,
-                dual_boot=self.dual_boot_enabled,
-                preserve_efi=self.preserve_efi if is_uefi else False,
-                include_efi=include_efi,
-                bios_mode=not is_uefi,
-                root_part_override=root_part_override,
-                btrfs_subvolumes=btrfs_subvolumes,
-            )
-            config_values["commands"].extend(mkfs_cmds)
-            print(f"Mkfs commands: {mkfs_cmds}")
-            
-            # Define partition layout
-            part1_suffix = f"{partition_prefix}1"
-            part2_suffix = f"{partition_prefix}2"
-            part3_suffix = f"{partition_prefix}3"
-            
-            print(f"=== PARTITION LAYOUT ===")
-            print(f"Part1 suffix: '{part1_suffix}'")
-            print(f"Part2 suffix: '{part2_suffix}'")
-            
+            commands = []
             partitions = []
-            if is_uefi:
-                if not (self.dual_boot_enabled and self.preserve_efi):
-                    efi_device = f"{primary_disk}{part1_suffix}"
-                    partitions.append({
-                        "device": efi_device,
-                        "mountpoint": "/boot/efi",
-                        "fstype": "vfat"
-                    })
-                    print(f"EFI partition: device={efi_device}, mountpoint=/boot/efi, fstype=vfat")
-                    if btrfs_subvolumes:
-                        boot_device = f"{primary_disk}{part2_suffix}"
-                        root_device = f"{primary_disk}{part3_suffix}"
-                        partitions.append({"device": boot_device, "mountpoint": "/boot", "fstype": "ext4"})
-                        print(f"Boot partition: device={boot_device}, mountpoint=/boot, fstype=ext4")
-                    else:
-                        root_device = f"{primary_disk}{part2_suffix}"
-                elif self.selected_efi_partition:
-                    partitions.append({
-                        "device": self.selected_efi_partition,
-                        "mountpoint": "/boot/efi",
-                        "fstype": "vfat"
-                    })
-                    print(f"Using existing EFI partition: device={self.selected_efi_partition}")
-                    root_device = root_part_override or f"{primary_disk}{partition_prefix}2"
+            boot_part = None
+
+            if self.dual_boot_enabled:
+                if not is_uefi:
+                    self.show_toast("Dual boot requires UEFI firmware.")
+                    return
+                if not self.selected_efi_partition:
+                    self.show_toast("Select an existing EFI partition for dual boot.")
+                    return
+                layout = get_disk_layout(primary_disk)
+                chosen = self._selected_segment()
+                if chosen and self._layout_disk == primary_disk:
+                    chosen = {_segment_key(s): s for s in layout["segments"]}.get(_segment_key(chosen))
                 else:
-                    root_device = root_part_override or f"{primary_disk}{part2_suffix}"
+                    chosen = None
+                if not chosen or not chosen["selectable"]:
+                    self._refresh_layout()
+                    self.show_toast(f"Dual boot needs free space (at least {MIN_FREE_MIB // 1024} GiB) or an unused partition (at least 9 GiB). Select one in the disk layout.")
+                    return
+                partitions.append({
+                    "device": self.selected_efi_partition,
+                    "mountpoint": "/boot/efi",
+                    "fstype": "vfat"
+                })
+                if chosen["kind"] == "part":
+                    root_part = chosen["path"]
+                    expect_devices = [root_part]
+                else:
+                    boot_part = get_next_partition_device(primary_disk)
+                    if not boot_part or os.path.exists(boot_part):
+                        self.show_toast("Could not determine a free partition number for dual boot.")
+                        return
+                    boot_num = int(re.search(r"(\d+)$", boot_part).group(1))
+                    root_part = get_next_partition_device(primary_disk, boot_num)
+                    if not root_part or os.path.exists(root_part):
+                        self.show_toast("Could not determine a free partition number for dual boot.")
+                        return
+                    root_num = int(re.search(r"(\d+)$", root_part).group(1))
+                    start_mib = chosen["start_mib"]
+                    end_mib = chosen["end_mib"]
+                    boot_end_mib = start_mib + BOOT_SIZE_MIB
+                    commands.extend([
+                        _dual_boot_sfdisk_append(primary_disk, boot_num, root_num, start_mib, boot_end_mib, end_mib),
+                        ["partprobe", primary_disk],
+                        ["udevadm", "settle", "--timeout=30"],
+                        ["mkfs.ext4", "-F", boot_part],
+                    ])
+                    partitions.append({"device": boot_part, "mountpoint": "/boot", "fstype": "ext4"})
+                    expect_devices = [boot_part, root_part]
             else:
-                if btrfs_subvolumes:
-                    boot_device = f"{primary_disk}{part2_suffix}"
-                    root_device = f"{primary_disk}{part3_suffix}"
-                    partitions.append({"device": boot_device, "mountpoint": "/boot", "fstype": "ext4"})
-                    print(f"Boot partition: device={boot_device}, mountpoint=/boot, fstype=ext4")
-                else:
-                    root_device = f"{primary_disk}{part2_suffix}"
-            partitions.append({
-                "device": root_device, 
-                "mountpoint": "/", 
-                "fstype": self.filesystem_type
-            })
-            print(f"Root partition: device={root_device}, mountpoint=/, fstype={self.filesystem_type}")
-            
+                boot_part = _part(primary_disk, 2)
+                root_part = _part(primary_disk, 3)
+                if is_uefi:
+                    partitions.append({"device": _part(primary_disk, 1), "mountpoint": "/boot/efi", "fstype": "vfat"})
+                commands.extend([
+                    ["wipefs", "-af", primary_disk],
+                    _sfdisk_cmd(primary_disk, _clean_install_sfdisk_script(is_uefi, efi_size)),
+                    ["partprobe", primary_disk],
+                    ["udevadm", "settle", "--timeout=30"],
+                ])
+                if is_uefi:
+                    commands.append(["mkfs.fat", "-F32", _part(primary_disk, 1)])
+                commands.append(["mkfs.ext4", "-F", boot_part])
+                partitions.append({"device": boot_part, "mountpoint": "/boot", "fstype": "ext4"})
+                expect_devices = [_part(primary_disk, n) for n in (1, 2, 3)]
+
+            commands.append(_mkfs_root_command(self.filesystem_type, root_part))
+            partitions.append({"device": root_part, "mountpoint": "/", "fstype": self.filesystem_type})
+
+            config_values["commands"] = commands
             config_values["partitions"] = partitions
-            
-            print(f"=== FINAL COMMANDS LIST ===")
-            for i, cmd in enumerate(config_values["commands"]):
-                print(f"Command {i+1}: {' '.join(cmd)}")
-            print(f"=== END DISK CONFIGURATION DEBUG ===")
-            
-            if config_values["commands"]:
-                 print(f"    Example command: {' '.join(shlex.quote(c) for c in config_values['commands'][0])}")
+            config_values["separate_boot"] = bool(boot_part)
+            config_values["expect_devices"] = expect_devices
+
+            print("=== FINAL COMMANDS LIST ===")
+            for i, cmd in enumerate(commands):
+                print(f"Command {i+1}: {' '.join(shlex.quote(c) for c in cmd)}")
+            print(f"Partitions: {partitions}")
 
         print("Storage configuration confirmed. Returning to summary.")
         

@@ -272,6 +272,17 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
         elif is_main_page:
             if current_page_name == "summary":
                 # --- Begin Installation --- 
+                if not self.summary_page.accounts_ready():
+                    self.update_navigation()
+                    return
+                self.final_config.pop("accounts", None)
+                if self.summary_page.is_server_install():
+                    try:
+                        self.final_config["accounts"] = self.summary_page.build_accounts_config()
+                    except RuntimeError as e:
+                        print(f"ERROR: {e}")
+                        self.toast_overlay.add_toast(Adw.Toast.new("Could not prepare the account passwords"))
+                        return
                 print("Configuration complete, starting installation progress...")
                 # Navigate first, then start installation with collected data
                 self.navigate_to_page("progress")
@@ -364,7 +375,7 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
             self.next_button.set_label("Begin Installation")
             # Enable only if all required configurations are marked complete
             all_required_complete = all(self.config_state.get(key, False) for key in self.required_configs)
-            self.next_button.set_sensitive(all_required_complete)
+            self.next_button.set_sensitive(all_required_complete and self.summary_page.accounts_ready())
         elif current_page_name == "progress":
             self.next_button.set_label("Installing...")
             self.next_button.set_sensitive(False) # Cannot navigate next from progress

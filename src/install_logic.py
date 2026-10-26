@@ -257,7 +257,44 @@ def _get_device_uuid(device_path):
     return None
 
 
-def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None):
+def _is_separate_boot(target_root):
+    boot = os.path.join(target_root, "boot")
+    try:
+        return os.path.ismount(boot)
+    except OSError:
+        return False
+
+
+def _grub_esp_stub(root_uuid, boot_uuid, separate_boot):
+    lines = [
+        "search --no-floppy --file --set=cfg1 /boot/grub2/grub.cfg",
+        "search --no-floppy --file --set=cfg2 /grub2/grub.cfg",
+    ]
+    if boot_uuid:
+        lines.append("search --no-floppy --fs-uuid --set=bootfs %s" % boot_uuid)
+    if root_uuid:
+        lines.append("search --no-floppy --fs-uuid --set=rootfs %s" % root_uuid)
+    lines.extend([
+        "if [ -n \"$bootfs\" ]; then",
+        "  set root=$bootfs",
+        "  set prefix=($root)%s" % ("/grub2" if separate_boot else "/boot/grub2"),
+        "elif [ -n \"$rootfs\" ]; then",
+        "  set root=$rootfs",
+        "  set prefix=($root)/boot/grub2",
+        "elif [ -n \"$cfg1\" ]; then",
+        "  set root=$cfg1",
+        "  set prefix=($root)/boot/grub2",
+        "elif [ -n \"$cfg2\" ]; then",
+        "  set root=$cfg2",
+        "  set prefix=($root)/grub2",
+        "fi",
+        "configfile $prefix/grub.cfg",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, progress_callback=None, boot_partition_device=None, portable=False):
     """Install UEFI bootloader to match Anaconda/Oreon: EFI/<vendor> (e.g. almalinux),
     signed shim+grub from host, stub grub.cfg on ESP.
     Mounts the target ESP to a private temp dir so we always write to the correct partition."""
@@ -325,38 +362,27 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
             return False, err or "Failed to copy grub to EFI/BOOT", None
 
-        # When boot_partition_device given (separate /boot), use its UUID so GRUB reads from /boot partition
+        separate_boot = bool(boot_partition_device) or _is_separate_boot(target_root)
+        root_uuid = _get_root_uuid(target_root)
+        boot_uuid = None
         if boot_partition_device:
-            uuid = _get_device_uuid(boot_partition_device)
-            if not uuid:
-                uuid = _get_boot_uuid(target_root)
-            prefix_path = "/grub2"  # /boot partition root has grub2/
-        else:
-            uuid = _get_root_uuid(target_root)
-            prefix_path = "/boot/grub2"
-        cfg_hint = "/grub2/grub.cfg" if prefix_path == "/grub2" else "/boot/grub2/grub.cfg"
-        # Robust stub: prefer fs_uuid when available, but always include a file-based
-        # fallback so installation remains bootable even when UUID detection is flaky in
-        # installer mount states.
-        if uuid:
-            stub_cfg = (
-                "search --no-floppy --fs-uuid --set=root %s\n"
-                "if [ -z \"$root\" ]; then\n"
-                "  search --no-floppy --file --set=root %s\n"
-                "fi\n"
-                "set prefix=($root)%s\n"
-                "configfile $prefix/grub.cfg\n"
-            ) % (uuid, cfg_hint, prefix_path)
-        else:
-            stub_cfg = (
-                "search --no-floppy --file --set=root %s\n"
-                "set prefix=($root)%s\n"
-                "configfile $prefix/grub.cfg\n"
-            ) % (cfg_hint, prefix_path)
+            boot_uuid = _get_device_uuid(boot_partition_device)
+        if not boot_uuid and separate_boot:
+            boot_uuid = _get_boot_uuid(target_root)
+        stub_cfg = _grub_esp_stub(root_uuid, boot_uuid, separate_boot)
         efi_grub_cfg = os.path.join(efi_dir, "grub.cfg")
         if not _write_file_as_root(efi_grub_cfg, stub_cfg, progress_callback):
             _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
             return False, "Failed to write stub grub.cfg on ESP", None
+        if portable:
+            if not _write_file_as_root(os.path.join(efi_boot, "grub.cfg"), stub_cfg, progress_callback):
+                _run_command(["umount", tmp_mount], "Unmount ESP", progress_callback, timeout=15)
+                return False, "Failed to write stub grub.cfg to EFI/BOOT", None
+            _run_command(
+                ["rm", "-f", os.path.join(efi_boot, "fb%s.efi" % (arch.get("efi_suffix") or "x64"))],
+                "Remove shim fallback from EFI/BOOT",
+                progress_callback,
+            )
 
         try:
             os.sync()
@@ -370,6 +396,10 @@ def _install_uefi_bootloader(target_root, primary_disk, efi_partition_device, pr
             os.rmdir(tmp_mount)
         except Exception:
             pass
+
+    if portable:
+        print("Removable target: skipping NVRAM boot entry.")
+        return True, "", efi_install_id
 
     # NVRAM: point to shim in vendor dir
     match = (re.match(r"(/dev/[a-zA-Z]+)(\d+)", efi_partition_device) or
@@ -535,11 +565,14 @@ def install_bootloader(target_root, primary_disk, efi_partition_device, progress
     if progress_callback:
         progress_callback("Installing bootloader (%s)..." % ("UEFI" if uefi else "BIOS"), None)
 
+    from backend import disk_is_portable
+    portable = disk_is_portable(primary_disk)
     efi_install_id = BOOTLOADER_ID
     if uefi:
         ok, err, efi_install_id = _install_uefi_bootloader(
             target_root, primary_disk, efi_partition_device, progress_callback,
-            boot_partition_device=boot_partition_device
+            boot_partition_device=boot_partition_device,
+            portable=portable,
         )
         if efi_install_id is None:
             efi_install_id = BOOTLOADER_ID

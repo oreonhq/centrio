@@ -21,6 +21,8 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw
 
+import accounts
+
 
 class SummaryPage(Adw.PreferencesPage):
     def __init__(self, main_window, **kwargs):
@@ -79,6 +81,8 @@ class SummaryPage(Adw.PreferencesPage):
         self.add(software_group)
         self._add_config_row(software_group, "payload", "Software Packages", "Package selection and repositories", True)
 
+        self._build_account_group()
+
         # --- Installation Ready Status ---
         self.status_group = Adw.PreferencesGroup(
             title="Installation Status"
@@ -92,6 +96,145 @@ class SummaryPage(Adw.PreferencesPage):
         self.status_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
         self.ready_status_row.add_prefix(self.status_icon)
         self.status_group.add(self.ready_status_row)
+
+    def _build_account_group(self):
+        self.account_touched = set()
+        self.account_group = Adw.PreferencesGroup(
+            title="Server Accounts",
+            description="Server installs have no setup wizard. Create a user, enable root, or both."
+        )
+        self.add(self.account_group)
+
+        self.user_switch = Adw.SwitchRow(title="Create a user account")
+        self.user_switch.set_active(True)
+        self.account_group.add(self.user_switch)
+        self.full_name_row = Adw.EntryRow(title="Full name")
+        self.account_group.add(self.full_name_row)
+        self.username_row = Adw.EntryRow(title="Username")
+        self.account_group.add(self.username_row)
+        self.username_error = self._make_error_label()
+        self.user_password_row = Adw.PasswordEntryRow(title="Password")
+        self.account_group.add(self.user_password_row)
+        self.user_confirm_row = Adw.PasswordEntryRow(title="Confirm password")
+        self.account_group.add(self.user_confirm_row)
+        self.user_password_error = self._make_error_label()
+        self.admin_row = Adw.ActionRow(title="Administrator", subtitle="Add this user to the wheel group")
+        self.admin_check = Gtk.CheckButton()
+        self.admin_check.set_active(True)
+        self.admin_check.set_valign(Gtk.Align.CENTER)
+        self.admin_row.add_suffix(self.admin_check)
+        self.admin_row.set_activatable_widget(self.admin_check)
+        self.account_group.add(self.admin_row)
+
+        self.root_switch = Adw.SwitchRow(title="Enable the root account")
+        self.root_switch.set_active(False)
+        self.account_group.add(self.root_switch)
+        self.root_password_row = Adw.PasswordEntryRow(title="Root password")
+        self.account_group.add(self.root_password_row)
+        self.root_confirm_row = Adw.PasswordEntryRow(title="Confirm root password")
+        self.account_group.add(self.root_confirm_row)
+        self.root_password_error = self._make_error_label()
+        self.general_error = self._make_error_label()
+
+        for row, name in (
+            (self.full_name_row, "full_name"),
+            (self.username_row, "username"),
+            (self.user_password_row, "user_password"),
+            (self.user_confirm_row, "user_password"),
+            (self.root_password_row, "root_password"),
+            (self.root_confirm_row, "root_password"),
+        ):
+            row.connect("changed", self._on_account_field_changed, name)
+        self.user_switch.connect("notify::active", self._on_account_switch_changed)
+        self.root_switch.connect("notify::active", self._on_account_switch_changed)
+        self.admin_check.connect("toggled", lambda *_: self.main_window.update_navigation())
+        self._refresh_account_group()
+
+    def _make_error_label(self):
+        label = Gtk.Label(xalign=0, wrap=True)
+        label.add_css_class("error")
+        label.add_css_class("caption")
+        label.set_margin_top(6)
+        label.set_margin_start(12)
+        label.set_visible(False)
+        self.account_group.add(label)
+        return label
+
+    def is_server_install(self):
+        payload = self.main_window.final_config.get("payload") or {}
+        return bool(payload.get("server_install", False))
+
+    def _account_errors(self):
+        return accounts.validate_accounts(
+            self.user_switch.get_active(),
+            self.username_row.get_text(),
+            self.user_password_row.get_text(),
+            self.user_confirm_row.get_text(),
+            self.root_switch.get_active(),
+            self.root_password_row.get_text(),
+            self.root_confirm_row.get_text(),
+        )
+
+    def accounts_ready(self):
+        if not self.is_server_install():
+            return True
+        return not self._account_errors()
+
+    def build_accounts_config(self):
+        return accounts.build_accounts_config(
+            self.user_switch.get_active(),
+            self.full_name_row.get_text().strip(),
+            self.username_row.get_text(),
+            self.user_password_row.get_text(),
+            self.admin_check.get_active(),
+            self.root_switch.get_active(),
+            self.root_password_row.get_text(),
+        )
+
+    def _on_account_field_changed(self, row, name):
+        self.account_touched.add(name)
+        self._refresh_account_group()
+        self.main_window.update_navigation()
+
+    def _on_account_switch_changed(self, *_args):
+        self._refresh_account_group()
+        self.main_window.update_navigation()
+
+    def _refresh_account_group(self):
+        server = self.is_server_install()
+        self.account_group.set_visible(server)
+        user_on = self.user_switch.get_active()
+        root_on = self.root_switch.get_active()
+        for row in (self.full_name_row, self.username_row, self.user_password_row, self.user_confirm_row, self.admin_row):
+            row.set_visible(user_on)
+        for row in (self.root_password_row, self.root_confirm_row):
+            row.set_visible(root_on)
+        errors = self._account_errors() if server else {}
+        self._show_error(self.username_error, errors.get("username"), user_on and "username" in self.account_touched)
+        self._show_error(self.user_password_error, errors.get("user_password"), user_on and "user_password" in self.account_touched)
+        self._show_error(self.root_password_error, errors.get("root_password"), root_on and "root_password" in self.account_touched)
+        self._show_error(self.general_error, errors.get("general"), True)
+        if hasattr(self, "ready_status_row"):
+            self._update_installation_status()
+
+    def _show_error(self, label, message, allowed):
+        visible = bool(message) and allowed
+        label.set_text(message or "")
+        label.set_visible(visible)
+        for row in self._rows_for_error(label):
+            if visible:
+                row.add_css_class("error")
+            else:
+                row.remove_css_class("error")
+
+    def _rows_for_error(self, label):
+        if label is self.username_error:
+            return (self.username_row,)
+        if label is self.user_password_error:
+            return (self.user_password_row, self.user_confirm_row)
+        if label is self.root_password_error:
+            return (self.root_password_row, self.root_confirm_row)
+        return ()
 
     def _add_config_row(self, group, key, title, subtitle_base, required):
         row = Adw.ActionRow(title=title)
@@ -158,6 +301,8 @@ class SummaryPage(Adw.PreferencesPage):
             config["icon_widget"] = new_icon_widget
             
         # Update overall installation status
+        if hasattr(self, "account_group"):
+            self._refresh_account_group()
         self._update_installation_status()
     
     def _update_installation_status(self):
@@ -172,7 +317,13 @@ class SummaryPage(Adw.PreferencesPage):
         total_required = len(required_keys)
         completed_count = len(completed_required)
         
-        if completed_count == total_required:
+        if completed_count == total_required and not self.accounts_ready():
+            self.ready_status_row.set_title("Accounts Required")
+            self.ready_status_row.set_subtitle("Set up a server user account or a root password")
+            self.status_icon.set_from_icon_name("dialog-warning-symbolic")
+            self.ready_status_row.add_css_class("warning")
+            self.ready_status_row.remove_css_class("success")
+        elif completed_count == total_required:
             # All required items completed
             self.ready_status_row.set_title("Ready for Installation")
             self.ready_status_row.set_subtitle(f"All required settings configured ({completed_count}/{total_required})")
