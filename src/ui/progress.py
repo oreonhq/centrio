@@ -164,9 +164,9 @@ class ProgressPage(Gtk.Box):
             self.installation_error = f"Invalid or missing partitioning method: {method}"
             return False
 
+        primary_disk = target_disks[0] if target_disks else None
+        expect_devices = disk_config.get("expect_devices") or [p.get("device") for p in partitions if p.get("device")]
         if automatic_mode and target_disks:
-            primary_disk = target_disks[0]
-            
             if dual_boot:
                 if preserve_efi:
                     self._update_progress_text(f"Preparing disk {primary_disk} for dual boot installation...", 0.01)
@@ -174,161 +174,27 @@ class ProgressPage(Gtk.Box):
                     self._update_progress_text(f"Preparing disk {primary_disk} for dual boot (new EFI)...", 0.01)
             else:
                 self._update_progress_text(f"Preparing disk {primary_disk} for clean installation...", 0.01)
-            
+
             # --- Stop udisks2 --- 
             stop_success, stop_err = backend._stop_service("udisks2.service")
             if not stop_success:
-                 # Log warning but continue, maybe it wasn't running
                  print(f"Warning: Failed to stop udisks2 service (continuing): {stop_err}")
             else:
                  print("Stopped udisks2 service temporarily.")
-                 time.sleep(1) # Give it a moment
+                 time.sleep(1)
 
-            swap_ok, swap_err = backend.swapoff_on_disk(primary_disk, self._update_progress_text)
-            if not swap_ok:
-                self.installation_error = (
-                    f"Could not turn off swap on the target disk. Close anything using it and retry. Details: {swap_err}"
-                )
-                return False
-                 
-            # --- Deactivate LVM --- 
-            lvm_success, lvm_err = backend._deactivate_lvm_on_disk(primary_disk, self._update_progress_text)
-            if not lvm_success:
-                 # Log warning but proceed cautiously
-                 print(f"Warning: Failed to fully deactivate LVM on {primary_disk} (continuing): {lvm_err}")
-            else:
-                 print(f"LVM deactivation check complete for {primary_disk}.")
-                 
-            # --- Pre-emptive Unmount --- 
-            if dual_boot and preserve_efi:
-                self._update_progress_text(f"Checking mounts on {primary_disk} (preserving EFI)...", 0.02)
-            else:
-                self._update_progress_text(f"Checking existing mounts on {primary_disk}...", 0.02)
-                
-            mount_targets_to_check = set()
-            device_paths_to_check = set([primary_disk])
+            if not dual_boot:
+                rel_ok, rel_err = backend.release_disk_for_install(primary_disk, self._update_progress_text)
+                if not rel_ok:
+                    self.installation_error = rel_err
+                    return False
+                backend.forget_kernel_partitions(primary_disk, self._update_progress_text)
+
+            backend._start_service("systemd-udevd.service")
             try:
-                # Get all related device paths (disk + partitions)
-                lsblk_cmd = ["lsblk", "-n", "-o", "PATH", "--raw", primary_disk]
-                print(f"  Running: {' '.join(lsblk_cmd)}")
-                lsblk_result = subprocess.run(lsblk_cmd, capture_output=True, text=True, check=False, timeout=10)
-                if lsblk_result.returncode == 0:
-                    found_paths = [line.strip() for line in lsblk_result.stdout.split('\n') if line.strip()]
-                    print(f"  lsblk identified potential device paths: {found_paths}")
-                    device_paths_to_check.update(found_paths)
-                else:
-                    print(f"  Warning: lsblk failed for {primary_disk} (rc={lsblk_result.returncode}), proceeding with just the base disk path.")
-                
-                # Check each device path for mounts using findmnt
-                print(f"  Checking for mounts on paths: {list(device_paths_to_check)}")
-                for dev_path in device_paths_to_check:
-                    findmnt_cmd = ["findmnt", "-n", "-r", "-o", "TARGET", f"--source={dev_path}"]
-                    result = subprocess.run(findmnt_cmd, capture_output=True, text=True, check=False, timeout=10)
-                    if result.returncode == 0 and result.stdout.strip():
-                        mount_points = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-                        print(f"    findmnt identified mount points for source {dev_path}: {mount_points}")
-                        mount_targets_to_check.update(mount_points)
-
-            except Exception as e:
-                print(f"Warning: lsblk failed, proceeding with only {primary_disk}")
-            
-            try:
-                # Sync before checking lsof
-                try: subprocess.run(["sync"], check=False, timeout=5) 
-                except Exception: pass
-                # Check each mount point for active processes using lsof
-                print(f"Running lsof on paths: {list(mount_targets_to_check)} to check for busy resources...")
-                for path in sorted(list(mount_targets_to_check), reverse=True):
-                    print(f"  Checking lsof on {path}...")
-                    lsof_cmd = ["lsof", path]
-                    lsof_success, lsof_err, lsof_stdout = backend._run_command(lsof_cmd, f"Check Processes on {path}", timeout=15)
-                    
-                    if lsof_stdout:
-                        err_msg_detail = f"Device path {path} is busy. Processes found by lsof:\n{lsof_stdout}"
-                        print(f"ERROR: {err_msg_detail}")
-                        self.installation_error = err_msg_detail
-                        return False # Fail immediately
-                    elif not lsof_success and ("Cannot run program" in lsof_err or "Command not found" in lsof_err):
-                        print(f"  Warning: lsof command not found for check on {path}.")
-                    # else: lsof check passed for this path
-
-            except Exception as e:
-                print(f"Warning: findmnt check failed: {e}")
-                
-            # --- Attempt Unmount --- 
-            unmount_failed = False
-            if mount_targets_to_check:
-                print(f"  Attempting to unmount: {sorted(list(mount_targets_to_check))}")
-                for path in sorted(list(mount_targets_to_check), reverse=True):
-                    print(f"    Unmounting {path}...")
-                    try:
-                        try: subprocess.run(["sync"], check=False, timeout=5)
-                        except Exception: pass
-                        ok, err, _ = backend._run_command(["umount", path], f"Unmount {path}", timeout=10)
-                        if ok:
-                            print(f"      Successfully unmounted {path}")
-                            time.sleep(1)
-                        else:
-                            print(f"      Warning: Failed standard unmount {path}. Trying lazy unmount...")
-                            try: subprocess.run(["sync"], check=False, timeout=5)
-                            except Exception: pass
-                            ok_lazy, err_lazy, _ = backend._run_command(["umount", "-l", path], f"Lazy unmount {path}", timeout=10)
-                            if ok_lazy:
-                                print(f"        Lazy unmount successful for {path}")
-                                time.sleep(1)
-                            else:
-                                lazy_err_msg = f"Failed to unmount {path} even with lazy option: {err_lazy}"
-                                print(f"      ERROR: {lazy_err_msg}")
-                                self.installation_error = lazy_err_msg
-                                unmount_failed = True
-                    except Exception as std_e:
-                        std_err_msg = f"Error during unmount of {path}: {std_e}"
-                        print(f"      ERROR: {std_err_msg}")
-                        self.installation_error = std_err_msg
-                        unmount_failed = True
-                        break
-            else:
-                print("  No active mount points identified to unmount.")
-                
-            # Add explicit unmount attempt on the base device itself
-            print(f"Attempting final unmount on base device {primary_disk}...")
-            try:
-                 # Sync before final base unmount
-                 try: subprocess.run(["sync"], check=False, timeout=5) 
-                 except Exception: pass
-                 backend._run_command(["umount", primary_disk], f"Unmount {primary_disk}", timeout=10)
-            except Exception as base_umount_e:
-                 print(f"  Warning: Error during final base device umount: {base_umount_e}")
-                 
-            if unmount_failed: # Check result from loop above
-                 return False
-
-            # Do not partprobe here. partprobe before wipefs makes the kernel reattach
-            # partition nodes and often leaves the whole disk busy on bare metal.
-
-            # Add dmsetup remove
-            dm_success, dm_warn = backend._remove_dm_mappings(primary_disk, self._update_progress_text)
-            if not dm_success: # Should always return True, but check anyway
-                 print(f"Warning: dmsetup removal step indicated failure (ignored): {dm_warn}")
-            if dm_warn: print(f"Note: {dm_warn}")
-            time.sleep(0.5)
-                 
-            print("Running udevadm settle...")
-            try:
-                subprocess.run(["udevadm", "settle"], check=False, timeout=15)
-                print("  Udev settle complete.")
-            except FileNotFoundError:
-                 print("Warning: udevadm not found, cannot settle udev queue.")
+                subprocess.run(["udevadm", "settle", "--timeout=30"], check=False, timeout=40)
             except Exception as settle_e:
-                 print(f"Warning: Error running udevadm settle: {settle_e}")
-                 
-            print("Running sync command to flush buffers...")
-            try:
-                subprocess.run(["sync"], check=False, timeout=15)
-                print("  Sync complete.")
-                time.sleep(1) # Small pause after sync
-            except Exception as sync_e:
-                 print(f"Warning: Error running sync: {sync_e}")
+                print(f"Warning: Error running udevadm settle: {settle_e}")
 
             self._update_progress_text("Disk checks complete.", 0.04)
 
@@ -337,97 +203,47 @@ class ProgressPage(Gtk.Box):
             if not commands:
                 self.installation_error = "Automatic partitioning selected, but no commands were generated."
                 return False
-                
+
             self._update_progress_text("Preparing storage devices...", 0.05)
-            
+
             for i, cmd_list in enumerate(commands):
                 cmd_name = cmd_list[0]
-                progress_fraction = 0.1 + (0.20 * (i / len(commands))) # Adjusted fraction range
-                
-                # --- Final LSOF Check + Delay JUST before wipefs --- 
-                if cmd_name == "wipefs" and primary_disk and primary_disk in cmd_list:
-                    so2_ok, so2_err = backend.swapoff_on_disk(primary_disk, self._update_progress_text)
-                    if not so2_ok:
-                        self.installation_error = (
-                            f"Could not turn off swap on the target disk before wiping. Details: {so2_err}"
-                        )
-                        return False
-                    print(f"--- Performing FINAL check before {cmd_name} on {primary_disk} ---")
-                    lsof_found_processes = False
-                    # Get device paths again in case partprobe changed them
-                    final_device_paths_to_lsof = set([primary_disk])
-                    try:
-                        lsblk_cmd = ["lsblk", "-n", "-o", "PATH", "--raw", primary_disk]
-                        lsblk_result = subprocess.run(lsblk_cmd, capture_output=True, text=True, check=False, timeout=10)
-                        if lsblk_result.returncode == 0:
-                            final_device_paths_to_lsof.update([line.strip() for line in lsblk_result.stdout.split('\n') if line.strip()])
-                    except Exception: pass # Ignore lsblk failure here
-                    
-                    print(f"Running final lsof on paths: {list(final_device_paths_to_lsof)}...")
-                    # Sync before final lsof
-                    try: subprocess.run(["sync"], check=False, timeout=5) 
-                    except Exception: pass
-                    for dev_path in final_device_paths_to_lsof:
-                        lsof_cmd = ["lsof", dev_path]
-                        lsof_success, lsof_err, lsof_stdout = backend._run_command(lsof_cmd, f"Final Check on {dev_path}", timeout=15)
-                        if lsof_stdout:
-                            err_msg_detail = f"FINAL CHECK FAILED: Path {dev_path} is busy:\n{lsof_stdout}"
-                            print(f"ERROR: {err_msg_detail}")
-                            self.installation_error = err_msg_detail
-                            return False # Fail immediately
-                        elif not lsof_success and ("Cannot run program" in lsof_err or "Command not found" in lsof_err):
-                            print(f"  Warning: lsof command not found for final check on {dev_path}.")
-                        # else: lsof check passed for this path
-                        
-                    if not lsof_found_processes: # Should always be False if we got here
-                         print(f"  Final lsof checks passed for all paths.")
-                         print(f"Adding 4 second delay before executing {cmd_name}...")
-                         try: subprocess.run(["sync"], check=False, timeout=5)
-                         except Exception: pass
-                         time.sleep(4)
-                         try: subprocess.run(["sync"], check=False, timeout=5) # Sync after delay
-                         except Exception: pass
-                    else:
-                         # This case should not be reached due to return above
-                         return False 
-                
-                # --- Execute command --- 
+                if cmd_name == "bash" and any("sfdisk" in c for c in cmd_list):
+                    cmd_name = "sfdisk"
+                if cmd_name == "udevadm" and "settle" in cmd_list:
+                    cmd_list = ["udevadm", "settle", "--timeout=30"]
+                progress_fraction = 0.1 + (0.20 * (i / len(commands)))
+
                 quoted_cmd = ' '.join(shlex.quote(c) for c in cmd_list)
                 print(f"--- ABOUT TO EXECUTE STORAGE COMMAND: {quoted_cmd} ---")
-                
-                self._update_progress_text(f"Running: {cmd_name}...", progress_fraction)
-                success, err, _ = backend._run_command(cmd_list, f"Storage Step: {cmd_name}", self._update_progress_text, timeout=120) # Increased timeout for mkfs/parted
-                if not success:
-                    self.installation_error = err
-                    # Should we restart udisks2 here on failure?
-                    # backend._start_service("udisks2.service") # Maybe add this?
-                    return False
 
-                if cmd_name == "wipefs" and primary_disk and primary_disk in cmd_list:
-                    print(f"Running partprobe on {primary_disk} after wipefs...")
-                    try:
-                        pp_success, pp_err, _ = backend._run_command(
-                            ["partprobe", primary_disk],
-                            f"Reread partitions on {primary_disk} after wipefs",
-                            self._update_progress_text,
-                            timeout=30,
-                        )
-                        if not pp_success:
-                            print(f"  Warning: partprobe after wipefs failed: {pp_err}")
-                        time.sleep(1)
-                    except Exception as pp_e:
-                        print(f"Warning: Error running partprobe after wipefs: {pp_e}")
-                    try:
-                        subprocess.run(["udevadm", "settle"], check=False, timeout=15)
-                    except FileNotFoundError:
-                        pass
-                    except Exception as settle_e:
-                        print(f"Warning: udevadm settle after wipefs: {settle_e}")
-                    try:
-                        subprocess.run(["sync"], check=False, timeout=15)
-                    except Exception:
-                        pass
-                    
+                self._update_progress_text(f"Running: {cmd_name}...", progress_fraction)
+                success, err, _ = backend._run_command(cmd_list, f"Storage Step: {cmd_name}", self._update_progress_text, timeout=120)
+                if success:
+                    continue
+                if cmd_name in ("sfdisk", "parted") and backend.table_written_kernel_busy(err):
+                    print(f"Partition table written but kernel reports busy; rereading: {err}")
+                    vis_ok, vis_err = backend.ensure_partitions_visible(
+                        primary_disk, expect_devices, self._update_progress_text, release=not dual_boot
+                    )
+                    if vis_ok:
+                        continue
+                    self.installation_error = f"{err}\n{vis_err}"
+                    return False
+                if cmd_name == "partprobe":
+                    if backend.partition_nodes_ready(expect_devices):
+                        print(f"partprobe failed but partitions are visible (continuing): {err}")
+                        continue
+                    vis_ok, vis_err = backend.ensure_partitions_visible(
+                        primary_disk, expect_devices, self._update_progress_text, release=not dual_boot
+                    )
+                    if vis_ok:
+                        continue
+                    self.installation_error = f"{err}\n{vis_err}"
+                    return False
+                self.installation_error = err
+                return False
+
             self._update_progress_text("Partitioning and formatting complete.", 0.30) # End fraction adjusted
             
             # --- Verify partitions were created successfully ---
@@ -745,6 +561,8 @@ class ProgressPage(Gtk.Box):
             progress_callback=setup_cb,
             server_install=server_install,
             btrfs_subvolumes=btrfs_subvolumes,
+            separate_boot=bool((self.disk_config or {}).get("separate_boot", False)),
+            portable=backend.disk_is_portable(((self.disk_config or {}).get("target_disks") or [None])[0]),
         )
         
         if not success:
@@ -775,7 +593,8 @@ class ProgressPage(Gtk.Box):
         ])
         extra_packages = [p for p in packages if p not in _CORE_PACKAGES]
         # BTRFS snapper packages need DNF when subvolumes enabled
-        has_extra_work = bool(extra_packages or repositories or flatpak_enabled or flatpak_packages or btrfs_subvolumes)
+        browser_rpm = payload_config.get("browser_rpm")
+        has_extra_work = bool(extra_packages or repositories or flatpak_enabled or flatpak_packages or btrfs_subvolumes or browser_rpm)
         
         print(f"Additional packages check:")
         print(f"  packages (extra only): {extra_packages}")
@@ -825,6 +644,7 @@ class ProgressPage(Gtk.Box):
                 "flatpak_enabled": flatpak_enabled,
                 "flatpak_packages": flatpak_packages,
                 "nvidia_drivers": payload_config.get("nvidia_drivers", False),
+                "browser_rpm": browser_rpm,
                 "server_install": payload_config.get("server_install", False),
                 "minimal_install": False,
                 "keep_cache": True,
@@ -920,6 +740,22 @@ class ProgressPage(Gtk.Box):
             return False
         return True
 
+    def _configure_server_accounts(self, config_data):
+        if self.stop_requested:
+            return False
+        if not config_data.get("payload", {}).get("server_install", False):
+            return True
+        self._update_progress_text("Creating accounts...", 0.83)
+        success, err = backend.configure_server_accounts(
+            self.target_root,
+            config_data.get("accounts"),
+            progress_callback=self._update_progress_text,
+        )
+        if not success:
+            self.installation_error = err or "Failed to create accounts"
+            return False
+        return True
+
     def _generate_fstab(self, config_data):
         """Generate /etc/fstab in the target root after copying the system."""
         if self.stop_requested: return False, "Stop requested"
@@ -991,7 +827,7 @@ class ProgressPage(Gtk.Box):
         """Start the actual installation process sequentially."""
         self.main_window = main_window # Store ref for navigation
         self.stop_requested = False # Reset stop flag
-        print("Starting installation with config:", config_data)
+        print("Starting installation with config:", {k: v for k, v in config_data.items() if k != "accounts"})
         self.progress_value = 0.0
         self.installation_error = None 
         self.progress_bar.set_fraction(0.0)
@@ -1011,6 +847,7 @@ class ProgressPage(Gtk.Box):
              (self._generate_fstab,             config_data,             0.75,  0.76),  # fstab
              (self._configure_system,           config_data,             0.76,  0.82),  # 6% config
              (self._remove_live_users_and_configure_oobe, config_data,   0.82,  0.83),  # live user removal + OOBE
+             (self._configure_server_accounts,  config_data,             0.83,  0.83),
              (self._install_bootloader,         config_data,             0.83,  0.97),  # bootloader
         ]
         

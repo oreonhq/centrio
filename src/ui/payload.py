@@ -256,13 +256,13 @@ class PayloadPage(BaseConfigurationPage):
         )
         self.add(self.browser_section)
         BROWSERS = [
-            ("firefox", "Firefox", "org.mozilla.firefox", "firefox.svg"),
-            ("chrome", "Chrome", "com.google.Chrome", "chrome.svg"),
-            ("brave", "Brave", "com.brave.Browser", "brave.svg"),
-            ("edge", "Edge", "com.microsoft.Edge", "edge.svg"),
-            ("none", "No web browser", None, None),
+            ("firefox", "Firefox", None, "firefox.svg", "firefox"),
+            ("chrome", "Chrome", "com.google.Chrome", "chrome.svg", None),
+            ("brave", "Brave", "com.brave.Browser", "brave.svg", None),
+            ("edge", "Edge", "com.microsoft.Edge", "edge.svg", None),
+            ("none", "No web browser", None, None, None),
         ]
-        self.browser_options = {b[0]: {"name": b[1], "flatpak": b[2], "icon_file": b[3]} for b in BROWSERS}
+        self.browser_options = {b[0]: {"name": b[1], "flatpak": b[2], "icon_file": b[3], "rpm": b[4]} for b in BROWSERS}
         self.selected_browser = "none"
         self.browser_rows = {}
         self.browser_radios = {}
@@ -456,7 +456,9 @@ class PayloadPage(BaseConfigurationPage):
     def _refresh_flatpak_dependent(self):
         """Gray out Flatpak-dependent options when Flatpak is disabled."""
         enabled = self.flatpak_enabled and not self.server_install
-        self.browser_section.set_sensitive(enabled)
+        self.browser_section.set_sensitive(not self.server_install)
+        for bid, row in self.browser_rows.items():
+            row.set_sensitive(enabled or not self.browser_options[bid]["flatpak"])
         for gid, ginfo in self.package_groups.items():
             if ginfo.get("flatpak_packages") and gid in self.package_group_rows:
                 row = self.package_group_rows[gid]
@@ -469,7 +471,7 @@ class PayloadPage(BaseConfigurationPage):
         """Handle Flatpak toggle."""
         self.flatpak_enabled = switch_row.get_active()
         self._refresh_flatpak_dependent()
-        if not self.flatpak_enabled:
+        if not self.flatpak_enabled and self.browser_options.get(self.selected_browser, {}).get("flatpak"):
             self.selected_browser = "none"
             for bid, radio in self.browser_radios.items():
                 radio.set_active(bid == "none")
@@ -586,6 +588,9 @@ class PayloadPage(BaseConfigurationPage):
             selected_packages = [p for p in selected_packages if p not in custom_set]
         enabled_repos = [] if not has_network else self._get_enabled_repositories()
         flatpak_enabled_effective = self.flatpak_enabled and has_network
+        browser_rpm = None
+        if has_network and not self.server_install:
+            browser_rpm = self.browser_options.get(self.selected_browser, {}).get("rpm")
         
         print(f"  Selected packages ({len(selected_packages)}): {selected_packages[:10]}{'...' if len(selected_packages) > 10 else ''}")
         print(f"  Flatpak packages ({len(flatpak_packages)}): {flatpak_packages}")
@@ -601,6 +606,7 @@ class PayloadPage(BaseConfigurationPage):
             "repositories": enabled_repos,
             "flatpak_enabled": flatpak_enabled_effective,
             "nvidia_drivers": self.nvidia_drivers,
+            "browser_rpm": browser_rpm,
             "server_install": self.server_install,
             "custom_packages": self.custom_packages,
             "oem_repo_url": self.oem_repo_url,
