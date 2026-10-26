@@ -392,6 +392,68 @@ def write_file_as_root(path, content, progress_callback=None):
             pass
 
 
+CHROOT_UMOUNT_TIMEOUT = 20
+
+_KILL_CHROOT_SCRIPT = r'''
+r="$1"
+sig="$2"
+for p in /proc/[0-9]*; do
+    l=$(readlink "$p/root" 2>/dev/null) || continue
+    case "$l" in
+        "$r"|"$r"/*) kill "-$sig" "${p#/proc/}" 2>/dev/null && echo "${p#/proc/}" ;;
+    esac
+done
+exit 0
+'''
+
+
+def _kill_chroot_processes(target_root):
+    root_real = os.path.realpath(target_root)
+    if root_real == "/":
+        return
+    gpgconf = os.path.join(root_real, "usr/bin/gpgconf")
+    if os.path.exists(gpgconf):
+        _run_command(["chroot", root_real, "gpgconf", "--kill", "all"], "Stop gpg agents in target", None, timeout=15)
+    for sig in ("TERM", "KILL"):
+        ok, _, out = _run_command(["sh", "-c", _KILL_CHROOT_SCRIPT, "sh", root_real, sig], f"Stop leftover processes in target ({sig})", None, timeout=15)
+        pids = (out or "").split() if ok else []
+        if not pids:
+            break
+        print(f"  Sent SIG{sig} to leftover processes in {root_real}: {' '.join(pids)}")
+        time.sleep(1)
+
+
+def _unmount_with_fallback(mount_target, timeout=CHROOT_UMOUNT_TIMEOUT):
+    ok, err, _ = _run_command(["umount", "-R", mount_target], f"Unmount {mount_target}", None, timeout=timeout)
+    if ok:
+        return True
+    if "not mounted" in (err or "").lower():
+        return True
+    print(f"WARNING: Unmount of {mount_target} failed ({err}). Using lazy unmount.")
+    ok, err, _ = _run_command(["umount", "-R", "-l", mount_target], f"Lazy unmount {mount_target}", None, timeout=timeout)
+    if ok:
+        print(f"WARNING: Lazy unmount used for {mount_target}")
+    else:
+        print(f"WARNING: Lazy unmount of {mount_target} failed: {err}")
+    return ok
+
+
+def _teardown_chroot(target_root, mounted_paths):
+    print("Cleaning up chroot environment...")
+    try:
+        _kill_chroot_processes(target_root)
+    except Exception as e:
+        print(f"Warning: Could not stop leftover chroot processes: {e}")
+    for mount_target, mount_name in reversed(mounted_paths):
+        if mount_name == "boot_efi":
+            print(f"  Preserving EFI mount for bootloader installation: {mount_target}")
+            continue
+        try:
+            _unmount_with_fallback(mount_target)
+        except Exception as e:
+            print(f"Warning: Error unmounting {mount_target}: {e}")
+
+
 # --- New _run_in_chroot function ---
 def _run_in_chroot(target_root, command_list, description, progress_callback=None, timeout=None, pipe_input=None, env_unset=None):
     """Runs a command inside the target root using chroot, managing bind mounts.
@@ -548,6 +610,8 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
                 if not ok:
                     raise RuntimeError(err or f"Failed to mount {source} to {target}")
                 mounted_paths.append((target, name))
+                if name == "dev":
+                    _run_command(["mount", "--make-rslave", target], "Isolate dev mount", None, timeout=15)
             except FileNotFoundError:
                  raise RuntimeError("Mount command failed: 'mount' executable not found.")
             except RuntimeError:
@@ -572,32 +636,7 @@ def _run_in_chroot(target_root, command_list, description, progress_callback=Non
         return success, err, stdout
         
     finally:
-        # --- Unmount in reverse order ---
-        try:
-            print("Cleaning up chroot environment...")
-            for mount_info in reversed(mounted_paths):
-                 mount_target, mount_name = mount_info
-                 
-                 # Skip unmounting /boot/efi if we're in the middle of installation
-                 # It should remain mounted for bootloader installation
-                 if mount_name == "boot_efi":
-                     print(f"  Preserving EFI mount for bootloader installation: {mount_target}")
-                     continue
-                 
-                 try:
-                     print(f"  Unmounting {mount_target}...")
-                     ok, err, _ = _run_command(["umount", mount_target], f"Unmount {mount_target}", progress_callback, timeout=30)
-                     if ok:
-                         print(f"    Successfully unmounted {mount_target}")
-                     else:
-                         raise RuntimeError(err or f"Failed to unmount {mount_target}")
-                 except subprocess.CalledProcessError as e:
-                     print(f"    Failed to unmount {mount_target}: {e.stderr.strip()}")
-                     raise
-                 except Exception as e:
-                     print(f"    Warning: Error unmounting {mount_target}: {e}")
-        except Exception as e:
-            print(f"Warning: Error during chroot cleanup: {e}")
+        _teardown_chroot(target_root, mounted_paths)
 
 # --- Configuration Functions ---
 
@@ -708,6 +747,69 @@ def configure_system_in_container(target_root, config_data, progress_callback=No
 
     final_error_str = "\n".join(errors)
     return all_success, final_error_str
+
+
+SERVER_ROOT_SSH_CONF = "etc/ssh/sshd_config.d/50-centrio-root-login.conf"
+
+
+def configure_server_accounts(target_root, accounts, progress_callback=None):
+    accounts = accounts or {}
+    user = accounts.get("user") or None
+    root = accounts.get("root") or None
+    if not user and not root:
+        return False, "A server install needs a user account, a root password, or both."
+    if progress_callback:
+        progress_callback("Creating accounts...", None)
+    entries = []
+    if user:
+        username = user.get("username") or ""
+        if not username or not user.get("password_hash"):
+            return False, "User account details are incomplete."
+        useradd_cmd = ["useradd", "-m", "-s", "/bin/bash", "-U"]
+        if user.get("real_name"):
+            useradd_cmd.extend(["-c", user["real_name"]])
+        if user.get("is_admin"):
+            useradd_cmd.extend(["-G", "wheel"])
+        useradd_cmd.append(username)
+        ok, err, _ = _run_in_chroot(target_root, useradd_cmd, f"Create user {username}", progress_callback, timeout=60)
+        if not ok:
+            return False, f"Could not create user {username}: {err}"
+        entries.append(f"{username}:{user['password_hash']}")
+    if root:
+        if not root.get("password_hash"):
+            return False, "Root password is missing."
+        entries.append(f"root:{root['password_hash']}")
+    ok, err, _ = _run_command(
+        ["chpasswd", "-e", "-R", target_root],
+        "Set account passwords",
+        progress_callback,
+        timeout=30,
+        pipe_input="\n".join(entries) + "\n",
+    )
+    if not ok:
+        return False, "Could not set account passwords."
+    if not root:
+        _run_command(["usermod", "-R", target_root, "-L", "root"], "Lock root account", progress_callback, timeout=30)
+    conf_path = os.path.join(target_root, SERVER_ROOT_SSH_CONF)
+    if accounts.get("root_ssh_password_login"):
+        if not write_file_as_root(conf_path, "PermitRootLogin yes\n", progress_callback):
+            return False, "Could not enable root SSH login."
+        if os.path.exists(os.path.join(target_root, "usr/lib/systemd/system/sshd.service")):
+            _run_command(["systemctl", "--root", target_root, "enable", "sshd.service"], "Enable sshd", progress_callback, timeout=30)
+    for svc in ("gnome-initial-setup.service", "display-manager.service", "gdm.service"):
+        if os.path.lexists(os.path.join(target_root, "etc/systemd/system", svc)) or os.path.exists(os.path.join(target_root, "usr/lib/systemd/system", svc)):
+            _run_command(["systemctl", "--root", target_root, "disable", svc], f"Disable {svc}", progress_callback, timeout=30)
+    write_file_as_root(os.path.join(target_root, "var/lib/gnome-initial-setup-done"), "", progress_callback)
+    ok, err, _ = _run_command(
+        ["systemctl", "--root", target_root, "set-default", "multi-user.target"],
+        "Boot to multi-user target",
+        progress_callback,
+        timeout=30,
+    )
+    if not ok:
+        return False, f"Could not set the default boot target: {err}"
+    print("Server accounts configured.")
+    return True, ""
 
 
 # Live users to remove from installed system (live environment accounts)
@@ -3474,7 +3576,7 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
     # On aarch64, skip -R (initramfs rebuild) here; we run dracut --no-hostonly later to avoid host-only initramfs.
     _arch = get_host_architecture()
     plymouth_rebuild = ["plymouth-set-default-theme", "-R"] if _arch["arch"] != "aarch64" else ["plymouth-set-default-theme"]
-    for theme in ["spinner", "bgrt", "spin-gdm", "details"]:
+    for theme in ["bgrt", "spinner", "spin-gdm", "details"]:
         try:
             ok, _, _ = _run_in_chroot(target_root, plymouth_rebuild + [theme], "Set Plymouth theme", progress_callback, timeout=120)
             if ok:

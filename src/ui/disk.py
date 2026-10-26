@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 import backend
+import disk_filter
 
 from .base import BaseConfigurationPage
 
@@ -1530,10 +1531,13 @@ class DiskPage(BaseConfigurationPage):
         self.page_layout = QVBoxLayout(content)
         self.page_layout.setContentsMargins(0, 0, 6, 0)
         self.page_layout.setSpacing(10)
+        self.default_disk_path = None
         self.disks = self._list_disks()
         self.disk_combo = QComboBox()
+        self.disk_combo.setPlaceholderText("Select a disk")
         for path, text in self.disks:
             self.disk_combo.addItem(text, path)
+        self.disk_combo.setCurrentIndex(self.disk_combo.findData(self.default_disk_path) if self.default_disk_path else -1)
         self.refresh_disks_btn = QPushButton("Refresh Disks")
         self.fs_combo = QComboBox()
         self.fs_combo.addItems(["ext4", "xfs", "btrfs"])
@@ -1590,6 +1594,8 @@ class DiskPage(BaseConfigurationPage):
         self._reload_disks()
 
     def _current_disk(self):
+        if self.disk_combo.currentIndex() < 0:
+            return ""
         return (self.disk_combo.currentData() or self.disk_combo.currentText()).strip()
 
     def _reload_disks(self, *_args):
@@ -1599,8 +1605,10 @@ class DiskPage(BaseConfigurationPage):
         self.disk_combo.clear()
         for path, text in self.disks:
             self.disk_combo.addItem(text, path)
-        idx = self.disk_combo.findData(current)
-        self.disk_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        idx = self.disk_combo.findData(current) if current else -1
+        if idx < 0 and self.default_disk_path:
+            idx = self.disk_combo.findData(self.default_disk_path)
+        self.disk_combo.setCurrentIndex(idx)
         self.disk_combo.blockSignals(False)
         self._refresh_dual_boot_ui()
 
@@ -1625,43 +1633,41 @@ class DiskPage(BaseConfigurationPage):
         if live:
             print(f"Hiding live boot medium: {sorted(live)}")
         fallback = [] if "/dev/sda" in live else [("/dev/sda", "/dev/sda")]
-        try:
-            r = subprocess.run(
-                ["lsblk", "-J", "-b", "-d", "-o", "PATH,NAME,TYPE,SIZE,RO,MODEL,TRAN"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=True,
-            )
-            payload = json.loads(r.stdout) if r.stdout else {}
-            disks = []
-            min_size_bytes = 8 * 1024 * 1024 * 1024
-            skip_prefixes = ("loop", "zram", "ram", "dm-", "sr", "fd", "md")
-            for dev in payload.get("blockdevices", []):
-                if str(dev.get("type", "")).strip() != "disk":
-                    continue
-                if int(dev.get("ro", 0) or 0) != 0:
-                    continue
-                name = str(dev.get("name", "")).strip()
-                if not name or name.startswith(skip_prefixes):
-                    continue
-                size = int(dev.get("size", 0) or 0)
-                if size < min_size_bytes:
-                    continue
-                path = str(dev.get("path", "")).strip()
-                if not path.startswith("/dev/") or os.path.realpath(path) in live:
-                    continue
-                model = " ".join(str(dev.get("model") or "").split())
-                desc = ", ".join(b for b in (model, _human_size(size)) if b)
-                text = f"{path} ({desc})"
-                if str(dev.get("tran") or "").lower() == "usb":
-                    text += " (USB)"
-                elif backend.disk_is_portable(path):
-                    text += " (removable)"
-                disks.append((path, text))
-            return disks or fallback
-        except Exception:
+        self.default_disk_path = None
+        payload = None
+        for cols in (disk_filter.LSBLK_COLUMNS, "PATH,NAME,TYPE,SIZE,RO,MODEL,TRAN"):
+            try:
+                r = subprocess.run(
+                    ["lsblk", "-J", "-b", "-o", cols],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=True,
+                )
+                payload = json.loads(r.stdout) if r.stdout else {}
+                break
+            except Exception as e:
+                print(f"lsblk disk scan ({cols}) failed: {e}")
+        if payload is None:
             return fallback
+        min_size_bytes = 8 * 1024 * 1024 * 1024
+        found = [
+            d for d in disk_filter.installable_disks(payload.get("blockdevices", []), live)
+            if d["size"] >= min_size_bytes
+        ]
+        disks = []
+        for d in found:
+            desc = ", ".join(b for b in (d["model"], _human_size(d["size"])) if b)
+            text = f"{d['path']} ({desc})"
+            if d["tran"] == "usb":
+                text += " (USB)"
+            elif d["portable"]:
+                text += " (removable)"
+            disks.append((d["path"], text))
+        self.default_disk_path = disk_filter.default_disk(found)
+        if not disks:
+            return fallback
+        return disks
 
     def _on_dual_boot_toggled(self, checked):
         if checked:

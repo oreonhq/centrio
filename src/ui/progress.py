@@ -541,6 +541,15 @@ class ProgressPage(QWidget):
                 if not ps_ok:
                     raise RuntimeError(ps_err or "Plasma Setup OOBE configuration failed")
 
+            if bool(payload_cfg.get("server_install", False)):
+                acct_ok, acct_err = backend.configure_server_accounts(
+                    self.target_root,
+                    config_data.get("accounts"),
+                    progress_callback=self._scaled_progress_callback(0.998, 0.999),
+                )
+                if not acct_ok:
+                    raise RuntimeError(acct_err or "Failed to create accounts")
+
             backend.remove_centrio_installer(offline_install=offline_install)
             self.signals.done.emit(True, "")
         except Exception as e:
