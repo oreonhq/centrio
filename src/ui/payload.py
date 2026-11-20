@@ -91,16 +91,9 @@ DEFAULT_PACKAGE_GROUPS = {
     "gaming": {
         "name": "Gaming Support",
         "description": "Steam and gaming-related packages",
-        "flatpak_packages": ["com.valvesoftware.Steam", "net.lutris.Lutris", "org.winehq.Wine"],
+        "flatpak_packages": ["com.valvesoftware.Steam", "net.lutris.Lutris"],
         "required": False,
         "selected": False
-    },
-    "wine": {
-        "name": "Windows App Support",
-        "description": "Run Windows applications using Wine",
-        "packages": ["wine"],
-        "required": False,
-        "selected": True
     }
 }
 
@@ -133,10 +126,6 @@ class PayloadPage(BaseConfigurationPage):
         
         # State variables
         self.package_groups = {gid: dict(ginfo) for gid, ginfo in DEFAULT_PACKAGE_GROUPS.items()}
-        arch = get_host_architecture()
-        if arch.get("arch") == "aarch64" and "wine" in self.package_groups:
-            # Wine bundle is not supported on ARM64 hosts.
-            self.package_groups.pop("wine", None)
         self.package_group_rows = {}
         self.custom_repositories = COMMON_REPOSITORIES.copy()
         self.flatpak_enabled = True

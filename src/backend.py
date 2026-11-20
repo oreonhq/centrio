@@ -704,6 +704,117 @@ def configure_server_accounts(target_root, accounts, progress_callback=None):
 
 
 # Live users to remove from installed system (live environment accounts)
+
+LUKS_MAPPER_NAME = "luks-oreon"
+LUKS_CIPHER = "aes-xts-plain64"
+LUKS_KEY_SIZE = "512"
+LUKS_PBKDF = "argon2id"
+
+
+def setup_luks_volume(device, mapper_name, passphrase, progress_callback=None):
+    if not device or not os.path.exists(device):
+        return False, f"Device not found for encryption: {device or '(none)'}"
+    if not passphrase:
+        return False, "Encryption passphrase is missing."
+    mapper_name = mapper_name or LUKS_MAPPER_NAME
+    mapper_path = f"/dev/mapper/{mapper_name}"
+    if os.path.exists(mapper_path):
+        _run_command(["cryptsetup", "close", mapper_name], f"Close existing {mapper_name}", progress_callback, timeout=30)
+    ok_which, _, _ = _run_command(["cryptsetup", "--version"], "Check cryptsetup", progress_callback, timeout=15)
+    if not ok_which:
+        return False, "cryptsetup is not available on this live system."
+    fmt_cmd = [
+        "cryptsetup", "luksFormat",
+        "--type", "luks2",
+        "--cipher", LUKS_CIPHER,
+        "--key-size", LUKS_KEY_SIZE,
+        "--hash", "sha256",
+        "--pbkdf", LUKS_PBKDF,
+        "--batch-mode",
+        "--key-file=-",
+        device,
+    ]
+    ok, err, _ = _run_command(
+        fmt_cmd,
+        f"Encrypt {device}",
+        progress_callback,
+        timeout=600,
+        pipe_input=passphrase,
+    )
+    if not ok:
+        return False, err or f"Could not encrypt {device}"
+    ok, err, _ = _run_command(
+        ["cryptsetup", "open", "--key-file=-", device, mapper_name],
+        f"Open encrypted {device}",
+        progress_callback,
+        timeout=120,
+        pipe_input=passphrase,
+    )
+    if not ok:
+        return False, err or f"Could not open encrypted {device}"
+    if not os.path.exists(mapper_path):
+        return False, f"Mapped device missing after unlock: {mapper_path}"
+    print(f"Opened LUKS volume {device} as {mapper_path}")
+    return True, ""
+
+
+def luks_uuid_of(device, progress_callback=None):
+    ok, err, out = _run_command(
+        ["cryptsetup", "luksUUID", device],
+        f"Read LUKS UUID of {device}",
+        progress_callback,
+        timeout=30,
+    )
+    if ok and out:
+        return out.strip().splitlines()[0].strip()
+    ok2, _, out2 = _run_command(
+        ["blkid", "-o", "value", "-s", "UUID", device],
+        f"Read blkid UUID of {device}",
+        progress_callback,
+        timeout=15,
+    )
+    if ok2 and out2:
+        return out2.strip().splitlines()[0].strip()
+    return ""
+
+
+def write_crypttab_entry(target_root, mapper_name, luks_uuid, progress_callback=None):
+    if not luks_uuid:
+        return False, "Missing LUKS UUID for crypttab"
+    mapper_name = mapper_name or LUKS_MAPPER_NAME
+    crypttab_path = os.path.join(target_root, "etc/crypttab")
+    line = f"{mapper_name} UUID={luks_uuid} none discard\n"
+    existing = ""
+    ok_cat, _, cat_out = _run_command(["cat", crypttab_path], "Read crypttab", progress_callback, timeout=5)
+    if ok_cat and cat_out:
+        existing = cat_out
+        lines = []
+        for raw in existing.splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                lines.append(raw)
+                continue
+            name = stripped.split()[0]
+            if name == mapper_name:
+                continue
+            lines.append(raw)
+        existing = "\n".join(lines)
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+    content = existing + line
+    if not write_file_as_root(crypttab_path, content, progress_callback):
+        return False, "Failed to write /etc/crypttab"
+    print(f"Wrote crypttab entry for {mapper_name} (UUID={luks_uuid})")
+    return True, ""
+
+
+def ensure_crypt_dracut(target_root, progress_callback=None):
+    conf = os.path.join(target_root, "etc/dracut.conf.d/90-centrio-crypt.conf")
+    body = 'add_dracutmodules+=" crypt dm plymouth "\nomit_dracutmodules-=" plymouth "\ninstall_items+=" /etc/crypttab "\n'
+    if not write_file_as_root(conf, body, progress_callback):
+        return False, "Failed to write dracut crypt configuration"
+    return True, ""
+
 LIVE_USERNAMES = ["liveuser", "live", "fedora", "gnome"]
 
 
@@ -965,10 +1076,8 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
         raise RuntimeError("Could not detect OS VERSION_ID for DNF. Set releasever or fix /etc/os-release.")
     print(f"Using release version: {releasever}")
     
-    # WINE and NVIDIA rely on post-install scriptlets for desktop integration
     enable_scriptlets = any(
-        p == "wine" or p.startswith("wine-")
-        or p.startswith("nvidia-") or p.startswith("kmod-nvidia")
+        p.startswith("nvidia-") or p.startswith("kmod-nvidia")
         for p in packages
     )
 
@@ -996,7 +1105,7 @@ def _install_packages_dnf_impl(target_root, packages, progress_callback=None, ke
     if not enable_scriptlets:
         dnf_cmd.append("--setopt=tsflags=noscripts")  # Skip problematic scriptlets
     else:
-        print("Wine/NVIDIA detected in package set: running DNF with scriptlets enabled.")
+        print("NVIDIA packages detected: running DNF with scriptlets enabled.")
     
     if not keep_cache:
         dnf_cmd.append("--setopt=keepcache=0")
@@ -2515,7 +2624,52 @@ def copy_live_environment(target_root, progress_callback=None):
         progress_callback("Live environment copy completed successfully.", 0.9)
     return True, ""
 
-def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, separate_boot=False, portable=False):
+
+def _set_graphical_plymouth_theme(target_root, progress_callback=None):
+    skip = {"details", "text", "dummy"}
+    preferred = ["oreon", "bgrt", "spinner", "charge", "spin-gdm", "fade-in", "tribar"]
+    current = ""
+    ok, _, out = _run_in_chroot(
+        target_root, ["plymouth-set-default-theme"], "Read Plymouth theme", progress_callback, timeout=30
+    )
+    if ok and out:
+        current = (out.strip().splitlines() or [""])[-1].strip()
+    themes = []
+    ok_l, _, listed = _run_in_chroot(
+        target_root, ["plymouth-set-default-theme", "-l"], "List Plymouth themes", progress_callback, timeout=30
+    )
+    if ok_l and listed:
+        themes = [t.strip() for t in listed.splitlines() if t.strip()]
+    choice = None
+    if current and current not in skip and (not themes or current in themes):
+        choice = current
+    if not choice:
+        for name in preferred:
+            if name in themes:
+                choice = name
+                break
+    if not choice:
+        for name in themes:
+            if name not in skip:
+                choice = name
+                break
+    if not choice:
+        print("No graphical Plymouth theme found")
+        return False
+    if current == choice:
+        print(f"Keeping Plymouth theme {choice}")
+        return True
+    ok, err, _ = _run_in_chroot(
+        target_root, ["plymouth-set-default-theme", choice], f"Set Plymouth theme to {choice}", progress_callback, timeout=60
+    )
+    if ok:
+        print(f"Set Plymouth theme to {choice}")
+        return True
+    print(f"Warning: Could not set Plymouth theme {choice}: {err}")
+    return False
+
+
+def setup_live_environment_post_copy(target_root, progress_callback=None, server_install=False, btrfs_subvolumes=False, separate_boot=False, portable=False, luks_uuid=None, luks_name=None):
     """Sets up the copied live environment for booting from the target disk.
     
     This function handles the post-copy setup tasks like:
@@ -2682,23 +2836,26 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
             elif err and "No such file" not in err:
                 print(f"Warning: Could not remove {desktop_path}: {err}")
 
-    # --- Plymouth: ensure dracut includes plymouth so initramfs shows splash ---
-    plymouth_conf = os.path.join(target_root, "etc/dracut.conf.d/01-plymouth.conf")
-    if write_file_as_root(plymouth_conf, '# Force Plymouth into initramfs (Centrio installer)\nadd_dracutmodules+=" plymouth "\n', progress_callback):
+    plymouth_conf = os.path.join(target_root, "etc/dracut.conf.d/90-centrio-plymouth.conf")
+    plymouth_body = 'add_dracutmodules+=" plymouth "\nomit_dracutmodules-=" plymouth "\n'
+    if write_file_as_root(plymouth_conf, plymouth_body, progress_callback):
         print("Added dracut drop-in for Plymouth module")
+        _run_command(
+            ["rm", "-f", os.path.join(target_root, "etc/dracut.conf.d/01-plymouth.conf")],
+            "Remove early Plymouth drop-in",
+            progress_callback,
+            timeout=5,
+        )
 
-    # --- Plymouth: set default theme and rebuild initramfs for installed system ---
-    # On aarch64, skip -R (initramfs rebuild) here; we run dracut --no-hostonly later to avoid host-only initramfs.
-    _arch = get_host_architecture()
-    plymouth_rebuild = ["plymouth-set-default-theme", "-R"] if _arch["arch"] != "aarch64" else ["plymouth-set-default-theme"]
-    for theme in ["bgrt", "spinner", "spin-gdm", "details"]:
-        try:
-            ok, _, _ = _run_in_chroot(target_root, plymouth_rebuild + [theme], "Set Plymouth theme", progress_callback, timeout=120)
-            if ok:
-                print(f"Set Plymouth theme to {theme}")
-                break
-        except Exception as e:
-            print(f"Warning: Plymouth theme {theme}: {e}")
+    if luks_uuid:
+        ok_ct, err_ct = write_crypttab_entry(target_root, luks_name or LUKS_MAPPER_NAME, luks_uuid, progress_callback)
+        if not ok_ct:
+            return False, err_ct or "Failed to write crypttab"
+        ok_dr, err_dr = ensure_crypt_dracut(target_root, progress_callback)
+        if not ok_dr:
+            return False, err_dr or "Failed to configure encrypted boot"
+
+    _set_graphical_plymouth_theme(target_root, progress_callback)
 
     # --- Ensure /etc/default/grub exists with full content for Plymouth boot splash ---
     grub_default = os.path.join(target_root, "etc/default/grub")
@@ -2710,16 +2867,19 @@ def setup_live_environment_post_copy(target_root, progress_callback=None, server
             content = cat_out
         # If file is missing or empty/minimal, write full template (live env may have empty grub)
         if not content.strip() or len(content) < 80:
+            cmdline = "crashkernel=auto rhgb quiet splash rd.plymouth=1"
+            if luks_uuid:
+                cmdline = f"{cmdline} rd.luks.uuid={luks_uuid}"
             grub_template = '''GRUB_TIMEOUT=5
 GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
 GRUB_DEFAULT=saved
 GRUB_DISABLE_SUBMENU=true
 GRUB_TERMINAL_OUTPUT="console"
-GRUB_CMDLINE_LINUX="crashkernel=auto rhgb quiet splash rd.plymouth=1"
+GRUB_CMDLINE_LINUX="%s"
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
 GRUB_DISABLE_RECOVERY="true"
 GRUB_ENABLE_BLSCFG=true
-'''
+''' % cmdline
             if write_file_as_root(grub_default, grub_template, progress_callback):
                 print("Created /etc/default/grub with full template (was empty or missing)")
         else:
@@ -2728,10 +2888,14 @@ GRUB_ENABLE_BLSCFG=true
             match = re.search(r'^GRUB_CMDLINE_LINUX=(["\'])([^\'"]*)\1', content, re.MULTILINE)
             if match:
                 quote_char, args = match.group(1), match.group(2)
-                args_list = [p for p in args.split() if p and p != "nomodeset" and not p.startswith(("rd.lvm.lv=", "resume="))]
+                args_list = [p for p in args.split() if p and p != "nomodeset" and not p.startswith(("rd.lvm.lv=", "resume=", "rd.luks.uuid="))]
                 for param in ["rhgb", "quiet", "splash", "rd.plymouth=1"]:
                     if param not in args_list:
                         args_list.append(param)
+                if luks_uuid:
+                    luks_param = f"rd.luks.uuid={luks_uuid}"
+                    if luks_param not in args_list:
+                        args_list.append(luks_param)
                 new_line = "GRUB_CMDLINE_LINUX=%s%s%s\n" % (quote_char, " ".join(args_list), quote_char)
                 content = content[:match.start()] + new_line + content[match.end():]
                 modified = True
@@ -2769,10 +2933,40 @@ GRUB_ENABLE_BLSCFG=true
                 ok_ls, _, ls_out = _run_command(["ls", "-1", bls_dir], "List BLS entries", progress_callback, timeout=5)
                 if ok_ls and ls_out:
                     rd_lvm_re = re.compile(r'\brd\.lvm\.lv=[^\s]+\s*')
-                    root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
+                    root_uuid_re = re.compile(r'\broot=(?:UUID=[^\s]+|/dev/[^\s]+|live:[^\s]+)\s*')
                     resume_re = re.compile(r'\bresume=(?:UUID=[^\s]+|/dev/[^\s]+)\s*')
-                    # Live uses BTRFS subvol=root; our plain mkfs.btrfs has no subvolumes - strip rootflags
                     rootflags_subvol_re = re.compile(r'\brootflags=[^\s]*subvol=[^\s]+\s*|\brootflags=[^\s]+\s*')
+                    live_arg_prefixes = (
+                        "rd.live.",
+                        "live.",
+                        "boot=live",
+                        "boot=casper",
+                        "root=live:",
+                        "iso-scan/filename=",
+                        "rd.writable.fsimg=",
+                        "rd.live.overlay=",
+                    )
+                    drop_tokens = {
+                        "liveimg", "overlay", "rd.live.image", "nosplash",
+                        "plymouth.enable=0", "rd.plymouth=0", "rd.plymouth=off",
+                    }
+
+                    def _strip_live_kernel_args(opts):
+                        kept = []
+                        for tok in opts.split():
+                            if any(tok.startswith(p) for p in live_arg_prefixes):
+                                continue
+                            if tok in drop_tokens:
+                                continue
+                            kept.append(tok)
+                        out = []
+                        seen = set()
+                        for tok in kept:
+                            if tok in seen:
+                                continue
+                            seen.add(tok)
+                            out.append(tok)
+                        return " ".join(out).strip()
                     for name in [n.strip() for n in ls_out.splitlines() if n.strip()]:
                         if not name.endswith(".conf"):
                             continue
@@ -2802,8 +2996,12 @@ GRUB_ENABLE_BLSCFG=true
                                         opts = opts.strip()
                                         if "rootflags=" not in opts:
                                             opts = (opts + " rootflags=subvol=root").strip()  # Fedora-style root subvolume
+                                    opts = _strip_live_kernel_args(opts)
                                     opts = opts.strip()
                                     add = ["root=UUID=" + target_root_uuid, "rhgb", "quiet", "splash", "rd.plymouth=1"]
+                                    if luks_uuid:
+                                        add.append(f"rd.luks.uuid={luks_uuid}")
+                                    opts = re.sub(r'\brd\.luks\.uuid=[^\s]+\s*', '', opts)
                                     for p in add:
                                         if p not in opts.split():
                                             opts = (opts + " " + p).strip()
@@ -2825,6 +3023,8 @@ GRUB_ENABLE_BLSCFG=true
         portable_conf = 'hostonly="no"\nhostonly_cmdline="no"\nadd_drivers+=" usb_storage uas sd_mod xhci_pci ehci_pci "\n'
         if btrfs_subvolumes:
             portable_conf += 'add_dracutmodules+=" btrfs "\n'
+        if luks_uuid:
+            portable_conf += 'add_dracutmodules+=" crypt dm plymouth "\n'
         if not write_file_as_root(os.path.join(target_root, "etc/dracut.conf.d/90-portable.conf"), portable_conf, progress_callback):
             return False, "Failed to write portable dracut configuration"
     if arch["arch"] == "aarch64" or portable:

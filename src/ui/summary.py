@@ -272,7 +272,12 @@ class SummaryPage(Adw.PreferencesPage):
 
         # Determine icon and subtitle based on state
         if is_complete:
-            row.set_subtitle(f"{subtitle} (Configured)")
+            extra = ""
+            if key == "disk":
+                disk = self.main_window.final_config.get("disk") or {}
+                if disk.get("encryption"):
+                    extra = ", encrypted"
+            row.set_subtitle(f"{subtitle} (Configured{extra})")
             icon_name = "object-select-symbolic"
             row.add_css_class("success")
             row.remove_css_class("warning")
