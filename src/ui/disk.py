@@ -712,6 +712,29 @@ class DiskPage(BaseConfigurationPage):
         )
         self.custom_format_row.connect("notify::active", self.on_custom_format_toggled)
         self.fs_group.add(self.custom_format_row)
+
+        self.encrypt_row = Adw.SwitchRow(
+            title="Encrypt my data",
+            subtitle="Ask for a passphrase at startup. EFI and boot stay unlocked."
+        )
+        self.encrypt_row.set_active(False)
+        self.encrypt_row.connect("notify::active", self._on_encrypt_toggled)
+        self.fs_group.add(self.encrypt_row)
+        self.passphrase_row = Adw.PasswordEntryRow(title="Passphrase")
+        self.passphrase_row.set_visible(False)
+        self.fs_group.add(self.passphrase_row)
+        self.passphrase_confirm_row = Adw.PasswordEntryRow(title="Confirm passphrase")
+        self.passphrase_confirm_row.set_visible(False)
+        self.fs_group.add(self.passphrase_confirm_row)
+        self.encrypt_error = Gtk.Label(xalign=0, wrap=True)
+        self.encrypt_error.add_css_class("error")
+        self.encrypt_error.add_css_class("caption")
+        self.encrypt_error.set_margin_top(6)
+        self.encrypt_error.set_margin_start(12)
+        self.encrypt_error.set_visible(False)
+        self.fs_group.add(self.encrypt_error)
+        self.passphrase_row.connect("changed", lambda *_: self.update_complete_button_state())
+        self.passphrase_confirm_row.connect("changed", lambda *_: self.update_complete_button_state())
         
         # Advanced options (shown when custom formatting is enabled)
         self.advanced_group = Adw.PreferencesGroup(title="Advanced Options")
@@ -863,6 +886,27 @@ class DiskPage(BaseConfigurationPage):
         self.custom_format_enabled = switch_row.get_active()
         self.advanced_group.set_visible(self.custom_format_enabled)
         print(f"Custom formatting: {self.custom_format_enabled}")
+
+    def _on_encrypt_toggled(self, switch_row, pspec):
+        on = switch_row.get_active()
+        self.passphrase_row.set_visible(on)
+        self.passphrase_confirm_row.set_visible(on)
+        if not on:
+            self.passphrase_row.set_text("")
+            self.passphrase_confirm_row.set_text("")
+            self.encrypt_error.set_visible(False)
+            self.encrypt_error.set_text("")
+        self.update_complete_button_state()
+
+    def _encryption_error(self):
+        if not self.encrypt_row.get_active():
+            return ""
+        pw = self.passphrase_row.get_text()
+        if not pw:
+            return "Enter a passphrase"
+        if pw != self.passphrase_confirm_row.get_text():
+            return "Passphrases do not match"
+        return ""
     
     def _update_disk_list_for_dual_boot(self):
         """When dual boot is selected, only enable disks with free space; clear invalid selection."""
@@ -1430,6 +1474,14 @@ class DiskPage(BaseConfigurationPage):
             self.partitioning_method is not None and
             (not self.dual_boot_enabled or dual_boot_ok)
         )
+        enc_err = self._encryption_error()
+        if enc_err:
+            can_proceed = False
+            self.encrypt_error.set_text(enc_err)
+            self.encrypt_error.set_visible(True)
+        else:
+            self.encrypt_error.set_visible(False)
+            self.encrypt_error.set_text("")
         
         print(f"  Setting Complete button sensitive: {can_proceed}")
         self.complete_button.set_sensitive(can_proceed)
@@ -1546,8 +1598,25 @@ class DiskPage(BaseConfigurationPage):
                 partitions.append({"device": boot_part, "mountpoint": "/boot", "fstype": "ext4"})
                 expect_devices = [_part(primary_disk, n) for n in (1, 2, 3)]
 
-            commands.append(_mkfs_root_command(self.filesystem_type, root_part))
-            partitions.append({"device": root_part, "mountpoint": "/", "fstype": self.filesystem_type})
+            encrypt = self.encrypt_row.get_active()
+            if encrypt:
+                enc_err = self._encryption_error()
+                if enc_err:
+                    self.show_toast(enc_err)
+                    return
+                config_values["encryption"] = True
+                config_values["luks_name"] = "luks-oreon"
+                config_values["luks_device"] = root_part
+                config_values["luks_passphrase"] = self.passphrase_row.get_text()
+                partitions.append({
+                    "device": f"/dev/mapper/{config_values['luks_name']}",
+                    "mountpoint": "/",
+                    "fstype": self.filesystem_type,
+                })
+            else:
+                config_values["encryption"] = False
+                commands.append(_mkfs_root_command(self.filesystem_type, root_part))
+                partitions.append({"device": root_part, "mountpoint": "/", "fstype": self.filesystem_type})
 
             config_values["commands"] = commands
             config_values["partitions"] = partitions
@@ -1562,6 +1631,7 @@ class DiskPage(BaseConfigurationPage):
         print("Storage configuration confirmed. Returning to summary.")
         
         mode_text = "Dual boot" if self.dual_boot_enabled else "Clean installation"
-        self.show_toast(f"{mode_text} on {primary_disk} with {self.filesystem_type} filesystem")
+        enc_text = ", encrypted" if config_values.get("encryption") else ""
+        self.show_toast(f"{mode_text} on {primary_disk} with {self.filesystem_type} filesystem{enc_text}")
         
         super().mark_complete_and_return(button, config_values=config_values) 

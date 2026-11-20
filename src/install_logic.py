@@ -493,9 +493,18 @@ def _copy_grub_cfg_from_live_and_patch_uuid(target_root, target_root_uuid, progr
             if stripped.startswith("linux ") or stripped.startswith("linuxefi "):
                 parts = stripped.split(None, 2)  # cmd, path, rest
                 if len(parts) >= 3:
-                    args = [a for a in parts[2].split()
-                            if not a.startswith("resume=") and not a.startswith("rd.lvm.lv=")
-                            and not a.startswith("rootflags=")]
+                    skip_pfx = (
+                        "resume=", "rd.lvm.lv=", "rootflags=", "rd.live.", "live.",
+                        "boot=live", "root=live:", "iso-scan/filename=",
+                    )
+                    skip_tok = {
+                        "liveimg", "overlay", "rd.live.image", "nosplash",
+                        "plymouth.enable=0", "rd.plymouth=0", "rd.plymouth=off",
+                    }
+                    args = [
+                        a for a in parts[2].split()
+                        if a not in skip_tok and not any(a.startswith(p) for p in skip_pfx)
+                    ]
                     for param in ["quiet", "splash", "rhgb", "rd.plymouth=1"]:
                         if param not in args:
                             args.append(param)

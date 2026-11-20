@@ -240,7 +240,11 @@ class CentrioInstallerWindow(Adw.ApplicationWindow):
             # Users often revisit network/payload and stale values break installs.
             if is_complete and config_values is not None:
                  self.final_config[key] = config_values
-                 print(f"  Stored/updated final config for '{key}': {config_values}")
+                 logged = config_values
+                 if key == "disk" and isinstance(config_values, dict):
+                     logged = dict(config_values)
+                     logged.pop("luks_passphrase", None)
+                 print(f"  Stored/updated final config for '{key}': {logged}")
             elif not is_complete and key in self.final_config:
                  # Remove config if marked incomplete again (e.g., user goes back)
                  print(f"  Removing final config for '{key}'")

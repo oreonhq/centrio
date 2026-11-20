@@ -254,6 +254,8 @@ class ProgressPage(Gtk.Box):
                 
                 if not device:
                     continue
+                if device.startswith("/dev/mapper/"):
+                    continue
                     
                 print(f"Verifying partition: {device} (for {mountpoint})")
                 
@@ -289,6 +291,42 @@ class ProgressPage(Gtk.Box):
                 print(f"  Partition {device} verified successfully")
             
             print("All partitions verified successfully")
+
+            if disk_config.get("encryption"):
+                self._update_progress_text("Encrypting the Oreon system partition...", 0.312)
+                passphrase = disk_config.pop("luks_passphrase", None)
+                luks_name = disk_config.get("luks_name") or backend.LUKS_MAPPER_NAME
+                luks_device = disk_config.get("luks_device")
+                ok_l, err_l = backend.setup_luks_volume(
+                    luks_device, luks_name, passphrase, self._update_progress_text
+                )
+                passphrase = None
+                if not ok_l:
+                    self.installation_error = err_l or "Encryption setup failed"
+                    return False
+                luks_uuid = backend.luks_uuid_of(luks_device, self._update_progress_text)
+                if not luks_uuid:
+                    self.installation_error = "Could not read the LUKS UUID after encryption"
+                    return False
+                disk_config["luks_uuid"] = luks_uuid
+                disk_config["luks_name"] = luks_name
+                mapper = f"/dev/mapper/{luks_name}"
+                filesystem = disk_config.get("filesystem", "ext4")
+                mkfs_cmd = (
+                    ["mkfs.btrfs", "-f", mapper] if filesystem == "btrfs"
+                    else ["mkfs.xfs", "-f", mapper] if filesystem == "xfs"
+                    else ["mkfs.ext4", "-F", mapper]
+                )
+                ok_m, err_m, _ = backend._run_command(
+                    mkfs_cmd, f"Format encrypted root ({filesystem})", self._update_progress_text, timeout=300
+                )
+                if not ok_m:
+                    self.installation_error = err_m or "Failed to format the encrypted root"
+                    return False
+                for part_info in partitions:
+                    if part_info.get("mountpoint") == "/":
+                        part_info["device"] = mapper
+                print(f"Encrypted root ready at {mapper} (UUID={luks_uuid})")
 
             # --- BTRFS subvolumes (for snapper rollback) ---
             btrfs_subvolumes = disk_config.get("btrfs_subvolumes", False)
@@ -563,6 +601,8 @@ class ProgressPage(Gtk.Box):
             btrfs_subvolumes=btrfs_subvolumes,
             separate_boot=bool((self.disk_config or {}).get("separate_boot", False)),
             portable=backend.disk_is_portable(((self.disk_config or {}).get("target_disks") or [None])[0]),
+            luks_uuid=(self.disk_config or {}).get("luks_uuid"),
+            luks_name=(self.disk_config or {}).get("luks_name"),
         )
         
         if not success:
@@ -827,7 +867,17 @@ class ProgressPage(Gtk.Box):
         """Start the actual installation process sequentially."""
         self.main_window = main_window # Store ref for navigation
         self.stop_requested = False # Reset stop flag
-        print("Starting installation with config:", {k: v for k, v in config_data.items() if k != "accounts"})
+        safe = {}
+        for k, v in config_data.items():
+            if k == "accounts":
+                continue
+            if k == "disk" and isinstance(v, dict):
+                d = dict(v)
+                d.pop("luks_passphrase", None)
+                safe[k] = d
+            else:
+                safe[k] = v
+        print("Starting installation with config:", safe)
         self.progress_value = 0.0
         self.installation_error = None 
         self.progress_bar.set_fraction(0.0)
