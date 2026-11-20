@@ -417,6 +417,9 @@ class ProgressPage(QWidget):
                 if pv:
                     backend.release_block_device(pv, storage_cb)
                 ok, err = storage_layout.apply_root_storage(disk_config, storage_cb)
+                disk_config.pop("luks_passphrase", None)
+                if isinstance(config_data.get("disk"), dict):
+                    config_data["disk"].pop("luks_passphrase", None)
                 if not ok:
                     raise RuntimeError(err or "Root storage setup failed")
                 partitions = disk_config.get("partitions", [])
@@ -522,6 +525,8 @@ class ProgressPage(QWidget):
                 lvm_root=lvm_root,
                 separate_boot=bool(disk_cfg.get("separate_boot", False)),
                 portable=backend.disk_is_portable(primary_disk),
+                luks_uuid=disk_cfg.get("luks_uuid"),
+                luks_name=disk_cfg.get("luks_name"),
             )
             if not post_ok:
                 raise RuntimeError(post_err or "Post-copy system finalization failed")

@@ -9,6 +9,7 @@ from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
+    QLineEdit,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -1569,7 +1570,25 @@ class DiskPage(BaseConfigurationPage):
         self.page_layout.addWidget(self.efi_label)
         self.page_layout.addWidget(self.efi_combo)
         self.page_layout.addWidget(self.separate_home)
+        self.encrypt_check = QCheckBox("Encrypt my data")
+        self.encrypt_check.setToolTip("Ask for a passphrase when the computer starts. The EFI and boot partitions stay unlocked.")
+        self.passphrase_edit = QLineEdit()
+        self.passphrase_edit.setPlaceholderText("Passphrase")
+        self.passphrase_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.passphrase_confirm = QLineEdit()
+        self.passphrase_confirm.setPlaceholderText("Confirm passphrase")
+        self.passphrase_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        self.encrypt_error = QLabel("")
+        self.encrypt_error.setStyleSheet("color: #e01b24; font-size: 9pt;")
+        self.encrypt_error.setWordWrap(True)
+        self.encrypt_error.setVisible(False)
+        self.page_layout.addWidget(self.encrypt_check)
+        self.page_layout.addWidget(self.passphrase_edit)
+        self.page_layout.addWidget(self.passphrase_confirm)
+        self.page_layout.addWidget(self.encrypt_error)
         self.page_layout.addWidget(self.status_label)
+        self.encrypt_check.toggled.connect(self._on_encrypt_toggled)
+        self._on_encrypt_toggled(False)
 
         btn = QPushButton("Apply Storage Settings")
         btn.clicked.connect(self.apply_settings_and_return)
@@ -1736,6 +1755,25 @@ class DiskPage(BaseConfigurationPage):
 
     def _on_layout_segment_rejected(self, seg):
         self.show_toast(f"{_segment_name(seg)} cannot be used: {seg['reason']}")
+
+    def _on_encrypt_toggled(self, checked):
+        self.passphrase_edit.setVisible(bool(checked))
+        self.passphrase_confirm.setVisible(bool(checked))
+        if not checked:
+            self.passphrase_edit.clear()
+            self.passphrase_confirm.clear()
+            self.encrypt_error.setVisible(False)
+            self.encrypt_error.setText("")
+
+    def _encryption_error(self):
+        if not self.encrypt_check.isChecked():
+            return ""
+        pw = self.passphrase_edit.text()
+        if not pw:
+            return "Enter a passphrase"
+        if pw != self.passphrase_confirm.text():
+            return "Passphrases do not match"
+        return ""
 
     def apply_settings_and_return(self, _button=None):
         primary_disk = self._current_disk()
@@ -1986,5 +2024,18 @@ class DiskPage(BaseConfigurationPage):
             "expect_partitions": expect_parts,
             "commands": commands,
             "partitions": partitions,
+            "encryption": False,
         }
+        enc_err = self._encryption_error()
+        if enc_err:
+            self.encrypt_error.setText(enc_err)
+            self.encrypt_error.setVisible(True)
+            self.status_label.setText(enc_err)
+            return
+        self.encrypt_error.setVisible(False)
+        if self.encrypt_check.isChecked():
+            config_values["encryption"] = True
+            config_values["luks_name"] = "luks-oreon"
+            config_values["luks_device"] = root_part
+            config_values["luks_passphrase"] = self.passphrase_edit.text()
         self.mark_complete_and_return(config_values=config_values)

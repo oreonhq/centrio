@@ -540,6 +540,25 @@ def apply_root_storage(disk_config, progress_callback=None):
                 return False, err_td or f"could not tear down LVM on {primary_disk}"
         backend.release_block_device(root_part, progress_callback)
 
+    luks_uuid = None
+    luks_name = disk_config.get("luks_name") or backend.LUKS_MAPPER_NAME
+    if disk_config.get("encryption"):
+        passphrase = disk_config.pop("luks_passphrase", None)
+        if progress_callback:
+            progress_callback("Encrypting the Oreon system partition...", None)
+        ok_l, err_l = backend.setup_luks_volume(root_part, luks_name, passphrase, progress_callback)
+        passphrase = None
+        if not ok_l:
+            return False, err_l or "Encryption setup failed"
+        luks_uuid = backend.luks_uuid_of(root_part, progress_callback)
+        if not luks_uuid:
+            return False, "Could not read the LUKS UUID after encryption"
+        disk_config["luks_uuid"] = luks_uuid
+        disk_config["luks_name"] = luks_name
+        disk_config["luks_device"] = root_part
+        root_part = f"/dev/mapper/{luks_name}"
+        cfg["root_part"] = root_part
+
     fd, script_path = tempfile.mkstemp(prefix="centrio_bd_", suffix=".py")
     cfg_path = None
     try:

@@ -253,7 +253,12 @@ class SummaryPage(QWidget):
             return
         cfg = self.config_rows[key]
         if is_complete:
-            cfg["status_label"].setText("Configured")
+            text = "Configured"
+            if key == "disk":
+                disk = self.main_window.final_config.get("disk") or {}
+                if disk.get("encryption"):
+                    text = "Configured, encrypted"
+            cfg["status_label"].setText(text)
             cfg["status_label"].setStyleSheet("font-size: 10pt;")
         elif cfg["required"]:
             cfg["status_label"].setText("Required")
